@@ -835,8 +835,6 @@ bot.catch((err) => {
   console.error('Bot error:', err);
 });
 
-bot.start();
-
 const http = require('http');
 
 const port = process.env.PORT || 3000;
@@ -849,3 +847,5 @@ http
   .listen(port, () => {
     console.log(`HTTP health server listening on port ${port}`);
   });
+
+bot.start();
