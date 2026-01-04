@@ -401,10 +401,22 @@ async function handlePatchApplication(ctx, state) {
 
     await ctx.reply('Updating repository…');
     const { git, repoDir } = await prepareRepository(project, effectiveBaseBranch);
+    // Build a safe branch name from project.id + timestamp
+    const timestamp = formatTimestamp(new Date());
+    const safeProjectId = String(project.id)
+      .normalize('NFKD')
+      .replace(/[^\w\-/.]+/g, '-') // فقط حروف، عدد، _, -, /, . را نگه می‌داریم
+      .replace(/-+/g, '-')         // چند - پشت سر هم → یک -
+      .replace(/\/+/g, '/')        // چند / پشت سر هم → یک /
+      .replace(/^-+|-+$/g, '')     // حذف - از ابتدا/انتها
+      .toLowerCase()
+      .slice(0, 50);               // خیلی بلند نشود
 
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '');
-    const rawBranchName = `patch ${projectName} ${timestamp}`;  // حروف ساده برای ورودی
-    const branchName = makeBranchSlug(`patch/${projectName}/${timestamp}`);
+    const branchName = `patch/${safeProjectId}/${timestamp}`;
+
+    await ctx.reply('Creating branch…');
+    await createWorkingBranch(git, effectiveBaseBranch, branchName);
+
 
 
     await ctx.reply('Creating branch…');
