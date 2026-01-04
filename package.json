@@ -1,0 +1,17 @@
+{
+  "name": "patch-runner-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for applying git patches and opening GitHub PRs",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node -e \"console.log('No tests yet')\""
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.1.1",
+    "dotenv": "^16.4.5",
+    "grammy": "^1.22.1",
+    "simple-git": "^3.24.0"
+  }
+}
