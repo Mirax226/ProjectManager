@@ -1,0 +1,7 @@
+[
+  {
+    "id": "daily-system",
+    "name": "Daily System Supabase",
+    "envKey": "SUPABASE_DSN_DAILY_SYSTEM"
+  }
+]

@@ -1,5 +1,6 @@
 const fs = require('fs/promises');
 const path = require('path');
+const configStore = require('./configStore');
 
 const SETTINGS_FILE = path.join(__dirname, 'globalSettings.json');
 const ENV_DEFAULT_BASE = process.env.DEFAULT_BASE_BRANCH || 'main';
@@ -17,12 +18,23 @@ async function ensureSettingsFile() {
 }
 
 async function loadGlobalSettings() {
+  const dbSettings = await configStore.loadGlobalSettings();
+  if (dbSettings) {
+    if (!dbSettings.defaultBaseBranch) {
+      dbSettings.defaultBaseBranch = ENV_DEFAULT_BASE;
+    }
+    return dbSettings;
+  }
+
   await ensureSettingsFile();
   try {
     const raw = await fs.readFile(SETTINGS_FILE, 'utf-8');
     const parsed = JSON.parse(raw);
     if (!parsed.defaultBaseBranch) {
       parsed.defaultBaseBranch = ENV_DEFAULT_BASE;
+    }
+    if (parsed && !dbSettings) {
+      await configStore.saveGlobalSettings(parsed);
     }
     return parsed;
   } catch (error) {
@@ -34,6 +46,7 @@ async function loadGlobalSettings() {
 async function saveGlobalSettings(settings) {
   try {
     const payload = { ...settings };
+    await configStore.saveGlobalSettings(payload);
     await fs.writeFile(SETTINGS_FILE, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (error) {
     console.error('Failed to save globalSettings.json', error);
