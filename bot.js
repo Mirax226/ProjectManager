@@ -1294,5 +1294,6 @@ http
   .listen(port, () => {
     console.log(`HTTP health server listening on port ${port}`);
   });
-
+await bot.api.deleteWebhook({ drop_pending_updates: true });
+await bot.start();
 initializeConfig().then(() => bot.start());
