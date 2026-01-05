@@ -39,7 +39,7 @@ async function loadProjects() {
     }
     return result.rows[0].data || [];
   } catch (error) {
-    console.error('Failed to load projects from DB', error);
+    console.error('Failed to load projects', error);
     return [];
   }
 }
@@ -55,11 +55,11 @@ async function saveProjects(projects) {
       `INSERT INTO path_config (key, data)
        VALUES ($1, $2)
        ON CONFLICT (key) DO UPDATE
-       SET data = EXCLUDED.data, updated_at = NOW()`,
+      SET data = EXCLUDED.data, updated_at = NOW()`,
       ['projects', projects],
     );
   } catch (error) {
-    console.error('Failed to save projects to DB', error);
+    console.error('Failed to save projects', error);
   }
 }
 
@@ -76,7 +76,7 @@ async function loadGlobalSettings() {
     }
     return result.rows[0].data || null;
   } catch (error) {
-    console.error('Failed to load global settings from DB', error);
+    console.error('Failed to load global settings', error);
     return null;
   }
 }
@@ -92,15 +92,16 @@ async function saveGlobalSettings(settings) {
       `INSERT INTO path_config (key, data)
        VALUES ($1, $2)
        ON CONFLICT (key) DO UPDATE
-       SET data = EXCLUDED.data, updated_at = NOW()`,
+      SET data = EXCLUDED.data, updated_at = NOW()`,
       ['globalSettings', settings],
     );
   } catch (error) {
-    console.error('Failed to save global settings to DB', error);
+    console.error('Failed to save global settings', error);
   }
 }
 
 module.exports = {
+  getPool,
   loadProjects,
   saveProjects,
   loadGlobalSettings,

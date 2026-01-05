@@ -6,6 +6,7 @@ const { Bot, InlineKeyboard, Keyboard } = require('grammy');
 const { Pool } = require('pg');
 
 const { loadProjects, saveProjects, findProjectById } = require('./projectsStore');
+const { getPool: getConfigPool } = require('./configStore');
 const { setUserState, getUserState, clearUserState } = require('./state');
 const {
   prepareRepository,
@@ -34,6 +35,19 @@ if (!ADMIN_TELEGRAM_ID) {
 
 const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
+
+async function testConfigDbConnection() {
+  try {
+    const db = await getConfigPool();
+    if (!db) {
+      return;
+    }
+    await db.query('SELECT 1');
+    console.log('Config DB: OK');
+  } catch (error) {
+    console.error('Config DB connection failed', error);
+  }
+}
 
 const mainKeyboard = new Keyboard()
   .text('📁 Projects')
@@ -1294,5 +1308,17 @@ http
   .listen(port, () => {
     console.log(`HTTP health server listening on port ${port}`);
   });
-await bot.api.deleteWebhook({ drop_pending_updates: true });
-initializeConfig().then(() => bot.start());
+async function startBot() {
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+  } catch (error) {
+    console.error('Failed to delete webhook', error);
+  }
+  await testConfigDbConnection();
+  await initializeConfig();
+  bot.start();
+}
+
+startBot().catch((error) => {
+  console.error('Failed to start bot', error);
+});

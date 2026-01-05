@@ -19,8 +19,12 @@ npm install
 
 ## Run
 ```
-node bot.js
+node src/bot.js
 ```
+
+## Render deploy notes
+- Build command: `npm install` (no extra installs needed).
+- Start command: `node src/bot.js`.
 
 ## Usage
 1. Start the bot with `/start` from the admin Telegram account.
