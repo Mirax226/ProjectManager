@@ -107,7 +107,7 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-bot.on('text', async (ctx, next) => {
+bot.on('message:text', async (ctx, next) => {
   const state = userState.get(ctx.from.id);
   if (!state || state.mode !== 'create-project') {
     return next();
