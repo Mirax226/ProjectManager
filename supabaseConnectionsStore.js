@@ -1,16 +1,15 @@
-// supabaseConnectionsStore.js
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+// src/supabaseConnectionsStore.js
+// ساده شده: فقط از supabaseConnections.json می‌خوانیم
+// و در حافظه cache می‌کنیم. هیچ دسترسی‌ای به Postgres ندارد.
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const fs = require("fs");
+const path = require("path");
 
 let cachedConnections = null;
 let loaded = false;
 
 /**
- * نوع کانکشن:
+ * SupabaseConnection:
  * {
  *   id: string;
  *   name: string;
@@ -18,7 +17,7 @@ let loaded = false;
  * }
  */
 
-export async function loadSupabaseConnections() {
+async function loadSupabaseConnections() {
   if (loaded && Array.isArray(cachedConnections)) {
     return cachedConnections;
   }
@@ -44,17 +43,21 @@ export async function loadSupabaseConnections() {
   return cachedConnections;
 }
 
-export function findSupabaseConnection(id) {
+function findSupabaseConnection(id) {
   if (!Array.isArray(cachedConnections)) return undefined;
   return cachedConnections.find((c) => c.id === id);
 }
 
-// برای سازگاری با کد موجود، این تابع فقط کش را آپدیت می‌کند
-// و فعلاً چیزی در DB ذخیره نمی‌کند.
-export async function saveSupabaseConnections(connections) {
+// برای سازگاری با کد فعلی؛ فعلاً فقط cache را به‌روز می‌کنیم.
+async function saveSupabaseConnections(connections) {
   if (Array.isArray(connections)) {
     cachedConnections = connections;
     loaded = true;
   }
-  // اگر بعداً خواستی به DB هم ذخیره کنی، اینجا می‌شود اضافه کرد.
 }
+
+module.exports = {
+  loadSupabaseConnections,
+  findSupabaseConnection,
+  saveSupabaseConnections,
+};
