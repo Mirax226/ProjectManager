@@ -5,6 +5,22 @@ const simpleGit = require('simple-git');
 const WORKDIR = process.env.WORKDIR || '/tmp/patch-runner-bot';
 const DEFAULT_BASE_BRANCH = process.env.DEFAULT_BASE_BRANCH || 'main';
 
+function slugifyProjectId(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+}
+
+function makePatchBranchName(projectId) {
+  const slug = slugifyProjectId(projectId || 'project');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `patch/${slug}/${ts}-${rand}`;
+}
+
 function getDefaultWorkingDir(repoSlug) {
   if (!repoSlug || !repoSlug.includes('/')) return undefined;
   const [owner, repo] = repoSlug.split('/');
@@ -88,6 +104,7 @@ async function prepareRepository(project, effectiveBaseBranch) {
   const git = simpleGit(repoDir);
   await git.fetch();
   await git.checkout(baseBranch);
+  await git.pull('origin', baseBranch, { '--ff-only': null });
   await git.reset(['--hard', `origin/${baseBranch}`]);
 
   return { git, repoDir, baseBranch };
@@ -143,4 +160,6 @@ module.exports = {
   getRepoInfo,
   getGithubToken,
   getDefaultWorkingDir,
+  makePatchBranchName,
+  slugifyProjectId,
 };

@@ -17,6 +17,8 @@ const {
   getRepoInfo,
   getGithubToken,
   getDefaultWorkingDir,
+  makePatchBranchName,
+  slugifyProjectId,
 } = require('./gitUtils');
 const { createPullRequest, measureGithubLatency } = require('./githubUtils');
 const { loadGlobalSettings, saveGlobalSettings } = require('./settingsStore');
@@ -46,6 +48,7 @@ let botStarted = false;
 let botRetryTimeout = null;
 const userState = new Map();
 let configStatusPool = null;
+const patchSessions = new Map();
 
 configureSelfLogger({
   bot,
@@ -101,12 +104,44 @@ function resetUserState(ctx) {
   clearUserState(ctx.from.id);
 }
 
+function getPatchSession(userId) {
+  return patchSessions.get(userId);
+}
+
+function startPatchSession(userId, projectId) {
+  patchSessions.set(userId, { projectId, buffer: '' });
+}
+
+function clearPatchSession(userId) {
+  patchSessions.delete(userId);
+}
+
+function appendPatchChunk(session, chunk) {
+  const text = chunk || '';
+  if (!text) return 0;
+  if (session.buffer && !session.buffer.endsWith('\n')) {
+    session.buffer += '\n';
+  }
+  session.buffer += text;
+  if (!text.endsWith('\n')) {
+    session.buffer += '\n';
+  }
+  return text.length;
+}
+
 async function renderMainMenu(ctx) {
   await renderOrEdit(ctx, 'Main menu:', { reply_markup: mainKeyboard });
 }
 
 function buildCancelKeyboard() {
   return new InlineKeyboard().text('❌ Cancel', 'cancel_input');
+}
+
+function buildPatchSessionKeyboard() {
+  return new InlineKeyboard()
+    .text('✅ Patch completed', 'patch:finish')
+    .row()
+    .text('❌ Cancel', 'patch:cancel');
 }
 
 function getMessageTargetFromCtx(ctx) {
@@ -175,6 +210,37 @@ bot.use(async (ctx, next) => {
 });
 
 bot.on('message:text', async (ctx, next) => {
+  const session = getPatchSession(ctx.from.id);
+  if (!session) {
+    return next();
+  }
+  const chunkLength = appendPatchChunk(session, ctx.message.text);
+  await ctx.reply(
+    `Patch chunk received (${chunkLength} chars).\nSend more, or press ‘✅ Patch completed’.`,
+    { reply_markup: buildPatchSessionKeyboard() },
+  );
+});
+
+bot.on('message:document', async (ctx, next) => {
+  const session = getPatchSession(ctx.from.id);
+  if (!session) {
+    return next();
+  }
+  const doc = ctx.message.document;
+  const fileName = doc?.file_name || '';
+  if (!fileName.endsWith('.patch') && !fileName.endsWith('.diff')) {
+    await ctx.reply('Unsupported file type; only .patch/.diff are accepted in patch mode.');
+    return;
+  }
+  const fileContents = await downloadTelegramFile(ctx, doc.file_id);
+  const chunkLength = appendPatchChunk(session, fileContents);
+  await ctx.reply(
+    `Patch file received (${chunkLength} chars).\nPress ‘✅ Patch completed’ when ready.`,
+    { reply_markup: buildPatchSessionKeyboard() },
+  );
+});
+
+bot.on('message:text', async (ctx, next) => {
   const state = userState.get(ctx.from.id);
   if (!state || state.mode !== 'create-project') {
     return next();
@@ -193,6 +259,7 @@ bot.on('message', async (ctx, next) => {
 
 bot.command('start', async (ctx) => {
   resetUserState(ctx);
+  clearPatchSession(ctx.from.id);
   await renderMainMenu(ctx);
 });
 
@@ -213,12 +280,35 @@ bot.hears('⚙️ Settings', async (ctx) => {
 
 bot.callbackQuery('cancel_input', async (ctx) => {
   resetUserState(ctx);
+  clearPatchSession(ctx.from.id);
   try {
     await ctx.editMessageText('Operation cancelled.');
   } catch (error) {
     // Ignore edit failures (old message, etc.)
   }
   await renderMainMenu(ctx);
+});
+
+bot.callbackQuery('patch:cancel', async (ctx) => {
+  clearPatchSession(ctx.from.id);
+  await ctx.answerCallbackQuery();
+  try {
+    await ctx.editMessageText('Patch input cancelled.');
+  } catch (error) {
+    // Ignore edit failures
+  }
+  await renderMainMenu(ctx);
+});
+
+bot.callbackQuery('patch:finish', async (ctx) => {
+  const session = getPatchSession(ctx.from.id);
+  if (!session || !session.buffer.trim()) {
+    await ctx.answerCallbackQuery({ text: 'No patch text received yet.', show_alert: true });
+    return;
+  }
+  clearPatchSession(ctx.from.id);
+  await ctx.answerCallbackQuery();
+  await handlePatchApplication(ctx, session.projectId, session.buffer);
 });
 
 bot.on('callback_query:data', async (ctx) => {
@@ -251,9 +341,6 @@ bot.on('callback_query:data', async (ctx) => {
 
 async function handleStatefulMessage(ctx, state) {
   switch (state.type) {
-    case 'await_patch':
-      await handlePatchApplication(ctx, state);
-      break;
     case 'rename_project':
       await handleRenameProjectStep(ctx, state);
       break;
@@ -365,10 +452,14 @@ async function handleProjectCallback(ctx, data) {
       await renderServerMenu(ctx, projectId);
       break;
     case 'apply_patch':
-      setUserState(ctx.from.id, { type: 'await_patch', projectId });
-      await ctx.reply('Send the git patch as text or as a .patch/.diff file.\n(Or press Cancel)', {
-        reply_markup: buildCancelKeyboard(),
-      });
+      startPatchSession(ctx.from.id, projectId);
+      await ctx.reply(
+        'Send the git patch as text (you can use multiple messages)\n' +
+          'or attach a .patch / .diff file.\n' +
+          'When you are done, press ‘✅ Patch completed’.\n' +
+          'Or press ‘❌ Cancel’.',
+        { reply_markup: buildPatchSessionKeyboard() },
+      );
       break;
     case 'delete':
       await renderDeleteConfirmation(ctx, projectId);
@@ -931,15 +1022,6 @@ function getWorkingDirChoiceKeyboard() {
     .text('❌ Cancel', 'cancel_input');
 }
 
-function slugifyProjectId(value) {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40);
-}
-
 function parseRepoSlug(value) {
   if (!value) return undefined;
   const trimmed = value.trim();
@@ -1184,15 +1266,7 @@ async function finalizeProjectWizard(ctx, state) {
   await renderProjectsList(ctx);
 }
 
-async function handlePatchApplication(ctx, state) {
-  const cancelText = ctx.message.text?.trim();
-  if (cancelText && cancelText.toLowerCase() === 'cancel') {
-    resetUserState(ctx);
-    await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
-    return;
-  }
-  const projectId = state.projectId;
+async function handlePatchApplication(ctx, projectId, patchText) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
@@ -1205,12 +1279,6 @@ async function handlePatchApplication(ctx, state) {
   const globalSettings = await loadGlobalSettings();
 
   try {
-    const patchText = await extractPatchText(ctx);
-    if (!patchText) {
-      await ctx.reply('No patch text found.');
-      return;
-    }
-
     const effectiveBaseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
     let repoInfo;
     try {
@@ -1227,25 +1295,8 @@ async function handlePatchApplication(ctx, state) {
 
     await ctx.reply('Updating repository…');
     const { git, repoDir } = await prepareRepository(project, effectiveBaseBranch);
-    // Build a safe branch name from project.id + timestamp
-    const timestamp = formatTimestamp(new Date());
-    const safeProjectId = String(project.id)
-      .normalize('NFKD')
-      .replace(/[^\w\-/.]+/g, '-') // فقط حروف، عدد، _, -, /, . را نگه می‌داریم
-      .replace(/-+/g, '-')         // چند - پشت سر هم → یک -
-      .replace(/\/+/g, '/')        // چند / پشت سر هم → یک /
-      .replace(/^-+|-+$/g, '')     // حذف - از ابتدا/انتها
-      .toLowerCase()
-      .slice(0, 50);               // خیلی بلند نشود
+    const branchName = makePatchBranchName(project.id);
 
-    const branchName = `patch/${safeProjectId}/${timestamp}`;
-
-    await ctx.reply('Creating branch…');
-    await createWorkingBranch(git, effectiveBaseBranch, branchName);
-
-
-
-    await ctx.reply('Creating branch…');
     await createWorkingBranch(git, effectiveBaseBranch, branchName);
 
     await ctx.reply('Applying patch…');
@@ -2349,35 +2400,6 @@ function parseRenderErrorPayload(body) {
       level: '',
     };
   }
-}
-
-function formatTimestamp(date) {
-  const pad = (n) => String(n).padStart(2, '0');
-  const yyyy = date.getFullYear();
-  const mm = pad(date.getMonth() + 1);
-  const dd = pad(date.getDate());
-  const hh = pad(date.getHours());
-  const min = pad(date.getMinutes());
-  const ss = pad(date.getSeconds());
-  return `${yyyy}${mm}${dd}-${hh}${min}${ss}`;
-}
-
-async function extractPatchText(ctx) {
-  if (ctx.message.document) {
-    const doc = ctx.message.document;
-    const fileName = doc.file_name || '';
-    if (!fileName.endsWith('.patch') && !fileName.endsWith('.diff')) {
-      await ctx.reply('Unsupported file type. Please send a .patch or .diff file.');
-      return null;
-    }
-    return downloadTelegramFile(ctx, doc.file_id);
-  }
-
-  const text = ctx.message.text;
-  if (!text) {
-    return null;
-  }
-  return text;
 }
 
 function downloadTelegramFile(ctx, fileId) {
