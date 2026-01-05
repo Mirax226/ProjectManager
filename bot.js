@@ -6,7 +6,6 @@ const { Bot, InlineKeyboard, Keyboard } = require('grammy');
 const { Pool } = require('pg');
 
 const { loadProjects, saveProjects, findProjectById } = require('./projectsStore');
-const { getPool: getConfigPool } = require('./configStore');
 const { setUserState, getUserState, clearUserState } = require('./state');
 const {
   prepareRepository,
@@ -37,38 +36,64 @@ const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
+const userState = new Map();
+let configStatusPool = null;
+
+async function renderOrEdit(ctx, text, extra) {
+  if (ctx.callbackQuery) {
+    try {
+      return await ctx.editMessageText(text, extra);
+    } catch (err) {
+      console.error('[UI] editMessageText failed, fallback to reply', err);
+      return ctx.reply(text, extra);
+    }
+  }
+  return ctx.reply(text, extra);
+}
+
+async function checkConfigDbStatus() {
+  const dsn = process.env.PATH_APPLIER_CONFIG_DSN;
+  if (!dsn) {
+    return { ok: false, message: 'not configured' };
+  }
+  try {
+    if (!configStatusPool) {
+      configStatusPool = new Pool({
+        connectionString: dsn,
+        max: 1,
+        idleTimeoutMillis: 30_000,
+      });
+    }
+    await configStatusPool.query('SELECT 1');
+    return { ok: true, message: 'OK' };
+  } catch (error) {
+    return { ok: false, message: error.message || 'error' };
+  }
+}
 
 async function testConfigDbConnection() {
-  try {
-    const db = await getConfigPool();
-    if (!db) {
-      return;
-    }
-    await db.query('SELECT 1');
+  const status = await checkConfigDbStatus();
+  if (status.ok) {
     console.log('Config DB: OK');
-  } catch (error) {
-    console.error('Config DB connection failed', error);
+    return;
   }
+  if (status.message === 'not configured') {
+    console.warn('Config DB: PATH_APPLIER_CONFIG_DSN not set.');
+    return;
+  }
+  console.error('Config DB connection failed', status.message);
 }
 
 const mainKeyboard = new Keyboard()
   .text('📁 Projects')
   .row()
-  .text('🗄️ Supabase')
+  .text('🏭 Data Center')
   .row()
   .text('⚙️ Settings')
   .row()
   .text('📶 Ping test')
   .row()
   .text('❓ Help')
-  .resized();
-
-const projectsKeyboard = new Keyboard()
-  .text('📄 List projects')
-  .row()
-  .text('➕ Add project')
-  .row()
-  .text('⬅️ Back')
   .resized();
 
 bot.use(async (ctx, next) => {
@@ -80,6 +105,14 @@ bot.use(async (ctx, next) => {
     return;
   }
   return next();
+});
+
+bot.on('text', async (ctx, next) => {
+  const state = userState.get(ctx.from.id);
+  if (!state || state.mode !== 'create-project') {
+    return next();
+  }
+  await handleProjectWizardInput(ctx, state);
 });
 
 bot.on('message', async (ctx, next) => {
@@ -103,24 +136,11 @@ bot.hears('❓ Help', async (ctx) => {
 });
 
 bot.hears('📁 Projects', async (ctx) => {
-  await ctx.reply('Project actions:', { reply_markup: projectsKeyboard });
-});
-
-bot.hears('🗄️ Supabase', async (ctx) => {
-  await renderSupabaseConnectionsMenu(ctx);
-});
-
-bot.hears('⬅️ Back', async (ctx) => {
-  await ctx.reply('Main menu:', { reply_markup: mainKeyboard });
-});
-
-bot.hears('➕ Add project', async (ctx) => {
-  setUserState(ctx.from.id, { type: 'add_project', step: 1, data: {} });
-  await ctx.reply('Send a short ID for the project (e.g. daily-system)');
-});
-
-bot.hears('📄 List projects', async (ctx) => {
   await renderProjectsList(ctx);
+});
+
+bot.hears('🏭 Data Center', async (ctx) => {
+  await renderDataCenterMenu(ctx);
 });
 
 bot.hears('⚙️ Settings', async (ctx) => {
@@ -158,8 +178,16 @@ bot.hears('📶 Ping test', async (ctx) => {
 
 bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data;
+  if (data.startsWith('main:')) {
+    await handleMainCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('proj:')) {
     await handleProjectCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('projwiz:')) {
+    await handleProjectWizardCallback(ctx, data);
     return;
   }
   if (data.startsWith('gsettings:')) {
@@ -174,9 +202,6 @@ bot.on('callback_query:data', async (ctx) => {
 
 async function handleStatefulMessage(ctx, state) {
   switch (state.type) {
-    case 'add_project':
-      await handleAddProjectStep(ctx, state);
-      break;
     case 'await_patch':
       await handlePatchApplication(ctx, state);
       break;
@@ -207,50 +232,83 @@ async function handleStatefulMessage(ctx, state) {
   }
 }
 
+function buildProjectsKeyboard(projects, globalSettings) {
+  const defaultId = globalSettings?.defaultProjectId;
+  const rows = projects.map((project) => {
+    const label = `${project.id === defaultId ? '⭐ ' : ''}${project.name || project.id}`;
+    return [
+      {
+        text: label,
+        callback_data: `proj:open:${project.id}`,
+      },
+    ];
+  });
+
+  rows.push([{ text: '➕ Add project', callback_data: 'proj:add' }]);
+  rows.push([{ text: '⬅️ Back', callback_data: 'main:back' }]);
+  return { inline_keyboard: rows };
+}
+
 async function renderProjectsList(ctx) {
   const projects = await loadProjects();
   const globalSettings = await loadGlobalSettings();
   if (!projects.length) {
-    await ctx.reply('No projects configured yet.', { reply_markup: projectsKeyboard });
+    await renderOrEdit(ctx, 'No projects configured yet.', {
+      reply_markup: buildProjectsKeyboard([], globalSettings),
+    });
     return;
   }
 
-  const lines = projects
-    .map((p, idx) => {
-      const effectiveBase = p.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
-      return `${idx + 1}. ${p.id} (base: ${effectiveBase})`;
-    })
-    .join('\n');
-
-  const inline = new InlineKeyboard();
-  projects.forEach((project) => {
-    inline
-      .text('🧩 Apply patch', `proj:${project.id}:apply_patch`)
-      .text('⚙️ Settings', `proj:${project.id}:settings`)
-      .text('🗑️ Delete', `proj:${project.id}:delete`)
-      .row();
+  await renderOrEdit(ctx, 'Select a project:', {
+    reply_markup: buildProjectsKeyboard(projects, globalSettings),
   });
+}
 
-  await ctx.reply(lines, { reply_markup: inline });
+async function handleMainCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const [, action] = data.split(':');
+  if (action === 'back') {
+    await ctx.reply('Main menu:', { reply_markup: mainKeyboard });
+  }
 }
 
 async function handleProjectCallback(ctx, data) {
   await ctx.answerCallbackQuery();
-  const [, projectId, action, extra] = data.split(':');
+  const [, action, projectId, extra] = data.split(':');
+
+  if (action === 'add') {
+    await startProjectWizard(ctx);
+    return;
+  }
+
+  if (action === 'list') {
+    await renderProjectsList(ctx);
+    return;
+  }
+
   const projects = await loadProjects();
-  const project = findProjectById(projects, projectId);
-  if (!project && action !== 'confirm_delete' && action !== 'cancel_delete') {
-    await ctx.reply('Project not found.');
+  const project = projectId ? findProjectById(projects, projectId) : null;
+  if (!project && !['confirm_delete', 'cancel_delete'].includes(action)) {
+    await renderOrEdit(ctx, 'Project not found.');
     return;
   }
 
   switch (action) {
+    case 'open':
+      await renderProjectSettings(ctx, projectId);
+      break;
+    case 'project_menu':
+      await renderProjectMenu(ctx, projectId);
+      break;
+    case 'server_menu':
+      await renderServerMenu(ctx, projectId);
+      break;
+    case 'datacenter_menu':
+      await renderDataCenterMenu(ctx, { projectId });
+      break;
     case 'apply_patch':
       setUserState(ctx.from.id, { type: 'await_patch', projectId });
       await ctx.reply('Send the git patch as text or as a .patch/.diff file.');
-      break;
-    case 'settings':
-      await renderProjectSettings(ctx, projectId);
       break;
     case 'delete':
       await renderDeleteConfirmation(ctx, projectId);
@@ -259,7 +317,7 @@ async function handleProjectCallback(ctx, data) {
       await deleteProject(ctx, projectId);
       break;
     case 'cancel_delete':
-      await ctx.reply('Deletion cancelled.');
+      await renderOrEdit(ctx, 'Deletion cancelled.');
       await renderProjectsList(ctx);
       break;
     case 'rename':
@@ -281,15 +339,15 @@ async function handleProjectCallback(ctx, data) {
       });
       await ctx.reply(`Send new value for ${extra}.`);
       break;
-    case 'cmd_clear':
-      await updateProjectField(projectId, extra, undefined);
-      await ctx.reply(`${extra} cleared.`);
-      await renderProjectSettings(ctx, projectId);
+    case 'cmd_clearall':
+      await clearProjectCommands(projectId);
+      await renderOrEdit(ctx, 'Commands cleared.');
+      await renderCommandsScreen(ctx, projectId);
       break;
     case 'diagnostics':
       await runProjectDiagnostics(ctx, projectId);
       break;
-    case 'render':
+    case 'render_menu':
       await renderRenderUrlsScreen(ctx, projectId);
       break;
     case 'render_ping':
@@ -311,8 +369,8 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'render_clear':
       await updateProjectField(projectId, extra, undefined);
-      await ctx.reply(`${extra} cleared.`);
-      await renderProjectSettings(ctx, projectId);
+      await renderOrEdit(ctx, `${extra} cleared.`);
+      await renderRenderUrlsScreen(ctx, projectId);
       break;
     case 'supabase':
       await renderSupabaseScreen(ctx, projectId);
@@ -323,12 +381,12 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'supabase_clear':
       await updateProjectField(projectId, 'supabaseConnectionId', undefined);
-      await ctx.reply('supabaseConnectionId cleared.');
-      await renderProjectSettings(ctx, projectId);
+      await renderOrEdit(ctx, 'supabaseConnectionId cleared.');
+      await renderSupabaseScreen(ctx, projectId);
       break;
     case 'set_default':
       await setDefaultProject(projectId);
-      await ctx.reply('Default project updated.');
+      await renderOrEdit(ctx, 'Default project updated.');
       await renderProjectSettings(ctx, projectId);
       break;
     case 'back':
@@ -349,12 +407,12 @@ async function handleGlobalSettingsCallback(ctx, data) {
       break;
     case 'clear_default_base':
       await clearDefaultBaseBranch();
-      await ctx.reply('Default base branch cleared (using environment default).');
+      await renderOrEdit(ctx, 'Default base branch cleared (using environment default).');
       await renderGlobalSettings(ctx);
       break;
     case 'clear_default_project':
       await clearDefaultProject();
-      await ctx.reply('Default project cleared.');
+      await renderOrEdit(ctx, 'Default project cleared.');
       await renderGlobalSettings(ctx);
       break;
     case 'back':
@@ -371,7 +429,7 @@ async function handleSupabaseCallback(ctx, data) {
   switch (action) {
     case 'back':
       clearUserState(ctx.from.id);
-      await ctx.reply('Main menu:', { reply_markup: mainKeyboard });
+      await renderDataCenterMenu(ctx);
       break;
     case 'connections':
       await renderSupabaseConnectionsMenu(ctx);
@@ -396,7 +454,9 @@ async function handleSupabaseCallback(ctx, data) {
 async function renderSupabaseConnectionsMenu(ctx) {
   const connections = await loadSupabaseConnections();
   if (!connections.length) {
-    await ctx.reply('No Supabase connections configured.', { reply_markup: mainKeyboard });
+    await renderOrEdit(ctx, 'No Supabase connections configured.', {
+      reply_markup: new InlineKeyboard().text('⬅️ Back', 'supabase:back'),
+    });
     return;
   }
   const inline = new InlineKeyboard();
@@ -404,7 +464,7 @@ async function renderSupabaseConnectionsMenu(ctx) {
     inline.text(`🗄️ ${connection.name}`, `supabase:conn:${connection.id}`).row();
   });
   inline.text('⬅️ Back', 'supabase:back');
-  await ctx.reply('Select a Supabase connection:', { reply_markup: inline });
+  await renderOrEdit(ctx, 'Select a Supabase connection:', { reply_markup: inline });
 }
 
 async function renderSupabaseConnectionMenu(ctx, connectionId) {
@@ -420,7 +480,7 @@ async function renderSupabaseConnectionMenu(ctx, connectionId) {
     .row()
     .text('⬅️ Back', 'supabase:connections');
 
-  await ctx.reply(`Supabase: ${connection.name}`, { reply_markup: inline });
+  await renderOrEdit(ctx, `Supabase: ${connection.name}`, { reply_markup: inline });
 }
 
 async function handleSupabaseConsoleMessage(ctx, state) {
@@ -510,65 +570,223 @@ function truncateMessage(text, limit) {
   return `${text.slice(0, limit)}\n... (truncated)`;
 }
 
-async function handleAddProjectStep(ctx, state) {
-  const text = ctx.message.text?.trim();
-  if (!text) {
-    await ctx.reply('Please send text for this step.');
-    return;
+function getWizardSteps() {
+  return [
+    'name',
+    'id',
+    'repoUrl',
+    'workingDir',
+    'startCommand',
+    'testCommand',
+    'diagnosticCommand',
+    'renderServiceUrl',
+    'renderDeployHookUrl',
+  ];
+}
+
+function getNextWizardStep(current) {
+  const steps = getWizardSteps();
+  const idx = steps.indexOf(current);
+  return steps[idx + 1] || null;
+}
+
+function getWizardKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '⏭ Skip', callback_data: 'projwiz:skip' }],
+      [{ text: '❌ Cancel', callback_data: 'projwiz:cancel' }],
+    ],
+  };
+}
+
+function slugifyProjectId(value) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+}
+
+function parseRepoInfo(value) {
+  if (!value) return {};
+  const trimmed = value.trim();
+  const urlMatch = trimmed.match(/github\.com\/([^/]+)\/([^/]+)(?:\.git)?/i);
+  if (urlMatch) {
+    return { owner: urlMatch[1], repo: urlMatch[2].replace(/\.git$/i, '') };
   }
-
-  const data = state.data;
-  if (state.step === 1) {
-    data.id = text;
-    setUserState(ctx.from.id, { type: 'add_project', step: 2, data });
-    await ctx.reply('Send the GitHub owner (e.g. Mirax226)');
-    return;
-  }
-
-  if (state.step === 2) {
-    data.owner = text;
-    setUserState(ctx.from.id, { type: 'add_project', step: 3, data });
-    await ctx.reply('Send the GitHub repo name (e.g. daily-system-bot-v2)');
-    return;
-  }
-
-  if (state.step === 3) {
-    data.repo = text;
-    setUserState(ctx.from.id, { type: 'add_project', step: 4, data });
-    await ctx.reply('Send base branch (or leave empty to use default)');
-    return;
-  }
-
-  if (state.step === 4) {
-    const globalSettings = await loadGlobalSettings();
-    data.baseBranch = text || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
-
-    const projects = await loadProjects();
-    if (findProjectById(projects, data.id)) {
-      await ctx.reply('A project with this ID already exists.');
-      clearUserState(ctx.from.id);
-      return;
+  if (trimmed.includes('/')) {
+    const [owner, repo] = trimmed.split('/');
+    if (owner && repo) {
+      return { owner, repo };
     }
-
-    const project = {
-      id: data.id,
-      name: data.id,
-      owner: data.owner,
-      repo: data.repo,
-      repoUrl: `https://github.com/${data.owner}/${data.repo}`,
-      baseBranch: data.baseBranch,
-      workingDir: getRepoPath({ owner: data.owner, repo: data.repo }),
-    };
-
-    projects.push(project);
-    await saveProjects(projects);
-    clearUserState(ctx.from.id);
-
-    await ctx.reply(
-      `Saved project:\nID: ${project.id}\nOwner: ${project.owner}\nRepo: ${project.repo}\nBase: ${project.baseBranch}`,
-      { reply_markup: projectsKeyboard },
-    );
   }
+  return {};
+}
+
+async function startProjectWizard(ctx) {
+  userState.set(ctx.from.id, {
+    mode: 'create-project',
+    step: 'name',
+    draft: {},
+  });
+
+  await promptNextProjectField(ctx, userState.get(ctx.from.id));
+}
+
+async function handleProjectWizardCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const [, action] = data.split(':');
+  const state = userState.get(ctx.from.id);
+  if (!state || state.mode !== 'create-project') {
+    return;
+  }
+
+  if (action === 'cancel') {
+    userState.delete(ctx.from.id);
+    await renderOrEdit(ctx, 'Project creation cancelled.');
+    await renderProjectsList(ctx);
+    return;
+  }
+
+  if (action === 'skip') {
+    state.step = getNextWizardStep(state.step);
+    await promptNextProjectField(ctx, state);
+  }
+}
+
+async function handleProjectWizardInput(ctx, state) {
+  const value = ctx.message.text.trim();
+  if (!value) {
+    await ctx.reply('Please send text or press Skip.');
+    return;
+  }
+
+  if (state.step === 'name') {
+    state.draft.name = value;
+    state.step = 'id';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'id') {
+    state.draft.id = value;
+    state.step = 'repoUrl';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'repoUrl') {
+    state.draft.repoUrl = value;
+    state.step = 'workingDir';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'workingDir') {
+    state.draft.workingDir = value;
+    state.step = 'startCommand';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'startCommand') {
+    state.draft.startCommand = value;
+    state.step = 'testCommand';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'testCommand') {
+    state.draft.testCommand = value;
+    state.step = 'diagnosticCommand';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'diagnosticCommand') {
+    state.draft.diagnosticCommand = value;
+    state.step = 'renderServiceUrl';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'renderServiceUrl') {
+    state.draft.renderServiceUrl = value;
+    state.step = 'renderDeployHookUrl';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'renderDeployHookUrl') {
+    state.draft.renderDeployHookUrl = value;
+    state.step = null;
+    await promptNextProjectField(ctx, state);
+  }
+}
+
+async function promptNextProjectField(ctx, state) {
+  if (!state.step) {
+    await finalizeProjectWizard(ctx, state);
+    return;
+  }
+
+  const prompts = {
+    name: '🆕 New project\n\nSend project *name* or press Skip.',
+    id: 'Send project *ID* (unique short handle) or press Skip.',
+    repoUrl: 'Send the GitHub repo URL or `owner/repo` (or Skip).',
+    workingDir: 'Send working directory path (or Skip).',
+    startCommand: 'Send *startCommand* (or Skip).',
+    testCommand: 'Send *testCommand* (or Skip).',
+    diagnosticCommand: 'Send *diagnosticCommand* (or Skip).',
+    renderServiceUrl: 'Send Render service URL (or Skip).',
+    renderDeployHookUrl: 'Send Render deploy hook URL (or Skip).',
+  };
+
+  await renderOrEdit(ctx, prompts[state.step], {
+    parse_mode: 'Markdown',
+    reply_markup: getWizardKeyboard(),
+  });
+}
+
+async function finalizeProjectWizard(ctx, state) {
+  const draft = state.draft || {};
+  const repoInfo = parseRepoInfo(draft.repoUrl);
+  const baseId = draft.id || slugifyProjectId(draft.name || 'project');
+  const fallbackId = baseId || `project-${Date.now()}`;
+
+  const projects = await loadProjects();
+  let finalId = fallbackId;
+  if (projects.find((project) => project.id === finalId)) {
+    finalId = `${finalId}-${Date.now()}`;
+  }
+
+  const owner = draft.owner || repoInfo.owner;
+  const repo = draft.repo || repoInfo.repo;
+
+  const project = {
+    id: finalId,
+    name: draft.name || finalId,
+    owner,
+    repo,
+    repoUrl: draft.repoUrl || (owner && repo ? `https://github.com/${owner}/${repo}` : undefined),
+    workingDir: draft.workingDir || (owner && repo ? getRepoPath({ owner, repo }) : undefined),
+    startCommand: draft.startCommand,
+    testCommand: draft.testCommand,
+    diagnosticCommand: draft.diagnosticCommand,
+    renderServiceUrl: draft.renderServiceUrl,
+    renderDeployHookUrl: draft.renderDeployHookUrl,
+  };
+
+  projects.push(project);
+  await saveProjects(projects);
+  userState.delete(ctx.from.id);
+
+  await renderOrEdit(
+    ctx,
+    `✅ Project created.\nName: ${project.name}\nID: ${project.id}`,
+  );
+  await renderProjectsList(ctx);
 }
 
 async function handlePatchApplication(ctx, state) {
@@ -713,7 +931,7 @@ async function handleChangeBaseBranchStep(ctx, state) {
 
   clearUserState(ctx.from.id);
   await ctx.reply('Base branch updated.');
-  await renderProjectSettings(ctx, state.projectId);
+  await renderProjectMenu(ctx, state.projectId);
 }
 
 async function handleEditCommandInput(ctx, state) {
@@ -732,7 +950,7 @@ async function handleEditCommandInput(ctx, state) {
 
   clearUserState(ctx.from.id);
   await ctx.reply(`${state.field} updated.`);
-  await renderProjectSettings(ctx, state.projectId);
+  await renderCommandsScreen(ctx, state.projectId);
 }
 
 async function handleEditRenderUrl(ctx, state) {
@@ -751,7 +969,7 @@ async function handleEditRenderUrl(ctx, state) {
 
   clearUserState(ctx.from.id);
   await ctx.reply(`${state.field} updated.`);
-  await renderProjectSettings(ctx, state.projectId);
+  await renderRenderUrlsScreen(ctx, state.projectId);
 }
 
 async function handleEditSupabase(ctx, state) {
@@ -770,7 +988,7 @@ async function handleEditSupabase(ctx, state) {
 
   clearUserState(ctx.from.id);
   await ctx.reply('supabaseConnectionId updated.');
-  await renderProjectSettings(ctx, state.projectId);
+  await renderSupabaseScreen(ctx, state.projectId);
 }
 
 async function handleGlobalBaseChange(ctx, state) {
@@ -885,7 +1103,7 @@ async function getProjectById(projectId, ctx) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project && ctx) {
-    await ctx.reply('Project not found.');
+    await renderOrEdit(ctx, 'Project not found.');
   }
   return project;
 }
@@ -894,73 +1112,142 @@ async function renderProjectSettings(ctx, projectId) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
-    await ctx.reply('Project not found.');
+    await renderOrEdit(ctx, 'Project not found.');
     return;
   }
   const globalSettings = await loadGlobalSettings();
   const effectiveBase = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
 
   const lines = [
-    `Name: ${project.name || '-'}`,
+    `📁 ${project.name || project.id}`,
     `ID: ${project.id}`,
     `Repo: ${project.owner ? `${project.owner}/${project.repo}` : project.repoUrl || '-'}`,
-    `Repo URL: ${project.repoUrl || '-'}`,
     `Working dir: ${project.workingDir || '-'}`,
     `Base branch: ${effectiveBase}`,
-    `startCommand: ${project.startCommand || '-'}`,
-    `testCommand: ${project.testCommand || '-'}`,
-    `diagnosticCommand: ${project.diagnosticCommand || '-'}`,
-    `renderServiceUrl: ${project.renderServiceUrl || '-'}`,
-    `renderDeployHookUrl: ${project.renderDeployHookUrl || '-'}`,
-    `supabaseConnectionId: ${project.supabaseConnectionId || '-'}`,
   ];
 
   const inline = new InlineKeyboard()
-    .text('✏️ Edit project', `proj:${project.id}:rename`)
+    .text('📂 Project', `proj:project_menu:${project.id}`)
     .row()
-    .text('🌿 Change base branch', `proj:${project.id}:change_base`)
-    .row()
-    .text('🧰 Edit commands', `proj:${project.id}:commands`)
-    .row()
-    .text('🧪 Run diagnostics', `proj:${project.id}:diagnostics`)
-    .row()
-    .text('🛰️ Edit Render URLs', `proj:${project.id}:render`);
+    .text('🖥 Server', `proj:server_menu:${project.id}`)
+    .row();
 
-  if (project.renderServiceUrl) {
-    inline
-      .row()
-      .text('📡 Ping Render now', `proj:${project.id}:render_ping`)
-      .row()
-      .text('🔗 Show keep-alive URL', `proj:${project.id}:render_keepalive_url`);
+  if (project.supabaseConnectionId) {
+    inline.text('🏭 Data Center', `proj:datacenter_menu:${project.id}`).row();
   }
 
-  if (project.renderDeployHookUrl) {
-    inline.row().text('🚀 Deploy (Render)', `proj:${project.id}:render_deploy`);
+  if (project.id !== globalSettings.defaultProjectId) {
+    inline.text('⭐ Set as default project', `proj:set_default:${project.id}`).row();
   }
 
   inline
+    .text('🗑️ Delete project', `proj:delete:${project.id}`)
     .row()
-    .text('🗄️ Edit Supabase binding', `proj:${project.id}:supabase`)
-    .row()
-    .text('⭐ Set as default project', `proj:${project.id}:set_default`)
-    .row()
-    .text('⬅️ Back', `proj:${project.id}:back`);
+    .text('⬅️ Back', 'proj:list');
 
-  await ctx.reply(lines.join('\n'), { reply_markup: inline });
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderProjectMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+
+  const inline = new InlineKeyboard()
+    .text('🧩 Apply patch', `proj:apply_patch:${projectId}`)
+    .row()
+    .text('✏️ Edit project', `proj:rename:${projectId}`)
+    .row()
+    .text('🌿 Change base branch', `proj:change_base:${projectId}`)
+    .row()
+    .text('🧰 Edit commands', `proj:commands:${projectId}`)
+    .row()
+    .text('🧪 Run diagnostics', `proj:diagnostics:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, `📂 Project menu: ${project.name || project.id}`, {
+    reply_markup: inline,
+  });
+}
+
+async function renderServerMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+
+  const lines = [
+    `🖥 Server menu: ${project.name || project.id}`,
+    `Render service URL: ${project.renderServiceUrl || '-'}`,
+    `Render deploy hook URL: ${project.renderDeployHookUrl || '-'}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text('📶 Ping Render now', `proj:render_ping:${projectId}`)
+    .row()
+    .text('🔗 Edit Render URLs', `proj:render_menu:${projectId}`)
+    .row();
+
+  if (project.renderServiceUrl) {
+    inline.text('🛰 Show keep-alive URL', `proj:render_keepalive_url:${projectId}`).row();
+  }
+
+  if (project.renderDeployHookUrl) {
+    inline.text('🚀 Deploy (Render)', `proj:render_deploy:${projectId}`).row();
+  }
+
+  inline.text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDataCenterMenu(ctx, options = {}) {
+  const { projectId } = options;
+  const configStatus = await checkConfigDbStatus();
+  const connections = await loadSupabaseConnections();
+  const lines = [
+    '🏭 Data Center',
+    `Config DB: ${configStatus.ok ? 'OK' : configStatus.message}`,
+    `Supabase connections: ${connections.length}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text('🗄️ Supabase console', 'supabase:connections')
+    .row();
+
+  if (projectId) {
+    inline.text('🔗 Edit Supabase binding', `proj:supabase:${projectId}`).row();
+  } else {
+    const settings = await loadGlobalSettings();
+    if (settings.defaultProjectId) {
+      inline.text(
+        '🔗 Edit Supabase binding',
+        `proj:supabase:${settings.defaultProjectId}`,
+      ).row();
+    }
+  }
+
+  if (projectId) {
+    inline.text('⬅️ Back', `proj:open:${projectId}`);
+  } else {
+    inline.text('⬅️ Back', 'main:back');
+  }
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderDeleteConfirmation(ctx, projectId) {
   const inline = new InlineKeyboard()
-    .text('🗑️ Yes, delete', `proj:${projectId}:confirm_delete`)
-    .text('⬅️ Cancel', `proj:${projectId}:cancel_delete`);
-  await ctx.reply(`Are you sure you want to delete project ${projectId}?`, { reply_markup: inline });
+    .text('🗑️ Yes, delete', `proj:confirm_delete:${projectId}`)
+    .text('⬅️ Cancel', `proj:cancel_delete:${projectId}`);
+  await renderOrEdit(ctx, `Are you sure you want to delete project ${projectId}?`, {
+    reply_markup: inline,
+  });
 }
 
 async function deleteProject(ctx, projectId) {
   const projects = await loadProjects();
   const filtered = projects.filter((p) => p.id !== projectId);
   if (filtered.length === projects.length) {
-    await ctx.reply('Project not found.');
+    await renderOrEdit(ctx, 'Project not found.');
     return;
   }
   await saveProjects(filtered);
@@ -969,7 +1256,7 @@ async function deleteProject(ctx, projectId) {
     settings.defaultProjectId = undefined;
     await saveGlobalSettings(settings);
   }
-  await ctx.reply(`Project ${projectId} deleted.`);
+  await renderOrEdit(ctx, `Project ${projectId} deleted.`);
   await renderProjectsList(ctx);
 }
 
@@ -988,21 +1275,19 @@ async function renderCommandsScreen(ctx, projectId) {
   ];
 
   const inline = new InlineKeyboard()
-    .text('✏️ Edit startCommand', `proj:${project.id}:cmd_edit:startCommand`)
+    .text('✏️ Edit startCommand', `proj:cmd_edit:${project.id}:startCommand`)
     .row()
-    .text('✏️ Edit testCommand', `proj:${project.id}:cmd_edit:testCommand`)
+    .text('✏️ Edit testCommand', `proj:cmd_edit:${project.id}:testCommand`)
     .row()
-    .text('✏️ Edit diagnosticCommand', `proj:${project.id}:cmd_edit:diagnosticCommand`)
-    .row()
-    .text('🧹 Clear startCommand', `proj:${project.id}:cmd_clear:startCommand`)
-    .row()
-    .text('🧹 Clear testCommand', `proj:${project.id}:cmd_clear:testCommand`)
-    .row()
-    .text('🧹 Clear diagnosticCommand', `proj:${project.id}:cmd_clear:diagnosticCommand`)
-    .row()
-    .text('⬅️ Back', `proj:${project.id}:settings`);
+    .text('✏️ Edit diagnosticCommand', `proj:cmd_edit:${project.id}:diagnosticCommand`);
 
-  await ctx.reply(lines.join('\n'), { reply_markup: inline });
+  if (project.startCommand || project.testCommand || project.diagnosticCommand) {
+    inline.row().text('🧹 Clear all commands', `proj:cmd_clearall:${project.id}`);
+  }
+
+  inline.row().text('⬅️ Back', `proj:project_menu:${project.id}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderRenderUrlsScreen(ctx, projectId) {
@@ -1019,17 +1304,22 @@ async function renderRenderUrlsScreen(ctx, projectId) {
   ];
 
   const inline = new InlineKeyboard()
-    .text('✏️ Edit service URL', `proj:${project.id}:render_edit:renderServiceUrl`)
+    .text('✏️ Edit service URL', `proj:render_edit:${project.id}:renderServiceUrl`)
     .row()
-    .text('✏️ Edit deploy hook URL', `proj:${project.id}:render_edit:renderDeployHookUrl`)
-    .row()
-    .text('🧹 Clear service URL', `proj:${project.id}:render_clear:renderServiceUrl`)
-    .row()
-    .text('🧹 Clear deploy hook URL', `proj:${project.id}:render_clear:renderDeployHookUrl`)
-    .row()
-    .text('⬅️ Back', `proj:${project.id}:settings`);
+    .text('✏️ Edit deploy hook URL', `proj:render_edit:${project.id}:renderDeployHookUrl`);
 
-  await ctx.reply(lines.join('\n'), { reply_markup: inline });
+  if (project.renderServiceUrl) {
+    inline.row().text('🧹 Clear service URL', `proj:render_clear:${project.id}:renderServiceUrl`);
+  }
+  if (project.renderDeployHookUrl) {
+    inline
+      .row()
+      .text('🧹 Clear deploy hook URL', `proj:render_clear:${project.id}:renderDeployHookUrl`);
+  }
+
+  inline.row().text('⬅️ Back', `proj:server_menu:${project.id}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderSupabaseScreen(ctx, projectId) {
@@ -1041,13 +1331,13 @@ async function renderSupabaseScreen(ctx, projectId) {
   }
 
   const lines = [`supabaseConnectionId: ${project.supabaseConnectionId || '-'}`];
-  const inline = new InlineKeyboard()
-    .text('✏️ Edit', `proj:${project.id}:supabase_edit`)
-    .text('🧹 Clear', `proj:${project.id}:supabase_clear`)
-    .row()
-    .text('⬅️ Back', `proj:${project.id}:settings`);
+  const inline = new InlineKeyboard().text('✏️ Edit', `proj:supabase_edit:${project.id}`);
+  if (project.supabaseConnectionId) {
+    inline.text('🧹 Clear', `proj:supabase_clear:${project.id}`);
+  }
+  inline.row().text('⬅️ Back', `proj:open:${project.id}`);
 
-  await ctx.reply(lines.join('\n'), { reply_markup: inline });
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderGlobalSettings(ctx) {
@@ -1071,7 +1361,7 @@ async function renderGlobalSettings(ctx) {
     .row()
     .text('⬅️ Back', 'gsettings:back');
 
-  await ctx.reply(lines.join('\n'), { reply_markup: inline });
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function setDefaultProject(projectId) {
@@ -1099,6 +1389,22 @@ async function updateProjectField(projectId, field, value) {
     return false;
   }
   projects[idx] = { ...projects[idx], [field]: value };
+  await saveProjects(projects);
+  return true;
+}
+
+async function clearProjectCommands(projectId) {
+  const projects = await loadProjects();
+  const idx = projects.findIndex((p) => p.id === projectId);
+  if (idx === -1) {
+    return false;
+  }
+  projects[idx] = {
+    ...projects[idx],
+    startCommand: undefined,
+    testCommand: undefined,
+    diagnosticCommand: undefined,
+  };
   await saveProjects(projects);
   return true;
 }
