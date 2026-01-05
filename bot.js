@@ -60,6 +60,20 @@ async function renderOrEdit(ctx, text, extra) {
   return ctx.reply(text, extra);
 }
 
+function resetUserState(ctx) {
+  if (!ctx?.from?.id) return;
+  userState.delete(ctx.from.id);
+  clearUserState(ctx.from.id);
+}
+
+async function renderMainMenu(ctx) {
+  await renderOrEdit(ctx, 'Main menu:', { reply_markup: mainKeyboard });
+}
+
+function buildCancelKeyboard() {
+  return new InlineKeyboard().text('❌ Cancel', 'cancel_input');
+}
+
 function getMessageTargetFromCtx(ctx) {
   const message = ctx.callbackQuery?.message;
   if (!message) return null;
@@ -140,19 +154,33 @@ bot.on('message', async (ctx, next) => {
 });
 
 bot.command('start', async (ctx) => {
-  await ctx.reply('Patch Runner Bot ready.', { reply_markup: mainKeyboard });
+  resetUserState(ctx);
+  await renderMainMenu(ctx);
 });
 
 bot.hears('📁 Projects', async (ctx) => {
+  resetUserState(ctx);
   await renderProjectsList(ctx);
 });
 
 bot.hears('🏭 Data Center', async (ctx) => {
+  resetUserState(ctx);
   await renderDataCenterMenu(ctx);
 });
 
 bot.hears('⚙️ Settings', async (ctx) => {
+  resetUserState(ctx);
   await renderGlobalSettings(ctx);
+});
+
+bot.callbackQuery('cancel_input', async (ctx) => {
+  resetUserState(ctx);
+  try {
+    await ctx.editMessageText('Operation cancelled.');
+  } catch (error) {
+    // Ignore edit failures (old message, etc.)
+  }
+  await renderMainMenu(ctx);
 });
 
 bot.on('callback_query:data', async (ctx) => {
@@ -250,7 +278,7 @@ async function handleMainCallback(ctx, data) {
   await ctx.answerCallbackQuery();
   const [, action] = data.split(':');
   if (action === 'back') {
-    await ctx.reply('Main menu:', { reply_markup: mainKeyboard });
+    await renderMainMenu(ctx);
   }
 }
 
@@ -287,7 +315,9 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'apply_patch':
       setUserState(ctx.from.id, { type: 'await_patch', projectId });
-      await ctx.reply('Send the git patch as text or as a .patch/.diff file.');
+      await ctx.reply('Send the git patch as text or as a .patch/.diff file.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'delete':
       await renderDeleteConfirmation(ctx, projectId);
@@ -306,7 +336,9 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the new project name.');
+      await ctx.reply('Send the new project name.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'change_base':
       setUserState(ctx.from.id, {
@@ -314,7 +346,9 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the new base branch.');
+      await ctx.reply('Send the new base branch.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'commands':
       await renderCommandsScreen(ctx, projectId);
@@ -326,7 +360,9 @@ async function handleProjectCallback(ctx, data) {
         field: extra,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply(`Send new value for ${extra}.`);
+      await ctx.reply(`Send new value for ${extra}.\n(Or press Cancel)`, {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'cmd_clearall':
       await clearProjectCommands(projectId);
@@ -354,7 +390,9 @@ async function handleProjectCallback(ctx, data) {
         field: extra,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply(`Send new value for ${extra}.`);
+      await ctx.reply(`Send new value for ${extra}.\n(Or press Cancel)`, {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'render_clear':
       await updateProjectField(projectId, extra, undefined);
@@ -369,7 +407,9 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send new supabaseConnectionId.');
+      await ctx.reply('Send new supabaseConnectionId.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'supabase_clear':
       await updateProjectField(projectId, 'supabaseConnectionId', undefined);
@@ -393,7 +433,9 @@ async function handleGlobalSettingsCallback(ctx, data) {
   switch (action) {
     case 'change_default_base':
       setUserState(ctx.from.id, { type: 'global_change_base' });
-      await ctx.reply('Send new default base branch.');
+      await ctx.reply('Send new default base branch.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'ping_test':
       await runPingTest(ctx);
@@ -409,7 +451,7 @@ async function handleGlobalSettingsCallback(ctx, data) {
       await renderGlobalSettings(ctx);
       break;
     case 'back':
-      await ctx.reply('Main menu:', { reply_markup: mainKeyboard });
+      await renderMainMenu(ctx);
       break;
     default:
       break;
@@ -421,28 +463,35 @@ async function handleSupabaseCallback(ctx, data) {
   const [, action, connectionId] = data.split(':');
   switch (action) {
     case 'add':
+      resetUserState(ctx);
       setUserState(ctx.from.id, {
         type: 'supabase_add',
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the connection as: id, name, envKey');
+      await ctx.reply('Send the connection as: id, name, envKey\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
       break;
     case 'back':
-      clearUserState(ctx.from.id);
+      resetUserState(ctx);
       await renderDataCenterMenu(ctx);
       break;
     case 'connections':
+      resetUserState(ctx);
       await renderSupabaseConnectionsMenu(ctx);
       break;
     case 'conn':
+      resetUserState(ctx);
       setUserState(ctx.from.id, { type: 'supabase_console', connectionId, mode: null });
       await renderSupabaseConnectionMenu(ctx, connectionId);
       break;
     case 'tables':
+      resetUserState(ctx);
       setUserState(ctx.from.id, { type: 'supabase_console', connectionId, mode: null });
       await listSupabaseTables(ctx, connectionId);
       break;
     case 'sql':
+      resetUserState(ctx);
       setUserState(ctx.from.id, { type: 'supabase_console', connectionId, mode: 'awaiting-sql' });
       await promptSupabaseSql(ctx, connectionId);
       break;
@@ -490,9 +539,18 @@ async function handleSupabaseAddMessage(ctx, state) {
     return;
   }
 
-  const parts = text.split(',').map((part) => part.trim()).filter(Boolean);
-  if (parts.length < 3) {
-    await ctx.reply('Invalid format. Please send: id, name, envKey');
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
+
+  const parts = text.split(',').map((part) => part.trim());
+  if (parts.length !== 3 || parts.some((part) => !part)) {
+    await ctx.reply(
+      'Invalid format.\n\nFormat:\n  id, name, envKey\n\nYou can also type `cancel` to exit.',
+    );
     return;
   }
 
@@ -505,7 +563,8 @@ async function handleSupabaseAddMessage(ctx, state) {
 
   const next = [...connections, { id, name, envKey }];
   await saveSupabaseConnections(next);
-  clearUserState(ctx.from.id);
+  resetUserState(ctx);
+  await ctx.reply('Supabase connection saved.');
   await renderDataCenterMenuForMessage(state.messageContext);
   if (!state.messageContext) {
     await renderDataCenterMenu(ctx);
@@ -521,6 +580,12 @@ async function handleSupabaseConsoleMessage(ctx, state) {
     await ctx.reply('Please send the SQL query as text.');
     return;
   }
+  if (sql.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
   await runSupabaseSql(ctx, state.connectionId, sql);
   setUserState(ctx.from.id, { type: 'supabase_console', connectionId: state.connectionId, mode: null });
   await renderSupabaseConnectionMenu(ctx, state.connectionId);
@@ -532,7 +597,9 @@ async function promptSupabaseSql(ctx, connectionId) {
     await ctx.reply('Supabase connection not found.');
     return;
   }
-  await ctx.reply(`Send the SQL query to execute on ${connection.name}.`);
+  await ctx.reply(`Send the SQL query to execute on ${connection.name}.\n(Or press Cancel)`, {
+    reply_markup: buildCancelKeyboard(),
+  });
 }
 
 async function listSupabaseTables(ctx, connectionId) {
@@ -624,12 +691,7 @@ function getNextWizardStep(current) {
 }
 
 function getWizardKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: '⏭ Skip', callback_data: 'projwiz:skip' }],
-      [{ text: '❌ Cancel', callback_data: 'projwiz:cancel' }],
-    ],
-  };
+  return new InlineKeyboard().text('⏭ Skip', 'projwiz:skip').row().text('❌ Cancel', 'cancel_input');
 }
 
 function slugifyProjectId(value) {
@@ -676,9 +738,9 @@ async function handleProjectWizardCallback(ctx, data) {
   }
 
   if (action === 'cancel') {
-    userState.delete(ctx.from.id);
+    resetUserState(ctx);
     await renderOrEdit(ctx, 'Project creation cancelled.');
-    await renderProjectsList(ctx);
+    await renderMainMenu(ctx);
     return;
   }
 
@@ -689,7 +751,14 @@ async function handleProjectWizardCallback(ctx, data) {
 }
 
 async function handleProjectWizardInput(ctx, state) {
-  const value = ctx.message.text.trim();
+  const text = ctx.message.text.trim();
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
+  const value = text;
   if (!value) {
     await ctx.reply('Please send text or press Skip.');
     return;
@@ -765,15 +834,15 @@ async function promptNextProjectField(ctx, state) {
   }
 
   const prompts = {
-    name: '🆕 New project\n\nSend project *name* or press Skip.',
-    id: 'Send project *ID* (unique short handle) or press Skip.',
-    repoUrl: 'Send the GitHub repo URL or `owner/repo` (or Skip).',
-    workingDir: 'Send working directory path (or Skip).',
-    startCommand: 'Send *startCommand* (or Skip).',
-    testCommand: 'Send *testCommand* (or Skip).',
-    diagnosticCommand: 'Send *diagnosticCommand* (or Skip).',
-    renderServiceUrl: 'Send Render service URL (or Skip).',
-    renderDeployHookUrl: 'Send Render deploy hook URL (or Skip).',
+    name: '🆕 New project\n\nSend project *name* or press Skip.\n(Or press Cancel)',
+    id: 'Send project *ID* (unique short handle) or press Skip.\n(Or press Cancel)',
+    repoUrl: 'Send the GitHub repo URL or `owner/repo` (or Skip).\n(Or press Cancel)',
+    workingDir: 'Send working directory path (or Skip).\n(Or press Cancel)',
+    startCommand: 'Send *startCommand* (or Skip).\n(Or press Cancel)',
+    testCommand: 'Send *testCommand* (or Skip).\n(Or press Cancel)',
+    diagnosticCommand: 'Send *diagnosticCommand* (or Skip).\n(Or press Cancel)',
+    renderServiceUrl: 'Send Render service URL (or Skip).\n(Or press Cancel)',
+    renderDeployHookUrl: 'Send Render deploy hook URL (or Skip).\n(Or press Cancel)',
   };
 
   await renderOrEdit(ctx, prompts[state.step], {
@@ -823,6 +892,13 @@ async function finalizeProjectWizard(ctx, state) {
 }
 
 async function handlePatchApplication(ctx, state) {
+  const cancelText = ctx.message.text?.trim();
+  if (cancelText && cancelText.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
   const projectId = state.projectId;
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
@@ -905,6 +981,12 @@ async function handleRenameProjectStep(ctx, state) {
     await ctx.reply('Please send text.');
     return;
   }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
 
   if (state.step === 1) {
     setUserState(ctx.from.id, {
@@ -913,7 +995,9 @@ async function handleRenameProjectStep(ctx, state) {
       projectId: state.projectId,
       data: { newName: text },
     });
-    await ctx.reply('Send new ID (or leave empty to keep current).');
+    await ctx.reply('Send new ID (or leave empty to keep current).\n(Or press Cancel)', {
+      reply_markup: buildCancelKeyboard(),
+    });
     return;
   }
 
@@ -956,6 +1040,12 @@ async function handleChangeBaseBranchStep(ctx, state) {
     await ctx.reply('Please send text.');
     return;
   }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
 
   const updated = await updateProjectField(state.projectId, 'baseBranch', text);
   if (!updated) {
@@ -975,6 +1065,12 @@ async function handleEditCommandInput(ctx, state) {
   const text = ctx.message.text?.trim();
   if (!text) {
     await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
     return;
   }
 
@@ -998,6 +1094,12 @@ async function handleEditRenderUrl(ctx, state) {
     await ctx.reply('Please send text.');
     return;
   }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
 
   const updated = await updateProjectField(state.projectId, state.field, text);
   if (!updated) {
@@ -1019,6 +1121,12 @@ async function handleEditSupabase(ctx, state) {
     await ctx.reply('Please send text.');
     return;
   }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
 
   const updated = await updateProjectField(state.projectId, 'supabaseConnectionId', text);
   if (!updated) {
@@ -1038,6 +1146,12 @@ async function handleGlobalBaseChange(ctx, state) {
   const text = ctx.message.text?.trim();
   if (!text) {
     await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
     return;
   }
 
