@@ -22,7 +22,11 @@ const {
   slugifyProjectId,
 } = require('./gitUtils');
 const { createPullRequest, measureGithubLatency } = require('./githubUtils');
-const { loadGlobalSettings, saveGlobalSettings } = require('./settingsStore');
+const {
+  loadGlobalSettings,
+  saveGlobalSettings,
+  loadCronSettings,
+} = require('./settingsStore');
 const {
   loadSupabaseConnections,
   saveSupabaseConnections,
@@ -31,6 +35,14 @@ const {
 const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
+const {
+  CRON_API_KEY,
+  listJobs,
+  getJob,
+  createJob,
+  updateJob,
+  deleteJob,
+} = require('./src/cronClient');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
@@ -87,6 +99,21 @@ function getEffectiveSelfLogForwarding(settings) {
   };
 }
 
+function getCronNotificationLevels(project) {
+  if (!project || !Array.isArray(project.cronNotificationsLevels)) {
+    return ['info', 'warning', 'error'];
+  }
+  const normalized = project.cronNotificationsLevels
+    .map((level) => String(level).toLowerCase())
+    .filter((level) => ['info', 'warning', 'error'].includes(level));
+  return normalized.length ? normalized : ['info', 'warning', 'error'];
+}
+
+async function getEffectiveCronSettings() {
+  const settings = await loadCronSettings();
+  return settings || { enabled: true, defaultTimezone: 'UTC' };
+}
+
 async function renderOrEdit(ctx, text, extra) {
   if (ctx.callbackQuery) {
     try {
@@ -138,6 +165,10 @@ function buildCancelKeyboard() {
   return new InlineKeyboard().text('❌ Cancel', 'cancel_input');
 }
 
+function buildBackKeyboard(callbackData, label = '⬅️ Back') {
+  return new InlineKeyboard().text(label, callbackData);
+}
+
 function buildPatchSessionKeyboard() {
   return new InlineKeyboard()
     .text('✅ Patch completed', 'patch:finish')
@@ -168,6 +199,21 @@ async function checkConfigDbStatus() {
     return { ok: true, message: 'OK' };
   } catch (error) {
     return { ok: false, message: error.message || 'error' };
+  }
+}
+
+async function getCronStatusLine(cronSettings) {
+  if (!cronSettings?.enabled) {
+    return 'Cron: disabled (settings).';
+  }
+  if (!CRON_API_KEY) {
+    return 'Cron: disabled (no API key).';
+  }
+  try {
+    await listJobs();
+    return 'Cron: ✅ API OK.';
+  } catch (error) {
+    return `Cron: ⚠️ API error: ${truncateText(error.message, 80)}`;
   }
 }
 
@@ -280,14 +326,34 @@ bot.hears('⚙️ Settings', async (ctx) => {
 });
 
 bot.callbackQuery('cancel_input', async (ctx) => {
+  const state = getUserState(ctx.from.id);
+  const wizardState = userState.get(ctx.from.id);
+  let backTarget = 'main:back';
+
+  if (state?.backCallback) {
+    backTarget = state.backCallback;
+  } else if (state?.projectId) {
+    backTarget = `proj:open:${state.projectId}`;
+  } else if (state?.type === 'supabase_add') {
+    backTarget = 'supabase:back';
+  } else if (state?.type === 'supabase_console' && state.connectionId) {
+    backTarget = `supabase:conn:${state.connectionId}`;
+  } else if (state?.type === 'global_change_base') {
+    backTarget = 'gsettings:menu';
+  } else if (wizardState?.mode === 'create-project') {
+    backTarget = wizardState.backCallback || 'proj:list';
+  }
+
   resetUserState(ctx);
   clearPatchSession(ctx.from.id);
+  await ctx.answerCallbackQuery();
   try {
-    await ctx.editMessageText('Operation cancelled.');
+    await ctx.editMessageText('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(backTarget),
+    });
   } catch (error) {
     // Ignore edit failures (old message, etc.)
   }
-  await renderMainMenu(ctx);
 });
 
 bot.callbackQuery('patch:cancel', async (ctx) => {
@@ -338,6 +404,13 @@ bot.on('callback_query:data', async (ctx) => {
     await handleSupabaseCallback(ctx, data);
     return;
   }
+  if (data.startsWith('cron:')) {
+    await handleCronCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('projcron:')) {
+    await handleProjectCronCallback(ctx, data);
+  }
 });
 
 async function handleStatefulMessage(ctx, state) {
@@ -374,6 +447,23 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'supabase_add':
       await handleSupabaseAddMessage(ctx, state);
+      break;
+    case 'cron_create_url':
+    case 'cron_create_schedule':
+    case 'cron_create_name':
+      await handleCronCreateMessage(ctx, state);
+      break;
+    case 'cron_edit_schedule':
+      await handleCronEditScheduleMessage(ctx, state);
+      break;
+    case 'cron_edit_url':
+      await handleCronEditUrlMessage(ctx, state);
+      break;
+    case 'projcron_keepalive_schedule':
+    case 'projcron_keepalive_recreate':
+    case 'projcron_deploy_schedule':
+    case 'projcron_deploy_recreate':
+      await handleProjectCronScheduleMessage(ctx, state);
       break;
     default:
       clearUserState(ctx.from.id);
@@ -802,6 +892,151 @@ async function handleSupabaseCallback(ctx, data) {
   }
 }
 
+async function handleCronCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const [, action, jobId] = data.split(':');
+
+  switch (action) {
+    case 'menu':
+      await renderCronMenu(ctx);
+      break;
+    case 'list':
+      await renderCronJobList(ctx);
+      break;
+    case 'create':
+      if (!CRON_API_KEY) {
+        await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+          reply_markup: buildBackKeyboard('main:back'),
+        });
+        return;
+      }
+      {
+        const cronSettings = await getEffectiveCronSettings();
+        if (!cronSettings.enabled) {
+          await renderOrEdit(ctx, 'Cron integration is disabled in settings.', {
+            reply_markup: buildBackKeyboard('main:back'),
+          });
+          return;
+        }
+      }
+      setUserState(ctx.from.id, { type: 'cron_create_url', backCallback: 'cron:menu' });
+      await ctx.reply('Send target URL (e.g. keep-alive or deploy hook).', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'job':
+      await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
+      break;
+    case 'edit':
+      await renderCronJobEditMenu(ctx, jobId);
+      break;
+    case 'toggle': {
+      try {
+        const job = await getJob(jobId);
+        const cronSettings = await getEffectiveCronSettings();
+        const payload = buildCronJobPayload({
+          name: getCronJobTitle(job),
+          url: getCronJobUrl(job),
+          schedule: job?.schedule || { cron: job?.schedule?.cron || job?.schedule?.expression },
+          timezone: job?.schedule?.timezone || cronSettings.defaultTimezone,
+          enabled: !job?.enabled,
+        });
+        await updateJob(jobId, payload);
+        await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
+      } catch (error) {
+        await renderOrEdit(ctx, `Failed to toggle cron job: ${error.message}`, {
+          reply_markup: buildBackKeyboard('cron:menu'),
+        });
+      }
+      break;
+    }
+    case 'change_schedule':
+      await promptCronScheduleInput(ctx, jobId, 'cron:job:' + jobId);
+      break;
+    case 'change_url':
+      await promptCronUrlInput(ctx, jobId, 'cron:job:' + jobId);
+      break;
+    case 'delete': {
+      const inline = new InlineKeyboard()
+        .text('✅ Yes, delete', `cron:delete_confirm:${jobId}`)
+        .text('⬅️ No', `cron:job:${jobId}`);
+      await renderOrEdit(ctx, `Delete cron job #${jobId}?`, { reply_markup: inline });
+      break;
+    }
+    case 'delete_confirm':
+      try {
+        await deleteJob(jobId);
+        await renderOrEdit(ctx, 'Cron job deleted.', {
+          reply_markup: buildBackKeyboard('cron:menu'),
+        });
+      } catch (error) {
+        await renderOrEdit(ctx, `Failed to delete cron job: ${error.message}`, {
+          reply_markup: buildBackKeyboard('cron:menu'),
+        });
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+async function handleProjectCronCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const parts = data.split(':');
+  const action = parts[1];
+  const projectId = parts[2];
+  const extra = parts[3];
+
+  if (!projectId) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  switch (action) {
+    case 'menu':
+      await renderProjectCronBindings(ctx, projectId);
+      break;
+    case 'keepalive':
+      await handleProjectCronJobAction(ctx, projectId, 'keepalive');
+      break;
+    case 'deploy':
+      await handleProjectCronJobAction(ctx, projectId, 'deploy');
+      break;
+    case 'keepalive_view':
+      await openProjectCronJob(ctx, projectId, 'keepalive');
+      break;
+    case 'deploy_view':
+      await openProjectCronJob(ctx, projectId, 'deploy');
+      break;
+    case 'keepalive_recreate':
+      await promptProjectCronSchedule(ctx, projectId, 'keepalive', true);
+      break;
+    case 'deploy_recreate':
+      await promptProjectCronSchedule(ctx, projectId, 'deploy', true);
+      break;
+    case 'keepalive_unlink':
+      await renderProjectCronUnlinkConfirm(ctx, projectId, 'keepalive');
+      break;
+    case 'deploy_unlink':
+      await renderProjectCronUnlinkConfirm(ctx, projectId, 'deploy');
+      break;
+    case 'unlink_confirm':
+      await unlinkProjectCronJob(ctx, projectId, extra);
+      break;
+    case 'alerts_toggle':
+      await toggleProjectCronAlerts(ctx, projectId);
+      break;
+    case 'alerts_levels':
+      await renderProjectCronAlertLevels(ctx, projectId);
+      break;
+    case 'alerts_level':
+      await toggleProjectCronAlertLevel(ctx, projectId, extra);
+      break;
+    default:
+      break;
+  }
+}
+
 async function renderSupabaseConnectionsMenu(ctx) {
   const connections = await loadSupabaseConnections();
   if (!connections.length) {
@@ -834,6 +1069,248 @@ async function renderSupabaseConnectionMenu(ctx, connectionId) {
   await renderOrEdit(ctx, `Supabase: ${connection.name}`, { reply_markup: inline });
 }
 
+function parseScheduleInput(input) {
+  const raw = input?.trim();
+  if (!raw) {
+    throw new Error('Schedule is required.');
+  }
+  const normalized = raw.toLowerCase();
+  const match = normalized.match(/^every\s+(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)$/);
+  if (match) {
+    const amount = Number(match[1]);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error('Invalid interval.');
+    }
+    const unit = match[2].startsWith('h') ? 'hour' : 'minute';
+    if (unit === 'minute') {
+      return {
+        cron: `*/${amount} * * * *`,
+        label: `Every ${amount} minute${amount === 1 ? '' : 's'}`,
+      };
+    }
+    return {
+      cron: `0 */${amount} * * *`,
+      label: `Every ${amount} hour${amount === 1 ? '' : 's'}`,
+    };
+  }
+  return { cron: raw, label: raw };
+}
+
+function getCronJobId(job) {
+  return job?.jobId ?? job?.id ?? job?.job_id ?? null;
+}
+
+function getCronJobTitle(job) {
+  return job?.title || job?.name || job?.jobTitle || job?.jobName || '(unnamed)';
+}
+
+function getCronJobUrl(job) {
+  return job?.url || job?.request?.url || job?.httpTargetUrl || '';
+}
+
+function formatCronSchedule(job) {
+  const schedule = job?.schedule || {};
+  const expression = schedule.cron || schedule.expression;
+  if (expression) {
+    return expression;
+  }
+  if (Array.isArray(schedule.minutes) || Array.isArray(schedule.hours)) {
+    const minutes = Array.isArray(schedule.minutes) ? schedule.minutes.join(',') : '-';
+    const hours = Array.isArray(schedule.hours) ? schedule.hours.join(',') : '-';
+    return `Minutes: ${minutes}; Hours: ${hours}`;
+  }
+  return '-';
+}
+
+function buildCronJobPayload({ name, url, schedule, timezone, enabled }) {
+  let schedulePayload = null;
+  if (schedule && typeof schedule === 'object') {
+    schedulePayload = { ...schedule };
+    if (!schedulePayload.timezone) {
+      schedulePayload.timezone = timezone || 'UTC';
+    }
+  } else {
+    schedulePayload = {
+      timezone: timezone || 'UTC',
+      cron: schedule,
+    };
+  }
+  return {
+    title: name,
+    url,
+    enabled: enabled !== false,
+    schedule: schedulePayload,
+  };
+}
+
+async function renderCronMenu(ctx) {
+  const cronSettings = await getEffectiveCronSettings();
+  if (!cronSettings.enabled) {
+    await renderOrEdit(ctx, 'Cron integration is disabled in settings.', {
+      reply_markup: buildBackKeyboard('main:back'),
+    });
+    return;
+  }
+  if (!CRON_API_KEY) {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+      reply_markup: buildBackKeyboard('main:back'),
+    });
+    return;
+  }
+  let jobs = [];
+  try {
+    jobs = await listJobs();
+  } catch (error) {
+    await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
+      reply_markup: buildBackKeyboard('main:back'),
+    });
+    return;
+  }
+
+  const lines = ['⏱ Cron jobs', '', `Total jobs: ${jobs.length}`, 'Showing first 10 by name/id.'];
+  const inline = new InlineKeyboard()
+    .text('📋 List jobs', 'cron:list')
+    .row()
+    .text('➕ Create job', 'cron:create')
+    .row()
+    .text('⬅️ Back', 'main:back');
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderCronJobList(ctx) {
+  if (!CRON_API_KEY) {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+      reply_markup: buildBackKeyboard('main:back'),
+    });
+    return;
+  }
+  let jobs;
+  try {
+    jobs = await listJobs();
+  } catch (error) {
+    await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
+      reply_markup: buildBackKeyboard('cron:menu'),
+    });
+    return;
+  }
+  const slice = jobs.slice(0, 10);
+  const lines = ['Cron jobs:'];
+  slice.forEach((job) => {
+    const id = getCronJobId(job);
+    const name = getCronJobTitle(job);
+    const enabled = job?.enabled ? 'enabled' : 'disabled';
+    const schedule = formatCronSchedule(job);
+    lines.push(`- #${id} "${name}" — ${enabled} — ${schedule}`);
+  });
+  if (!slice.length) {
+    lines.push('(no jobs)');
+  }
+
+  const inline = new InlineKeyboard();
+  slice.forEach((job) => {
+    const id = getCronJobId(job);
+    if (id != null) {
+      inline.text(`Job #${id}`, `cron:job:${id}`).row();
+    }
+  });
+  inline.text('⬅️ Back', 'cron:menu');
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderCronJobDetails(ctx, jobId, options = {}) {
+  let job;
+  try {
+    job = await getJob(jobId);
+  } catch (error) {
+    await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
+      reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu'),
+    });
+    return;
+  }
+  if (!job) {
+    await renderOrEdit(ctx, 'Cron job not found.', {
+      reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu'),
+    });
+    return;
+  }
+
+  const schedule = formatCronSchedule(job);
+  const timezone = job?.schedule?.timezone || '-';
+  const url = getCronJobUrl(job) || '-';
+  const lines = [
+    `Cron job #${jobId}:`,
+    `Name: ${getCronJobTitle(job)}`,
+    `Enabled: ${job?.enabled ? 'Yes' : 'No'}`,
+    `URL: ${url}`,
+    `Schedule: ${schedule}`,
+    `Timezone: ${timezone}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text('✏️ Edit', `cron:edit:${jobId}`)
+    .row()
+    .text('🗑 Delete', `cron:delete:${jobId}`)
+    .row()
+    .text('⬅️ Back', options.backCallback || 'cron:list');
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderCronJobEditMenu(ctx, jobId) {
+  let job;
+  try {
+    job = await getJob(jobId);
+  } catch (error) {
+    await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
+      reply_markup: buildBackKeyboard('cron:menu'),
+    });
+    return;
+  }
+
+  const lines = [
+    `Edit Cron job #${jobId}:`,
+    `- Enabled: ${job?.enabled ? '✅' : '❌'}`,
+    `- Schedule: ${formatCronSchedule(job)}`,
+    `- URL: ${getCronJobUrl(job) || '-'}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text('🔁 Toggle enabled', `cron:toggle:${jobId}`)
+    .row()
+    .text('⏱ Change schedule', `cron:change_schedule:${jobId}`)
+    .row()
+    .text('🔗 Change URL', `cron:change_url:${jobId}`)
+    .row()
+    .text('⬅️ Back', `cron:job:${jobId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function promptCronScheduleInput(ctx, jobId, backCallback) {
+  setUserState(ctx.from.id, {
+    type: 'cron_edit_schedule',
+    jobId,
+    backCallback,
+  });
+  await ctx.reply(
+    "Send new schedule (cron string or 'every 10m', 'every 1h'). Or press Cancel.",
+    { reply_markup: buildCancelKeyboard() },
+  );
+}
+
+async function promptCronUrlInput(ctx, jobId, backCallback) {
+  setUserState(ctx.from.id, {
+    type: 'cron_edit_url',
+    jobId,
+    backCallback,
+  });
+  await ctx.reply('Send new URL for this job. Or press Cancel.', {
+    reply_markup: buildCancelKeyboard(),
+  });
+}
+
 async function handleSupabaseAddMessage(ctx, state) {
   const text = ctx.message.text?.trim();
   if (!text) {
@@ -843,8 +1320,9 @@ async function handleSupabaseAddMessage(ctx, state) {
 
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard('supabase:back'),
+    });
     return;
   }
 
@@ -873,6 +1351,208 @@ async function handleSupabaseAddMessage(ctx, state) {
   }
 }
 
+async function handleCronCreateMessage(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a value or press Cancel.');
+    return;
+  }
+
+  if (state.type === 'cron_create_url') {
+    setUserState(ctx.from.id, {
+      type: 'cron_create_schedule',
+      url: text,
+      backCallback: state.backCallback,
+    });
+    await ctx.reply(
+      "Send schedule (cron string or 'every 10m', 'every 1h'). Or press Cancel.",
+      { reply_markup: buildCancelKeyboard() },
+    );
+    return;
+  }
+
+  if (state.type === 'cron_create_schedule') {
+    let schedule;
+    try {
+      schedule = parseScheduleInput(text);
+    } catch (error) {
+      await ctx.reply(`Invalid schedule: ${error.message}`);
+      return;
+    }
+    setUserState(ctx.from.id, {
+      type: 'cron_create_name',
+      url: state.url,
+      schedule,
+      backCallback: state.backCallback,
+    });
+    await ctx.reply('Send job name (or type "skip" for default).', {
+      reply_markup: buildCancelKeyboard(),
+    });
+    return;
+  }
+
+  if (state.type === 'cron_create_name') {
+    const name = text.toLowerCase() === 'skip' ? null : text;
+    const cronSettings = await getEffectiveCronSettings();
+    try {
+      const payload = buildCronJobPayload({
+        name: name || `path-applier:custom:${Date.now()}`,
+        url: state.url,
+        schedule: state.schedule.cron,
+        timezone: cronSettings.defaultTimezone,
+        enabled: true,
+      });
+      const created = await createJob(payload);
+      clearUserState(ctx.from.id);
+      await ctx.reply(`Cron job created. ID: ${created.id}`);
+      await renderCronMenu(ctx);
+    } catch (error) {
+      await ctx.reply(`Failed to create cron job: ${error.message}`);
+    }
+  }
+}
+
+async function handleCronEditScheduleMessage(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a schedule or press Cancel.');
+    return;
+  }
+  let schedule;
+  try {
+    schedule = parseScheduleInput(text);
+  } catch (error) {
+    await ctx.reply(`Invalid schedule: ${error.message}`);
+    return;
+  }
+  try {
+    const job = await getJob(state.jobId);
+    const cronSettings = await getEffectiveCronSettings();
+    const payload = buildCronJobPayload({
+      name: getCronJobTitle(job),
+      url: getCronJobUrl(job),
+      schedule: schedule.cron,
+      timezone: job?.schedule?.timezone || cronSettings.defaultTimezone,
+      enabled: job?.enabled !== false,
+    });
+    await updateJob(state.jobId, payload);
+    clearUserState(ctx.from.id);
+    await ctx.reply('Cron job updated.');
+    await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
+  } catch (error) {
+    await ctx.reply(`Failed to update cron job: ${error.message}`);
+  }
+}
+
+async function handleCronEditUrlMessage(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a URL or press Cancel.');
+    return;
+  }
+  try {
+    const job = await getJob(state.jobId);
+    const cronSettings = await getEffectiveCronSettings();
+    const payload = buildCronJobPayload({
+      name: getCronJobTitle(job),
+      url: text,
+      schedule: job?.schedule || { cron: job?.schedule?.cron || job?.schedule?.expression },
+      timezone: job?.schedule?.timezone || cronSettings.defaultTimezone,
+      enabled: job?.enabled !== false,
+    });
+    await updateJob(state.jobId, payload);
+    clearUserState(ctx.from.id);
+    await ctx.reply('Cron job updated.');
+    await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
+  } catch (error) {
+    await ctx.reply(`Failed to update cron job: ${error.message}`);
+  }
+}
+
+async function handleProjectCronScheduleMessage(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a schedule or press Cancel.');
+    return;
+  }
+  let schedule;
+  try {
+    schedule = parseScheduleInput(text);
+  } catch (error) {
+    await ctx.reply(`Invalid schedule: ${error.message}`);
+    return;
+  }
+
+  const projects = await loadProjects();
+  const project = findProjectById(projects, state.projectId);
+  if (!project) {
+    clearUserState(ctx.from.id);
+    await ctx.reply('Project not found.');
+    return;
+  }
+
+  const cronSettings = await getEffectiveCronSettings();
+  const isKeepAlive = state.type.includes('keepalive');
+  const jobName = isKeepAlive
+    ? `path-applier:${project.id}:keep-alive`
+    : `path-applier:${project.id}:deploy`;
+
+  let targetUrl = '';
+  if (isKeepAlive) {
+    if (!project.renderServiceUrl) {
+      clearUserState(ctx.from.id);
+      await ctx.reply('renderServiceUrl is not configured for this project.', {
+        reply_markup: buildBackKeyboard(`projcron:menu:${project.id}`),
+      });
+      return;
+    }
+    const baseUrl = getPublicBaseUrl();
+    targetUrl = `${baseUrl.replace(/\\/$/, '')}/keep-alive/${project.id}`;
+  } else {
+    if (!project.renderDeployHookUrl) {
+      clearUserState(ctx.from.id);
+      await ctx.reply('renderDeployHookUrl is not configured for this project.', {
+        reply_markup: buildBackKeyboard(`projcron:menu:${project.id}`),
+      });
+      return;
+    }
+    targetUrl = project.renderDeployHookUrl;
+  }
+
+  const payload = buildCronJobPayload({
+    name: jobName,
+    url: targetUrl,
+    schedule: schedule.cron,
+    timezone: cronSettings.defaultTimezone,
+    enabled: true,
+  });
+
+  try {
+    if (state.type.endsWith('recreate')) {
+      const oldJobId = isKeepAlive ? project.cronKeepAliveJobId : project.cronDeployHookJobId;
+      if (oldJobId) {
+        try {
+          await deleteJob(oldJobId);
+        } catch (error) {
+          console.error('[cron] Failed to delete existing job', error);
+        }
+      }
+    }
+    const created = await createJob(payload);
+    if (isKeepAlive) {
+      project.cronKeepAliveJobId = created.id;
+    } else {
+      project.cronDeployHookJobId = created.id;
+    }
+    await saveProjects(projects);
+    clearUserState(ctx.from.id);
+    await ctx.reply(`Cron job created. ID: ${created.id}`);
+    await renderProjectCronBindings(ctx, project.id);
+  } catch (error) {
+    await ctx.reply(`Failed to create cron job: ${error.message}`);
+  }
+}
+
 async function handleSupabaseConsoleMessage(ctx, state) {
   if (state.mode !== 'awaiting-sql') {
     return;
@@ -884,8 +1564,9 @@ async function handleSupabaseConsoleMessage(ctx, state) {
   }
   if (sql.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(`supabase:conn:${state.connectionId}`),
+    });
     return;
   }
   await runSupabaseSql(ctx, state.connectionId, sql);
@@ -1038,6 +1719,7 @@ async function startProjectWizard(ctx) {
     mode: 'create-project',
     step: 'name',
     draft: {},
+    backCallback: 'proj:list',
   });
 
   await promptNextProjectField(ctx, userState.get(ctx.from.id));
@@ -1077,8 +1759,9 @@ async function handleProjectWizardInput(ctx, state) {
   const text = ctx.message.text.trim();
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard('proj:list'),
+    });
     return;
   }
   const value = text;
@@ -1968,9 +2651,232 @@ async function renderServerMenu(ctx, projectId) {
     .row()
     .text('🚀 Deploy (Render)', `proj:render_deploy:${projectId}`)
     .row()
+    .text('⏱ Cron bindings', `projcron:menu:${projectId}`)
+    .row()
     .text('⬅️ Back', `proj:open:${projectId}`);
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderProjectCronBindings(ctx, projectId) {
+  const cronSettings = await getEffectiveCronSettings();
+  if (!cronSettings.enabled) {
+    await renderOrEdit(ctx, 'Cron integration is disabled in settings.', {
+      reply_markup: buildBackKeyboard(`proj:server_menu:${projectId}`),
+    });
+    return;
+  }
+  if (!CRON_API_KEY) {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+      reply_markup: buildBackKeyboard(`proj:server_menu:${projectId}`),
+    });
+    return;
+  }
+
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  const levels = getCronNotificationLevels(project).join(' / ');
+  const lines = [
+    `Cron for project ${project.name || project.id}:`,
+    `- Keep-alive job: ${project.cronKeepAliveJobId || 'none'}`,
+    `- Deploy hook job: ${project.cronDeployHookJobId || 'none'}`,
+    `- Notifications: ${project.cronNotificationsEnabled ? 'on' : 'off'}`,
+    `- Levels: ${levels}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text(
+      project.cronKeepAliveJobId ? '✏️ Keep-alive job' : '➕ Keep-alive job',
+      `projcron:keepalive:${projectId}`,
+    )
+    .row()
+    .text(
+      project.cronDeployHookJobId ? '✏️ Deploy job' : '➕ Deploy job',
+      `projcron:deploy:${projectId}`,
+    )
+    .row()
+    .text('🔔 Alerts on/off', `projcron:alerts_toggle:${projectId}`)
+    .row()
+    .text('⚙️ Alert levels', `projcron:alerts_levels:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:server_menu:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function handleProjectCronJobAction(ctx, projectId, type) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  const jobId =
+    type === 'keepalive' ? project.cronKeepAliveJobId : project.cronDeployHookJobId;
+
+  if (jobId) {
+    const inline = new InlineKeyboard()
+      .text('🔍 View cron job', `projcron:${type}_view:${projectId}`)
+      .row()
+      .text('♻️ Recreate job', `projcron:${type}_recreate:${projectId}`)
+      .row()
+      .text('🗑 Unlink job', `projcron:${type}_unlink:${projectId}`)
+      .row()
+      .text('⬅️ Back', `projcron:menu:${projectId}`);
+    await renderOrEdit(
+      ctx,
+      `${type === 'keepalive' ? 'Keep-alive' : 'Deploy'} cron job: ${jobId}`,
+      { reply_markup: inline },
+    );
+    return;
+  }
+
+  await promptProjectCronSchedule(ctx, projectId, type, false);
+}
+
+async function promptProjectCronSchedule(ctx, projectId, type, recreate) {
+  setUserState(ctx.from.id, {
+    type: recreate
+      ? type === 'keepalive'
+        ? 'projcron_keepalive_recreate'
+        : 'projcron_deploy_recreate'
+      : type === 'keepalive'
+        ? 'projcron_keepalive_schedule'
+        : 'projcron_deploy_schedule',
+    projectId,
+    backCallback: `projcron:menu:${projectId}`,
+  });
+  await ctx.reply(
+    \"Send schedule (cron string or 'every 10m', 'every 1h'). Or press Cancel.\",
+    { reply_markup: buildCancelKeyboard() },
+  );
+}
+
+async function openProjectCronJob(ctx, projectId, type) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const jobId =
+    type === 'keepalive' ? project.cronKeepAliveJobId : project.cronDeployHookJobId;
+  if (!jobId) {
+    await renderOrEdit(ctx, 'Cron job not linked.', {
+      reply_markup: buildBackKeyboard(`projcron:menu:${projectId}`),
+    });
+    return;
+  }
+  await renderCronJobDetails(ctx, jobId, { backCallback: `projcron:menu:${projectId}` });
+}
+
+async function renderProjectCronUnlinkConfirm(ctx, projectId, type) {
+  const label = type === 'keepalive' ? 'keep-alive' : 'deploy';
+  const inline = new InlineKeyboard()
+    .text('✅ Yes, unlink', `projcron:unlink_confirm:${projectId}:${type}`)
+    .text('⬅️ No', `projcron:menu:${projectId}`);
+  await renderOrEdit(ctx, `Unlink ${label} cron job?`, { reply_markup: inline });
+}
+
+async function unlinkProjectCronJob(ctx, projectId, type) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const jobId =
+    type === 'keepalive' ? project.cronKeepAliveJobId : project.cronDeployHookJobId;
+  if (jobId) {
+    try {
+      await deleteJob(jobId);
+    } catch (error) {
+      console.error('[cron] Failed to delete cron job during unlink', error);
+    }
+  }
+  if (type === 'keepalive') {
+    project.cronKeepAliveJobId = null;
+  } else {
+    project.cronDeployHookJobId = null;
+  }
+  await saveProjects(projects);
+  await renderProjectCronBindings(ctx, projectId);
+}
+
+async function toggleProjectCronAlerts(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  project.cronNotificationsEnabled = !project.cronNotificationsEnabled;
+  await saveProjects(projects);
+  await renderProjectCronBindings(ctx, projectId);
+}
+
+async function renderProjectCronAlertLevels(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const levels = new Set(getCronNotificationLevels(project));
+  const lines = [
+    `Alert levels for ${project.name || project.id}:`,
+    `${levels.has('info') ? '[x]' : '[ ]'} info`,
+    `${levels.has('warning') ? '[x]' : '[ ]'} warning`,
+    `${levels.has('error') ? '[x]' : '[ ]'} error`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text(`${levels.has('info') ? '✅' : '➖'} info`, `projcron:alerts_level:${projectId}:info`)
+    .text(
+      `${levels.has('warning') ? '✅' : '➖'} warning`,
+      `projcron:alerts_level:${projectId}:warning`,
+    )
+    .row()
+    .text(`${levels.has('error') ? '✅' : '➖'} error`, `projcron:alerts_level:${projectId}:error`)
+    .row()
+    .text('⬅️ Back', `projcron:menu:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function toggleProjectCronAlertLevel(ctx, projectId, level) {
+  if (!['info', 'warning', 'error'].includes(level)) {
+    await renderProjectCronAlertLevels(ctx, projectId);
+    return;
+  }
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const levels = new Set(getCronNotificationLevels(project));
+  if (levels.has(level)) {
+    levels.delete(level);
+  } else {
+    levels.add(level);
+  }
+  if (levels.size === 0) {
+    await ctx.answerCallbackQuery({
+      text: 'You must keep at least one level enabled.',
+      show_alert: true,
+    });
+    return;
+  }
+  project.cronNotificationsLevels = Array.from(levels);
+  await saveProjects(projects);
+  await renderProjectCronAlertLevels(ctx, projectId);
 }
 
 async function renderDataCenterMenu(ctx) {
@@ -1980,6 +2886,8 @@ async function renderDataCenterMenu(ctx) {
 
 async function buildDataCenterView() {
   const connections = await loadSupabaseConnections();
+  const cronSettings = await getEffectiveCronSettings();
+  const cronStatus = await getCronStatusLine(cronSettings);
   const lines = [
     '🏭 Data Center',
     `Config DB: ${
@@ -1987,6 +2895,7 @@ async function buildDataCenterView() {
         ? '✅ OK'
         : `❌ ERROR – ${runtimeStatus.configDbError || 'see logs'}`
     }`,
+    cronStatus,
   ];
 
   if (!connections.length) {
@@ -2002,8 +2911,13 @@ async function buildDataCenterView() {
     .text('➕ Add Supabase connection', 'supabase:add')
     .row()
     .text('🧾 List connections', 'supabase:connections')
-    .row()
-    .text('⬅️ Back', 'main:back');
+    .row();
+
+  if (cronSettings.enabled) {
+    inline.text('⏱ Cron jobs', 'cron:menu').row();
+  }
+
+  inline.text('⬅️ Back', 'main:back');
 
   return { text: lines.join('\n'), keyboard: inline };
 }
@@ -2369,6 +3283,28 @@ function parseProjectLogPayload(rawBody) {
   }
 }
 
+function parseCronAlertPayload(rawBody) {
+  if (!rawBody) {
+    return { level: 'error', message: '(no message)' };
+  }
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (parsed && typeof parsed === 'object') {
+      const rawLevel = String(parsed.level || parsed.severity || 'error').toLowerCase();
+      const level = ['info', 'warning', 'error'].includes(rawLevel) ? rawLevel : 'error';
+      return {
+        level,
+        message: parsed.message != null ? String(parsed.message) : '(no message)',
+        jobId: parsed.jobId ? String(parsed.jobId) : null,
+        time: parsed.time != null ? String(parsed.time) : null,
+      };
+    }
+  } catch (error) {
+    console.error('[cron-alert] Failed to parse JSON body', error);
+  }
+  return { level: 'error', message: String(rawBody) };
+}
+
 function formatProjectLogMessage(project, event) {
   const projectLabel = project.name || project.id;
   const lines = [
@@ -2451,6 +3387,7 @@ async function initializeConfig() {
   try {
     await loadProjects();
     await loadGlobalSettings();
+    await loadCronSettings();
   } catch (error) {
     console.error('Failed to load initial configuration', error);
   }
@@ -2551,6 +3488,63 @@ function startHttpServer() {
             console.error('[project-log] Failed to process log event', error);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'internal error' }));
+          }
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname.startsWith('/cron-alert/')) {
+          try {
+            const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+            const projects = await loadProjects();
+            const project = findProjectById(projects, projectId);
+            if (!project) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Unknown project' }));
+              return;
+            }
+
+            const rawBody = await readRequestBody(req);
+            const event = parseCronAlertPayload(rawBody);
+
+            if (project.cronNotificationsEnabled !== true) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, skipped: true }));
+              return;
+            }
+
+            if (
+              Array.isArray(project.cronNotificationsLevels) &&
+              !project.cronNotificationsLevels
+                .map((level) => String(level).toLowerCase())
+                .includes(event.level)
+            ) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, skipped: true }));
+              return;
+            }
+
+            const messageLines = [
+              `⏱ Cron alert for project ${project.name || project.id} (id: ${project.id})`,
+              `Level: ${event.level}`,
+            ];
+            if (event.jobId) {
+              messageLines.push(`Job: ${event.jobId}`);
+            }
+            if (event.time) {
+              messageLines.push(`Time: ${event.time}`);
+            }
+            messageLines.push('', truncateText(event.message, 1000));
+
+            await bot.api.sendMessage(ADMIN_TELEGRAM_ID, messageLines.join('\n'), {
+              disable_web_page_preview: true,
+            });
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+          } catch (error) {
+            console.error('[cron-alert] Failed to process alert', error);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, error: 'processing failed' }));
           }
           return;
         }
