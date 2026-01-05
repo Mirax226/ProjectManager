@@ -2753,7 +2753,7 @@ async function promptProjectCronSchedule(ctx, projectId, type, recreate) {
     backCallback: `projcron:menu:${projectId}`,
   });
   await ctx.reply(
-    \"Send schedule (cron string or 'every 10m', 'every 1h'). Or press Cancel.\",
+    'Send schedule (cron string or "every 10m", "every 1h"). Or press Cancel.',
     { reply_markup: buildCancelKeyboard() },
   );
 }
