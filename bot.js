@@ -11,6 +11,7 @@ const {
   prepareRepository,
   createWorkingBranch,
   applyPatchToRepo,
+  configureGitIdentity,
   commitAndPush,
   DEFAULT_BASE_BRANCH,
   fetchDryRun,
@@ -1303,6 +1304,13 @@ async function handlePatchApplication(ctx, projectId, patchText) {
     await applyPatchToRepo(git, repoDir, patchText);
 
     await ctx.reply('Committing and pushing…');
+    const identityResult = await configureGitIdentity(git);
+    if (!identityResult.ok) {
+      const stderr = identityResult.error?.stderr || identityResult.error?.message || 'Unknown error';
+      console.error(`[gitIdentity] Failed to set ${identityResult.step}: ${stderr}`);
+      await ctx.reply('Failed to configure git author identity for this project. Please check logs.');
+      throw new Error('Failed to configure git author identity for this project.');
+    }
     const hasChanges = await commitAndPush(git, branchName);
     if (!hasChanges) {
       await ctx.reply('Patch applied but no changes detected.');

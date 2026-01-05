@@ -131,6 +131,22 @@ async function applyPatchToRepo(git, repoDir, patchText) {
   }
 }
 
+async function configureGitIdentity(git) {
+  try {
+    await git.raw(['config', 'user.name', 'Path Applier Bot']);
+  } catch (error) {
+    return { ok: false, error, step: 'user.name' };
+  }
+
+  try {
+    await git.raw(['config', 'user.email', 'bot@path-applier.local']);
+  } catch (error) {
+    return { ok: false, error, step: 'user.email' };
+  }
+
+  return { ok: true };
+}
+
 async function commitAndPush(git, branchName) {
   const status = await git.status();
   if (status.files.length === 0) {
@@ -154,6 +170,7 @@ module.exports = {
   prepareRepository,
   createWorkingBranch,
   applyPatchToRepo,
+  configureGitIdentity,
   commitAndPush,
   fetchDryRun,
   getRepoPath,
