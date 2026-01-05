@@ -1,6 +1,7 @@
 const fs = require('fs/promises');
 const path = require('path');
 const configStore = require('./configStore');
+const { forwardSelfLog } = require('./logger');
 
 const SETTINGS_FILE = path.join(__dirname, 'globalSettings.json');
 const ENV_DEFAULT_BASE = process.env.DEFAULT_BASE_BRANCH || 'main';
@@ -50,6 +51,10 @@ async function saveGlobalSettings(settings) {
     await fs.writeFile(SETTINGS_FILE, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (error) {
     console.error('Failed to save globalSettings.json', error);
+    await forwardSelfLog('error', 'Failed to save global settings file', {
+      stack: error?.stack,
+      context: { error: error?.message },
+    });
     throw error;
   }
 }

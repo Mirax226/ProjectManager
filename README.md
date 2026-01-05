@@ -39,3 +39,25 @@ node src/bot.js
 5. Choose **Projects** → **List projects** and tap **Apply patch** for a project, then send a git patch as text or a `.patch`/`.diff` file.
 6. The bot updates the repo, creates a branch, applies the patch, pushes it, and opens a PR. A link to the PR is sent back.
 7. Use **Ping test** to check GitHub API and git fetch latency.
+
+## Project log forwarding
+External services can forward logs to Path Applier for per-project alerting:
+
+```
+POST https://<path-applier-host>/project-log/<projectId>
+Content-Type: application/json
+
+{
+  "level": "error",
+  "message": "Unhandled exception in /webhook",
+  "stack": "Error: ...",
+  "context": {
+    "requestId": "abc123",
+    "userId": 42
+  },
+  "timestamp": "2026-01-06T10:00:00.000Z",
+  "source": "daily-system-bot"
+}
+```
+
+If JSON is not convenient, send a plain text body; it will be treated as an error-level message. No authentication is required for now.

@@ -24,6 +24,8 @@ const {
   findSupabaseConnection,
 } = require('./supabaseConnectionsStore');
 const { runCommandInProject } = require('./shellUtils');
+const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
+const { configureSelfLogger, forwardSelfLog } = require('./logger');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
@@ -43,10 +45,41 @@ let botRetryTimeout = null;
 const userState = new Map();
 let configStatusPool = null;
 
+configureSelfLogger({
+  bot,
+  adminId: ADMIN_TELEGRAM_ID,
+  loadSettings: loadGlobalSettings,
+});
+
 const runtimeStatus = {
   configDbOk: false,
   configDbError: null,
 };
+
+function normalizeLogLevels(levels) {
+  if (!Array.isArray(levels)) return [];
+  return levels.map((level) => normalizeLogLevel(level)).filter(Boolean);
+}
+
+function getEffectiveProjectLogForwarding(project) {
+  const forwarding = project?.logForwarding || {};
+  const levels = normalizeLogLevels(forwarding.levels);
+  return {
+    enabled: forwarding.enabled === true,
+    levels: levels.length ? levels : ['error'],
+    targetChatId: forwarding.targetChatId,
+  };
+}
+
+function getEffectiveSelfLogForwarding(settings) {
+  const forwarding = settings?.selfLogForwarding || {};
+  const levels = normalizeLogLevels(forwarding.levels);
+  return {
+    enabled: forwarding.enabled === true,
+    levels: levels.length ? levels : ['error'],
+    targetChatId: forwarding.targetChatId || ADMIN_TELEGRAM_ID,
+  };
+}
 
 async function renderOrEdit(ctx, text, extra) {
   if (ctx.callbackQuery) {
@@ -115,6 +148,9 @@ async function testConfigDbConnection() {
     return;
   }
   console.error('Config DB connection failed', status.message);
+  await forwardSelfLog('error', 'Config DB connection failed', {
+    context: { error: status.message },
+  });
 }
 
 const mainKeyboard = new Keyboard()
@@ -191,6 +227,10 @@ bot.on('callback_query:data', async (ctx) => {
   }
   if (data.startsWith('proj:')) {
     await handleProjectCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('projlog:')) {
+    await handleProjectLogCallback(ctx, data);
     return;
   }
   if (data.startsWith('projwiz:')) {
@@ -427,10 +467,133 @@ async function handleProjectCallback(ctx, data) {
   }
 }
 
+async function handleProjectLogCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const parts = data.split(':');
+  const action = parts[1];
+  const level = action === 'level' ? parts[2] : null;
+  const projectId = action === 'level' ? parts[3] : parts[2];
+
+  if (!projectId) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  if (action === 'back') {
+    await renderProjectSettings(ctx, projectId);
+    return;
+  }
+
+  const projects = await loadProjects();
+  const idx = projects.findIndex((project) => project.id === projectId);
+  if (idx === -1) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  const project = projects[idx];
+  const current = getEffectiveProjectLogForwarding(project);
+  const updated = {
+    ...project,
+    logForwarding: {
+      enabled: current.enabled,
+      levels: [...current.levels],
+      targetChatId: current.targetChatId,
+    },
+  };
+
+  if (action === 'menu') {
+    await renderProjectLogAlerts(ctx, projectId);
+    return;
+  }
+
+  if (action === 'toggle') {
+    const nextEnabled = !current.enabled;
+    updated.logForwarding.enabled = nextEnabled;
+    if (nextEnabled && !updated.logForwarding.levels.length) {
+      updated.logForwarding.levels = ['error'];
+    }
+  }
+
+  if (action === 'level') {
+    const normalized = normalizeLogLevel(level);
+    if (normalized) {
+      const levels = new Set(updated.logForwarding.levels);
+      if (levels.has(normalized)) {
+        levels.delete(normalized);
+      } else {
+        levels.add(normalized);
+      }
+      updated.logForwarding.levels = Array.from(levels).filter((entry) =>
+        LOG_LEVELS.includes(entry),
+      );
+      if (current.enabled && updated.logForwarding.levels.length === 0) {
+        updated.logForwarding.levels = ['error'];
+      }
+    }
+  }
+
+  projects[idx] = updated;
+  await saveProjects(projects);
+  await renderProjectLogAlerts(ctx, projectId);
+}
+
 async function handleGlobalSettingsCallback(ctx, data) {
   await ctx.answerCallbackQuery();
-  const [, action] = data.split(':');
+  const parts = data.split(':');
+  const action = parts[1];
   switch (action) {
+    case 'bot_log_alerts':
+      await renderSelfLogAlerts(ctx);
+      break;
+    case 'bot_log_toggle': {
+      const settings = await loadGlobalSettings();
+      const current = getEffectiveSelfLogForwarding(settings);
+      const updated = {
+        ...settings,
+        selfLogForwarding: {
+          enabled: !current.enabled,
+          levels: [...current.levels],
+          targetChatId: settings?.selfLogForwarding?.targetChatId,
+        },
+      };
+      if (updated.selfLogForwarding.enabled && !updated.selfLogForwarding.levels.length) {
+        updated.selfLogForwarding.levels = ['error'];
+      }
+      await saveGlobalSettings(updated);
+      await renderSelfLogAlerts(ctx);
+      break;
+    }
+    case 'bot_log_level': {
+      const level = normalizeLogLevel(parts[2]);
+      if (!level) {
+        await renderSelfLogAlerts(ctx);
+        break;
+      }
+      const settings = await loadGlobalSettings();
+      const current = getEffectiveSelfLogForwarding(settings);
+      const levels = new Set(current.levels);
+      if (levels.has(level)) {
+        levels.delete(level);
+      } else {
+        levels.add(level);
+      }
+      const updatedLevels = Array.from(levels).filter((entry) => LOG_LEVELS.includes(entry));
+      const updated = {
+        ...settings,
+        selfLogForwarding: {
+          enabled: current.enabled,
+          levels: updatedLevels,
+          targetChatId: settings?.selfLogForwarding?.targetChatId,
+        },
+      };
+      if (current.enabled && updated.selfLogForwarding.levels.length === 0) {
+        updated.selfLogForwarding.levels = ['error'];
+      }
+      await saveGlobalSettings(updated);
+      await renderSelfLogAlerts(ctx);
+      break;
+    }
     case 'change_default_base':
       setUserState(ctx.from.id, { type: 'global_change_base' });
       await ctx.reply('Send new default base branch.\n(Or press Cancel)', {
@@ -448,6 +611,9 @@ async function handleGlobalSettingsCallback(ctx, data) {
     case 'clear_default_project':
       await clearDefaultProject();
       await renderOrEdit(ctx, 'Default project cleared.');
+      await renderGlobalSettings(ctx);
+      break;
+    case 'menu':
       await renderGlobalSettings(ctx);
       break;
     case 'back':
@@ -1310,6 +1476,8 @@ function buildProjectSettingsView(project, globalSettings) {
     .row()
     .text('📡 Server', `proj:server_menu:${project.id}`)
     .text('🗄 Supabase binding', `proj:supabase:${project.id}`)
+    .row()
+    .text('📣 Log alerts', `projlog:menu:${project.id}`)
     .row();
 
   if (!isDefault) {
@@ -1319,6 +1487,41 @@ function buildProjectSettingsView(project, globalSettings) {
   inline.text('🗑 Delete project', `proj:delete:${project.id}`).text('⬅️ Back', 'proj:list');
 
   return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildProjectLogAlertsView(project) {
+  const forwarding = getEffectiveProjectLogForwarding(project);
+  const levelsLabel = forwarding.levels.length ? forwarding.levels.join(' / ') : 'error';
+  const selected = new Set(forwarding.levels);
+  const lines = [
+    `📣 Log alerts — ${project.name || project.id}`,
+    '',
+    `Status: ${forwarding.enabled ? 'Enabled' : 'Disabled'}`,
+    `Levels: ${levelsLabel}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text(forwarding.enabled ? '✅ Enabled' : '🚫 Disabled', `projlog:toggle:${project.id}`)
+    .row()
+    .text(`❗ Errors: ${selected.has('error') ? 'ON' : 'OFF'}`, `projlog:level:error:${project.id}`)
+    .text(`⚠️ Warnings: ${selected.has('warn') ? 'ON' : 'OFF'}`, `projlog:level:warn:${project.id}`)
+    .row()
+    .text(`ℹ️ Info: ${selected.has('info') ? 'ON' : 'OFF'}`, `projlog:level:info:${project.id}`)
+    .row()
+    .text('⬅️ Back', `projlog:back:${project.id}`);
+
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectLogAlerts(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const view = buildProjectLogAlertsView(project);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
 async function renderProjectSettingsForMessage(messageContext, projectId) {
@@ -1550,10 +1753,12 @@ async function renderGlobalSettings(ctx) {
   const defaultProject = settings.defaultProjectId
     ? findProjectById(projects, settings.defaultProjectId)
     : undefined;
+  const selfLogForwarding = getEffectiveSelfLogForwarding(settings);
   const lines = [
     `defaultBaseBranch: ${settings.defaultBaseBranch || DEFAULT_BASE_BRANCH}`,
     `defaultProjectId: ${settings.defaultProjectId || '-'}` +
       (defaultProject ? ` (${defaultProject.name || defaultProject.id})` : ''),
+    `selfLogForwarding: ${selfLogForwarding.enabled ? 'enabled' : 'disabled'} (${selfLogForwarding.levels.join('/')})`,
   ];
 
   const inline = buildSettingsKeyboard();
@@ -1563,6 +1768,8 @@ async function renderGlobalSettings(ctx) {
 
 function buildSettingsKeyboard() {
   return new InlineKeyboard()
+    .text('📣 Bot log alerts', 'gsettings:bot_log_alerts')
+    .row()
     .text('📶 Ping test', 'gsettings:ping_test')
     .row()
     .text('✏️ Change default base branch', 'gsettings:change_default_base')
@@ -1572,6 +1779,36 @@ function buildSettingsKeyboard() {
     .text('🧹 Clear default project', 'gsettings:clear_default_project')
     .row()
     .text('⬅️ Back', 'gsettings:back');
+}
+
+function buildSelfLogAlertsView(settings) {
+  const forwarding = getEffectiveSelfLogForwarding(settings);
+  const levelsLabel = forwarding.levels.length ? forwarding.levels.join(' / ') : 'error';
+  const selected = new Set(forwarding.levels);
+  const lines = [
+    '📣 Bot log alerts',
+    '',
+    `Status: ${forwarding.enabled ? 'Enabled' : 'Disabled'}`,
+    `Levels: ${levelsLabel}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text(forwarding.enabled ? '✅ Enabled' : '🚫 Disabled', 'gsettings:bot_log_toggle')
+    .row()
+    .text(`❗ Errors: ${selected.has('error') ? 'ON' : 'OFF'}`, 'gsettings:bot_log_level:error')
+    .text(`⚠️ Warnings: ${selected.has('warn') ? 'ON' : 'OFF'}`, 'gsettings:bot_log_level:warn')
+    .row()
+    .text(`ℹ️ Info: ${selected.has('info') ? 'ON' : 'OFF'}`, 'gsettings:bot_log_level:info')
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
+
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderSelfLogAlerts(ctx) {
+  const settings = await loadGlobalSettings();
+  const view = buildSelfLogAlertsView(settings);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
 async function runPingTest(ctx) {
@@ -1712,6 +1949,65 @@ function readRequestBody(req) {
   });
 }
 
+function truncateText(value, limit) {
+  if (!value) return '';
+  const text = String(value);
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+function parseProjectLogPayload(rawBody) {
+  const now = new Date().toISOString();
+  if (!rawBody) {
+    return { level: 'error', message: '(no message)', timestamp: now };
+  }
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (parsed && typeof parsed === 'object') {
+      const level = normalizeLogLevel(parsed.level) || 'error';
+      const message = parsed.message != null ? String(parsed.message) : '(no message)';
+      return {
+        level,
+        message,
+        stack: parsed.stack ? String(parsed.stack) : '',
+        context: parsed.context,
+        timestamp: parsed.timestamp || now,
+        source: parsed.source,
+      };
+    }
+    return { level: 'error', message: truncateText(parsed, 1000), timestamp: now };
+  } catch (error) {
+    return {
+      level: 'error',
+      message: truncateText(rawBody, 1000),
+      timestamp: now,
+    };
+  }
+}
+
+function formatProjectLogMessage(project, event) {
+  const projectLabel = project.name || project.id;
+  const lines = [
+    `⚠️ [${event.level.toUpperCase()}] ${projectLabel}`,
+    `Time: ${event.timestamp || new Date().toISOString()}`,
+    `Source: ${event.source || 'external'}`,
+    `Message: ${truncateText(event.message, 1200) || '(no message)'}`,
+  ];
+
+  if (event.stack) {
+    lines.push(`Stack: ${truncateText(event.stack, 800)}`);
+  }
+
+  if (event.context && typeof event.context === 'object') {
+    const contextSnippet = truncateText(JSON.stringify(event.context), 600);
+    if (contextSnippet) {
+      lines.push(`Context: ${contextSnippet}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
 function parseRenderErrorPayload(body) {
   if (!body) {
     return { message: '', level: '' };
@@ -1786,8 +2082,12 @@ function buildPrBody(patchText) {
   return `Automated patch at ${new Date().toISOString()}\n\nPreview:\n\n${preview}`;
 }
 
-bot.catch((err) => {
+bot.catch(async (err) => {
   console.error('Bot error:', err);
+  await forwardSelfLog('error', 'Bot error encountered', {
+    stack: err?.stack,
+    context: { error: err?.message },
+  });
 });
 
 const port = process.env.PORT || 3000;
@@ -1848,6 +2148,55 @@ function startHttpServer() {
           await bot.api.sendMessage(ADMIN_TELEGRAM_ID, text);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname.startsWith('/project-log/')) {
+          try {
+            const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+            const projects = await loadProjects();
+            const project = findProjectById(projects, projectId);
+            if (!project) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'Unknown projectId' }));
+              return;
+            }
+
+            const rawBody = await readRequestBody(req);
+            const event = parseProjectLogPayload(rawBody);
+            const forwarding = getEffectiveProjectLogForwarding(project);
+
+            if (forwarding.enabled !== true) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'disabled' }));
+              return;
+            }
+
+            let allowedLevels = normalizeLogLevels(forwarding.levels).filter((level) =>
+              LOG_LEVELS.includes(level),
+            );
+            if (!allowedLevels.length) {
+              allowedLevels = ['error'];
+            }
+
+            if (!allowedLevels.includes(event.level)) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'level filtered' }));
+              return;
+            }
+
+            const targetChatId = forwarding.targetChatId || ADMIN_TELEGRAM_ID;
+            const message = formatProjectLogMessage(project, event);
+            await bot.api.sendMessage(targetChatId, message, {
+              disable_web_page_preview: true,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, forwarded: true }));
+          } catch (error) {
+            console.error('[project-log] Failed to process log event', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'internal error' }));
+          }
           return;
         }
 

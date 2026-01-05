@@ -1,6 +1,7 @@
 // Persistent storage for projects & globalSettings in Postgres (JSONB)
 
 const { Pool } = require('pg');
+const { forwardSelfLog } = require('./logger');
 
 let pool = null;
 
@@ -98,6 +99,10 @@ async function saveProjects(projects) {
     await saveJson('projects', projects);
   } catch (err) {
     console.error('[configStore] Failed to save projects', err);
+    await forwardSelfLog('error', 'Failed to save projects', {
+      stack: err?.stack,
+      context: { error: err?.message },
+    });
   }
 }
 
@@ -112,6 +117,10 @@ async function saveGlobalSettings(settings) {
     await saveJson('globalSettings', settings || {});
   } catch (err) {
     console.error('[configStore] Failed to save globalSettings', err);
+    await forwardSelfLog('error', 'Failed to save global settings', {
+      stack: err?.stack,
+      context: { error: err?.message },
+    });
   }
 }
 
