@@ -5,6 +5,7 @@ const { forwardSelfLog } = require('./logger');
 
 const SETTINGS_FILE = path.join(__dirname, 'globalSettings.json');
 const ENV_DEFAULT_BASE = process.env.DEFAULT_BASE_BRANCH || 'main';
+const DEFAULT_CRON_SETTINGS = { enabled: true, defaultTimezone: 'UTC' };
 
 async function ensureSettingsFile() {
   try {
@@ -63,4 +64,34 @@ module.exports = {
   SETTINGS_FILE,
   loadGlobalSettings,
   saveGlobalSettings,
+  loadCronSettings,
+  saveCronSettings,
 };
+
+async function loadCronSettings() {
+  const settings = await configStore.loadJson('cronSettings');
+  if (!settings || typeof settings !== 'object') {
+    return { ...DEFAULT_CRON_SETTINGS };
+  }
+  return {
+    enabled: typeof settings.enabled === 'boolean' ? settings.enabled : DEFAULT_CRON_SETTINGS.enabled,
+    defaultTimezone: settings.defaultTimezone || DEFAULT_CRON_SETTINGS.defaultTimezone,
+  };
+}
+
+async function saveCronSettings(settings) {
+  const payload = {
+    enabled: typeof settings?.enabled === 'boolean' ? settings.enabled : DEFAULT_CRON_SETTINGS.enabled,
+    defaultTimezone: settings?.defaultTimezone || DEFAULT_CRON_SETTINGS.defaultTimezone,
+  };
+  try {
+    await configStore.saveJson('cronSettings', payload);
+  } catch (error) {
+    console.error('[configStore] Failed to save cronSettings', error);
+    await forwardSelfLog('error', 'Failed to save cron settings', {
+      stack: error?.stack,
+      context: { error: error?.message },
+    });
+    throw error;
+  }
+}
