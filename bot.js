@@ -35,6 +35,8 @@ if (!ADMIN_TELEGRAM_ID) {
 
 const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
+let botStarted = false;
+let botRetryTimeout = null;
 
 async function testConfigDbConnection() {
   try {
@@ -1254,71 +1256,121 @@ async function initializeConfig() {
   }
 }
 
-http
-  .createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
-      const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
-      const project = projectId ? await getProjectById(projectId) : null;
-      if (!project) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'Project not found.' }));
-        return;
-      }
-      if (!project.renderServiceUrl) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'renderServiceUrl not configured.' }));
-        return;
-      }
-      const start = Date.now();
-      try {
-        const response = await requestUrl('GET', project.renderServiceUrl);
-        const durationMs = Date.now() - start;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, status: response.status, durationMs }));
-      } catch (error) {
-        const durationMs = Date.now() - start;
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, status: null, durationMs, error: error.message }));
-        await bot.api.sendMessage(
-          ADMIN_TELEGRAM_ID,
-          `Render keep-alive FAILED for project ${project.name || project.id}.`,
-        );
-      }
-      return;
-    }
+function startHttpServer() {
+  return new Promise((resolve) => {
+    http
+      .createServer(async (req, res) => {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
+          const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+          const project = projectId ? await getProjectById(projectId) : null;
+          if (!project) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Project not found.' }));
+            return;
+          }
+          if (!project.renderServiceUrl) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'renderServiceUrl not configured.' }));
+            return;
+          }
+          const start = Date.now();
+          try {
+            const response = await requestUrl('GET', project.renderServiceUrl);
+            const durationMs = Date.now() - start;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, status: response.status, durationMs }));
+          } catch (error) {
+            const durationMs = Date.now() - start;
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, status: null, durationMs, error: error.message }));
+            await bot.api.sendMessage(
+              ADMIN_TELEGRAM_ID,
+              `Render keep-alive FAILED for project ${project.name || project.id}.`,
+            );
+          }
+          return;
+        }
 
-    if (req.method === 'POST' && url.pathname.startsWith('/render-error-hook/')) {
-      const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
-      const body = await readRequestBody(req);
-      const { message, level } = parseRenderErrorPayload(body);
-      const timestamp = new Date().toISOString();
-      const text = `⚠️ Render error for project ${projectId} at ${timestamp}.\nLevel: ${
-        level || '-'
-      }\nMessage: ${message || '-'}`;
-      await bot.api.sendMessage(ADMIN_TELEGRAM_ID, text);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
-      return;
-    }
+        if (req.method === 'POST' && url.pathname.startsWith('/render-error-hook/')) {
+          const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+          const body = await readRequestBody(req);
+          const { message, level } = parseRenderErrorPayload(body);
+          const timestamp = new Date().toISOString();
+          const text = `⚠️ Render error for project ${projectId} at ${timestamp}.\nLevel: ${
+            level || '-'
+          }\nMessage: ${message || '-'}`;
+          await bot.api.sendMessage(ADMIN_TELEGRAM_ID, text);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
 
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Path Applier is running.\n');
-  })
-  .listen(port, () => {
-    console.log(`HTTP health server listening on port ${port}`);
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Path Applier is running.\n');
+      })
+      .listen(port, () => {
+        console.log(`HTTP health server listening on port ${port}`);
+        resolve();
+      });
   });
-async function startBot() {
-  try {
-    await bot.api.deleteWebhook({ drop_pending_updates: true });
-  } catch (error) {
-    console.error('Failed to delete webhook', error);
+}
+
+async function startBotPolling() {
+  if (botStarted) {
+    console.log('[Path Applier] bot.start() already called, skipping.');
+    return;
   }
+  botStarted = true;
+  if (botRetryTimeout) {
+    clearTimeout(botRetryTimeout);
+    botRetryTimeout = null;
+  }
+
+  try {
+    await bot.start();
+    console.log('[Path Applier] Bot polling started.');
+  } catch (error) {
+    botStarted = false;
+    if (
+      error?.error_code === 409 &&
+      typeof error.description === 'string' &&
+      error.description.includes('terminated by other getUpdates request')
+    ) {
+      console.error(
+        '[Path Applier] Telegram returned 409 (another getUpdates in progress). Will retry in 15 seconds.',
+      );
+      if (!botRetryTimeout) {
+        botRetryTimeout = setTimeout(() => {
+          botRetryTimeout = null;
+          startBotPolling().catch((retryError) => {
+            console.error(
+              '[Path Applier] Retry failed:',
+              retryError?.stack || retryError,
+            );
+          });
+        }, 15000);
+      }
+      return;
+    }
+    console.error('[Path Applier] Failed to start bot polling:', error?.stack || error);
+    throw error;
+  }
+}
+
+async function startBot() {
+  await startHttpServer();
   await testConfigDbConnection();
   await initializeConfig();
-  bot.start();
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
+    console.log('[Path Applier] Webhook deleted (if any). Using long polling.');
+  } catch (error) {
+    console.error('[Path Applier] Failed to delete webhook:', error?.stack || error);
+  }
+  await startBotPolling();
 }
 
 startBot().catch((error) => {
-  console.error('Failed to start bot', error);
+  console.error('Failed to start bot', error?.stack || error);
 });
