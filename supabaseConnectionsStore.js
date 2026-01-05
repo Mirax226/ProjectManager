@@ -1,4 +1,5 @@
 const { loadJson, saveJson } = require('./configStore');
+const { forwardSelfLog } = require('./logger');
 
 const SUPABASE_CONNECTIONS_KEY = 'supabaseConnections';
 
@@ -13,8 +14,17 @@ async function loadSupabaseConnections() {
 
 async function saveSupabaseConnections(conns) {
   if (!Array.isArray(conns)) throw new Error('Supabase connections must be an array');
-  cache = conns;
-  await saveJson(SUPABASE_CONNECTIONS_KEY, conns);
+  try {
+    cache = conns;
+    await saveJson(SUPABASE_CONNECTIONS_KEY, conns);
+  } catch (error) {
+    console.error('[supabaseConnectionsStore] Failed to save supabase connections', error);
+    await forwardSelfLog('error', 'Failed to save Supabase connections', {
+      stack: error?.stack,
+      context: { error: error?.message },
+    });
+    throw error;
+  }
 }
 
 function findSupabaseConnection(id) {
