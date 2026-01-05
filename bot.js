@@ -14,7 +14,9 @@ const {
   commitAndPush,
   DEFAULT_BASE_BRANCH,
   fetchDryRun,
-  getRepoPath,
+  getRepoInfo,
+  getGithubToken,
+  getDefaultWorkingDir,
 } = require('./gitUtils');
 const { createPullRequest, measureGithubLatency } = require('./githubUtils');
 const { loadGlobalSettings, saveGlobalSettings } = require('./settingsStore');
@@ -258,6 +260,15 @@ async function handleStatefulMessage(ctx, state) {
     case 'change_base_branch':
       await handleChangeBaseBranchStep(ctx, state);
       break;
+    case 'edit_repo':
+      await handleEditRepoStep(ctx, state);
+      break;
+    case 'edit_working_dir':
+      await handleEditWorkingDirStep(ctx, state);
+      break;
+    case 'edit_github_token':
+      await handleEditGithubTokenStep(ctx, state);
+      break;
     case 'edit_command_input':
       await handleEditCommandInput(ctx, state);
       break;
@@ -379,6 +390,39 @@ async function handleProjectCallback(ctx, data) {
       await ctx.reply('Send the new project name.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
+      break;
+    case 'edit_repo':
+      setUserState(ctx.from.id, {
+        type: 'edit_repo',
+        projectId,
+        messageContext: getMessageTargetFromCtx(ctx),
+      });
+      await ctx.reply(
+        'Send new GitHub repo as owner/repo (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
+        { reply_markup: buildCancelKeyboard() },
+      );
+      break;
+    case 'edit_workdir':
+      setUserState(ctx.from.id, {
+        type: 'edit_working_dir',
+        projectId,
+        messageContext: getMessageTargetFromCtx(ctx),
+      });
+      await ctx.reply(
+        'Send new working directory path. Or send "-" to reset to default based on repo.\n(Or press Cancel)',
+        { reply_markup: buildCancelKeyboard() },
+      );
+      break;
+    case 'edit_github_token':
+      setUserState(ctx.from.id, {
+        type: 'edit_github_token',
+        projectId,
+        messageContext: getMessageTargetFromCtx(ctx),
+      });
+      await ctx.reply(
+        'Send the env key that contains the GitHub token (for example: GITHUB_TOKEN_DS). Or send "-" to use the default GITHUB_TOKEN.\n(Or press Cancel)',
+        { reply_markup: buildCancelKeyboard() },
+      );
       break;
     case 'change_base':
       setUserState(ctx.from.id, {
@@ -840,8 +884,10 @@ function getWizardSteps() {
   return [
     'name',
     'id',
-    'repoUrl',
-    'workingDir',
+    'repoSlug',
+    'workingDirConfirm',
+    'workingDirCustom',
+    'githubTokenEnvKey',
     'startCommand',
     'testCommand',
     'diagnosticCommand',
@@ -856,8 +902,33 @@ function getNextWizardStep(current) {
   return steps[idx + 1] || null;
 }
 
-function getWizardKeyboard() {
-  return new InlineKeyboard().text('⏭ Skip', 'projwiz:skip').row().text('❌ Cancel', 'cancel_input');
+function isWizardStepSkippable(step) {
+  return [
+    'name',
+    'id',
+    'startCommand',
+    'testCommand',
+    'diagnosticCommand',
+    'renderServiceUrl',
+    'renderDeployHookUrl',
+  ].includes(step);
+}
+
+function getWizardKeyboard(step) {
+  const inline = new InlineKeyboard();
+  if (isWizardStepSkippable(step)) {
+    inline.text('⏭ Skip', 'projwiz:skip').row();
+  }
+  inline.text('❌ Cancel', 'cancel_input');
+  return inline;
+}
+
+function getWorkingDirChoiceKeyboard() {
+  return new InlineKeyboard()
+    .text('✅ Keep default', 'projwiz:keep_workdir')
+    .text('✏️ Change working dir', 'projwiz:change_workdir')
+    .row()
+    .text('❌ Cancel', 'cancel_input');
 }
 
 function slugifyProjectId(value) {
@@ -869,20 +940,14 @@ function slugifyProjectId(value) {
     .slice(0, 40);
 }
 
-function parseRepoInfo(value) {
-  if (!value) return {};
+function parseRepoSlug(value) {
+  if (!value) return undefined;
   const trimmed = value.trim();
-  const urlMatch = trimmed.match(/github\.com\/([^/]+)\/([^/]+)(?:\.git)?/i);
-  if (urlMatch) {
-    return { owner: urlMatch[1], repo: urlMatch[2].replace(/\.git$/i, '') };
-  }
-  if (trimmed.includes('/')) {
-    const [owner, repo] = trimmed.split('/');
-    if (owner && repo) {
-      return { owner, repo };
-    }
-  }
-  return {};
+  const parts = trimmed.split('/');
+  if (parts.length !== 2) return undefined;
+  const [owner, repo] = parts;
+  if (!owner || !repo) return undefined;
+  return `${owner}/${repo}`;
 }
 
 async function startProjectWizard(ctx) {
@@ -903,15 +968,24 @@ async function handleProjectWizardCallback(ctx, data) {
     return;
   }
 
-  if (action === 'cancel') {
-    resetUserState(ctx);
-    await renderOrEdit(ctx, 'Project creation cancelled.');
-    await renderMainMenu(ctx);
+  if (action === 'skip') {
+    if (!isWizardStepSkippable(state.step)) {
+      await ctx.reply('This step is required. Please enter a value.');
+      return;
+    }
+    state.step = getNextWizardStep(state.step);
+    await promptNextProjectField(ctx, state);
     return;
   }
 
-  if (action === 'skip') {
-    state.step = getNextWizardStep(state.step);
+  if (action === 'keep_workdir') {
+    state.step = 'githubTokenEnvKey';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (action === 'change_workdir') {
+    state.step = 'workingDirCustom';
     await promptNextProjectField(ctx, state);
   }
 }
@@ -939,20 +1013,52 @@ async function handleProjectWizardInput(ctx, state) {
 
   if (state.step === 'id') {
     state.draft.id = value;
-    state.step = 'repoUrl';
+    state.step = 'repoSlug';
     await promptNextProjectField(ctx, state);
     return;
   }
 
-  if (state.step === 'repoUrl') {
-    state.draft.repoUrl = value;
-    state.step = 'workingDir';
+  if (state.step === 'repoSlug') {
+    const repoSlug = parseRepoSlug(value);
+    if (!repoSlug) {
+      await ctx.reply('Please send a valid repo in the format owner/repo.');
+      return;
+    }
+    state.draft.repoSlug = repoSlug;
+    state.draft.repoUrl = `https://github.com/${repoSlug}`;
+    const defaultWorkingDir = getDefaultWorkingDir(repoSlug);
+    if (defaultWorkingDir) {
+      state.draft.workingDir = defaultWorkingDir;
+      state.draft.isWorkingDirCustom = false;
+    }
+    state.step = 'workingDirConfirm';
     await promptNextProjectField(ctx, state);
     return;
   }
 
-  if (state.step === 'workingDir') {
+  if (state.step === 'workingDirConfirm') {
+    await ctx.reply('Please use the buttons below to choose a working directory option.');
+    return;
+  }
+
+  if (state.step === 'workingDirCustom') {
+    if (!value) {
+      await ctx.reply('Please send a valid working directory path.');
+      return;
+    }
     state.draft.workingDir = value;
+    state.draft.isWorkingDirCustom = true;
+    state.step = 'githubTokenEnvKey';
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'githubTokenEnvKey') {
+    if (value === '-') {
+      state.draft.githubTokenEnvKey = undefined;
+    } else {
+      state.draft.githubTokenEnvKey = value;
+    }
     state.step = 'startCommand';
     await promptNextProjectField(ctx, state);
     return;
@@ -1002,8 +1108,12 @@ async function promptNextProjectField(ctx, state) {
   const prompts = {
     name: '🆕 New project\n\nSend project *name* or press Skip.\n(Or press Cancel)',
     id: 'Send project *ID* (unique short handle) or press Skip.\n(Or press Cancel)',
-    repoUrl: 'Send the GitHub repo URL or `owner/repo` (or Skip).\n(Or press Cancel)',
-    workingDir: 'Send working directory path (or Skip).\n(Or press Cancel)',
+    repoSlug:
+      'Send GitHub repo as `owner/repo` (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
+    workingDirConfirm: null,
+    workingDirCustom: 'Send working directory path.\n(Or press Cancel)',
+    githubTokenEnvKey:
+      'GitHub token env key:\nDefault: GITHUB_TOKEN\nSend a custom env key or type `-` to use the default.',
     startCommand: 'Send *startCommand* (or Skip).\n(Or press Cancel)',
     testCommand: 'Send *testCommand* (or Skip).\n(Or press Cancel)',
     diagnosticCommand: 'Send *diagnosticCommand* (or Skip).\n(Or press Cancel)',
@@ -1011,15 +1121,23 @@ async function promptNextProjectField(ctx, state) {
     renderDeployHookUrl: 'Send Render deploy hook URL (or Skip).\n(Or press Cancel)',
   };
 
+  if (state.step === 'workingDirConfirm') {
+    await renderOrEdit(
+      ctx,
+      `Default working directory:\n${state.draft.workingDir || '-'}\nDo you want to change it?`,
+      { reply_markup: getWorkingDirChoiceKeyboard() },
+    );
+    return;
+  }
+
   await renderOrEdit(ctx, prompts[state.step], {
     parse_mode: 'Markdown',
-    reply_markup: getWizardKeyboard(),
+    reply_markup: getWizardKeyboard(state.step),
   });
 }
 
 async function finalizeProjectWizard(ctx, state) {
   const draft = state.draft || {};
-  const repoInfo = parseRepoInfo(draft.repoUrl);
   const baseId = draft.id || slugifyProjectId(draft.name || 'project');
   const fallbackId = baseId || `project-${Date.now()}`;
 
@@ -1029,16 +1147,20 @@ async function finalizeProjectWizard(ctx, state) {
     finalId = `${finalId}-${Date.now()}`;
   }
 
-  const owner = draft.owner || repoInfo.owner;
-  const repo = draft.repo || repoInfo.repo;
+  const repoSlug = draft.repoSlug;
+  const owner = repoSlug ? repoSlug.split('/')[0] : undefined;
+  const repo = repoSlug ? repoSlug.split('/')[1] : undefined;
 
   const project = {
     id: finalId,
     name: draft.name || finalId,
+    repoSlug,
+    repoUrl: draft.repoUrl || (repoSlug ? `https://github.com/${repoSlug}` : undefined),
+    workingDir: draft.workingDir || (repoSlug ? getDefaultWorkingDir(repoSlug) : undefined),
+    isWorkingDirCustom: draft.isWorkingDirCustom || false,
+    githubTokenEnvKey: draft.githubTokenEnvKey,
     owner,
     repo,
-    repoUrl: draft.repoUrl || (owner && repo ? `https://github.com/${owner}/${repo}` : undefined),
-    workingDir: draft.workingDir || (owner && repo ? getRepoPath({ owner, repo }) : undefined),
     startCommand: draft.startCommand,
     testCommand: draft.testCommand,
     diagnosticCommand: draft.diagnosticCommand,
@@ -1047,7 +1169,12 @@ async function finalizeProjectWizard(ctx, state) {
   };
 
   projects.push(project);
-  await saveProjects(projects);
+  try {
+    await saveProjects(projects);
+  } catch (error) {
+    console.error('[configStore] Failed to save projects', error);
+    await ctx.reply('Failed to save project settings (DB error). Changes may not persist.');
+  }
   userState.delete(ctx.from.id);
 
   await renderOrEdit(
@@ -1085,6 +1212,18 @@ async function handlePatchApplication(ctx, state) {
     }
 
     const effectiveBaseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+    let repoInfo;
+    try {
+      repoInfo = getRepoInfo(project);
+    } catch (error) {
+      if (error.message === 'Project is missing repoSlug') {
+        await ctx.reply(
+          'This project is not fully configured: repoSlug is missing. Use "📝 Edit repo" to set it.',
+        );
+        return;
+      }
+      throw error;
+    }
 
     await ctx.reply('Updating repository…');
     const { git, repoDir } = await prepareRepository(project, effectiveBaseBranch);
@@ -1121,13 +1260,16 @@ async function handlePatchApplication(ctx, state) {
 
     await ctx.reply('Creating Pull Request…');
     const prBody = buildPrBody(patchText);
+    const [owner, repo] = repoInfo.repoSlug.split('/');
+    const githubToken = getGithubToken(project);
     const pr = await createPullRequest({
-      owner: project.owner,
-      repo: project.repo,
+      owner,
+      repo,
       baseBranch: effectiveBaseBranch || DEFAULT_BASE_BRANCH,
       headBranch: branchName,
       title: `Automated patch: ${project.id}`,
       body: prBody,
+      token: githubToken,
     });
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
@@ -1138,6 +1280,17 @@ async function handlePatchApplication(ctx, state) {
     await ctx.reply(`Failed to apply patch: ${error.message}`);
   } finally {
     clearUserState(ctx.from.id);
+  }
+}
+
+async function saveProjectsWithFeedback(ctx, projects) {
+  try {
+    await saveProjects(projects);
+    return true;
+  } catch (error) {
+    console.error('[configStore] Failed to save project settings', error);
+    await ctx.reply('Failed to save project settings (DB error). Changes may not persist.');
+    return false;
   }
 }
 
@@ -1216,6 +1369,162 @@ async function handleChangeBaseBranchStep(ctx, state) {
   const updated = await updateProjectField(state.projectId, 'baseBranch', text);
   if (!updated) {
     await ctx.reply('Project not found.');
+    clearUserState(ctx.from.id);
+    return;
+  }
+
+  clearUserState(ctx.from.id);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  if (!state.messageContext) {
+    await renderProjectSettings(ctx, state.projectId);
+  }
+}
+
+async function handleEditRepoStep(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
+
+  const repoSlug = parseRepoSlug(text);
+  if (!repoSlug) {
+    await ctx.reply('Please send a valid repo in the format owner/repo.');
+    return;
+  }
+
+  const projects = await loadProjects();
+  const idx = projects.findIndex((project) => project.id === state.projectId);
+  if (idx === -1) {
+    await ctx.reply('Project not found.');
+    clearUserState(ctx.from.id);
+    return;
+  }
+
+  const [owner, repo] = repoSlug.split('/');
+  const repoUrl = `https://github.com/${repoSlug}`;
+  const defaultWorkingDir = getDefaultWorkingDir(repoSlug);
+  const updatedProject = {
+    ...projects[idx],
+    repoSlug,
+    repoUrl,
+    owner,
+    repo,
+  };
+
+  if (!updatedProject.isWorkingDirCustom) {
+    updatedProject.workingDir = defaultWorkingDir;
+    updatedProject.isWorkingDirCustom = false;
+  }
+
+  projects[idx] = updatedProject;
+  const saved = await saveProjectsWithFeedback(ctx, projects);
+  if (!saved) {
+    clearUserState(ctx.from.id);
+    return;
+  }
+
+  clearUserState(ctx.from.id);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  if (!state.messageContext) {
+    await renderProjectSettings(ctx, state.projectId);
+  }
+}
+
+async function handleEditWorkingDirStep(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
+
+  const projects = await loadProjects();
+  const idx = projects.findIndex((project) => project.id === state.projectId);
+  if (idx === -1) {
+    await ctx.reply('Project not found.');
+    clearUserState(ctx.from.id);
+    return;
+  }
+
+  const project = projects[idx];
+  const trimmed = text.trim();
+  let nextWorkingDir = trimmed;
+  let isWorkingDirCustom = true;
+
+  if (trimmed === '-') {
+    if (!project.repoSlug) {
+      await ctx.reply('Cannot auto-set workingDir without repoSlug.');
+      return;
+    }
+    const defaultDir = getDefaultWorkingDir(project.repoSlug);
+    if (!defaultDir) {
+      await ctx.reply('Cannot derive workingDir from repoSlug.');
+      return;
+    }
+    nextWorkingDir = defaultDir;
+    isWorkingDirCustom = false;
+  }
+
+  projects[idx] = {
+    ...project,
+    workingDir: nextWorkingDir,
+    isWorkingDirCustom,
+  };
+
+  const saved = await saveProjectsWithFeedback(ctx, projects);
+  if (!saved) {
+    clearUserState(ctx.from.id);
+    return;
+  }
+
+  clearUserState(ctx.from.id);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  if (!state.messageContext) {
+    await renderProjectSettings(ctx, state.projectId);
+  }
+}
+
+async function handleEditGithubTokenStep(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.');
+    await renderMainMenu(ctx);
+    return;
+  }
+
+  const projects = await loadProjects();
+  const idx = projects.findIndex((project) => project.id === state.projectId);
+  if (idx === -1) {
+    await ctx.reply('Project not found.');
+    clearUserState(ctx.from.id);
+    return;
+  }
+
+  const tokenKey = text.trim() === '-' ? undefined : text.trim();
+  projects[idx] = {
+    ...projects[idx],
+    githubTokenEnvKey: tokenKey,
+  };
+
+  const saved = await saveProjectsWithFeedback(ctx, projects);
+  if (!saved) {
     clearUserState(ctx.from.id);
     return;
   }
@@ -1346,15 +1655,21 @@ async function runProjectDiagnostics(ctx, projectId) {
   const globalSettings = await loadGlobalSettings();
   const effectiveBaseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
 
+  let repoInfo;
   try {
-    if (project.owner && project.repo) {
-      await prepareRepository(project, effectiveBaseBranch);
-    }
+    repoInfo = getRepoInfo(project);
+    await prepareRepository(project, effectiveBaseBranch);
   } catch (error) {
+    if (error.message === 'Project is missing repoSlug') {
+      await ctx.reply(
+        'This project is not fully configured: repoSlug is missing. Use "📝 Edit repo" to set it.',
+      );
+      return;
+    }
     console.error('Failed to prepare repository for diagnostics', error);
   }
 
-  const workingDir = project.workingDir || (project.owner && project.repo ? getRepoPath(project) : undefined);
+  const workingDir = project.workingDir || repoInfo?.workingDir;
   if (!workingDir) {
     await ctx.reply('No working directory configured for this project.');
     return;
@@ -1447,12 +1762,17 @@ function buildProjectSettingsView(project, globalSettings) {
   const effectiveBase = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
   const isDefault = globalSettings.defaultProjectId === project.id;
   const name = project.name || project.id;
+  const tokenKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';
+  const tokenLabel = tokenKey === 'GITHUB_TOKEN' ? 'GITHUB_TOKEN (default)' : tokenKey;
 
   const lines = [
     `Project: ${isDefault ? '⭐ ' : ''}${name} (id: ${project.id})`,
     '',
-    `Repo: ${project.repoUrl || (project.owner && project.repo ? `https://github.com/${project.owner}/${project.repo}` : '-')}`,
+    'Repo:',
+    `- slug: ${project.repoSlug || 'not set'}`,
+    `- url: ${project.repoUrl || 'not set'}`,
     `Working dir: ${project.workingDir || '-'}`,
+    `GitHub token env: ${tokenLabel}`,
     `Base branch: ${effectiveBase}`,
     '',
     'Commands:',
@@ -1471,6 +1791,11 @@ function buildProjectSettingsView(project, globalSettings) {
   const inline = new InlineKeyboard()
     .text('✏️ Edit project', `proj:project_menu:${project.id}`)
     .text('🌱 Change base branch', `proj:change_base:${project.id}`)
+    .row()
+    .text('📝 Edit repo', `proj:edit_repo:${project.id}`)
+    .text('📁 Edit working dir', `proj:edit_workdir:${project.id}`)
+    .row()
+    .text('🔑 Edit GitHub token', `proj:edit_github_token:${project.id}`)
     .row()
     .text('🧰 Edit commands', `proj:commands:${project.id}`)
     .row()

@@ -1,6 +1,5 @@
 const { Octokit } = require('@octokit/rest');
 
-const githubToken = process.env.GITHUB_TOKEN;
 // Helper: make a branch-safe name from arbitrary text
 function makeBranchSlug(input) {
   return String(input)
@@ -17,15 +16,24 @@ function makeBranchSlug(input) {
     .slice(0, 80); // خیلی بلند هم نشه
 }
 
-function getOctokit() {
+function getOctokit(token) {
+  const githubToken = token || process.env.GITHUB_TOKEN;
   if (!githubToken) {
     throw new Error('Missing GITHUB_TOKEN');
   }
   return new Octokit({ auth: githubToken });
 }
 
-async function createPullRequest({ owner, repo, baseBranch, headBranch, title, body }) {
-  const octokit = getOctokit();
+async function createPullRequest({
+  owner,
+  repo,
+  baseBranch,
+  headBranch,
+  title,
+  body,
+  token,
+}) {
+  const octokit = getOctokit(token);
   const response = await octokit.pulls.create({
     owner,
     repo,

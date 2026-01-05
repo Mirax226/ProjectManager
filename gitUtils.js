@@ -5,17 +5,70 @@ const simpleGit = require('simple-git');
 const WORKDIR = process.env.WORKDIR || '/tmp/patch-runner-bot';
 const DEFAULT_BASE_BRANCH = process.env.DEFAULT_BASE_BRANCH || 'main';
 
-function getRepoPath(project) {
-  return path.join(WORKDIR, `${project.owner}__${project.repo}`);
+function getDefaultWorkingDir(repoSlug) {
+  if (!repoSlug || !repoSlug.includes('/')) return undefined;
+  const [owner, repo] = repoSlug.split('/');
+  if (!owner || !repo) return undefined;
+  return path.join(WORKDIR, `${owner}__${repo}`);
+}
+
+function getRepoInfo(project) {
+  let repoSlug = project?.repoSlug;
+  if (!repoSlug && project?.repoOwner && project?.repoName) {
+    repoSlug = `${project.repoOwner}/${project.repoName}`;
+  }
+  if (!repoSlug && project?.owner && project?.repo) {
+    repoSlug = `${project.owner}/${project.repo}`;
+  }
+  if (!repoSlug && typeof project?.repo === 'string' && project.repo.includes('/')) {
+    repoSlug = project.repo;
+  }
+
+  if (!repoSlug) {
+    throw new Error('Project is missing repoSlug');
+  }
+
+  let repoUrl = project?.repoUrl || `https://github.com/${repoSlug}`;
+  if (!repoUrl.endsWith('.git')) {
+    repoUrl = `${repoUrl}.git`;
+  }
+
+  let workingDir = project?.workingDir;
+  if (!workingDir) {
+    workingDir = getDefaultWorkingDir(repoSlug);
+  }
+
+  return { repoSlug, repoUrl, workingDir };
 }
 
 async function ensureWorkdir() {
   await fs.mkdir(WORKDIR, { recursive: true });
 }
 
+function getGithubToken(project) {
+  const key = project?.githubTokenEnvKey || 'GITHUB_TOKEN';
+  return process.env[key] || process.env.GITHUB_TOKEN;
+}
+
+function getRepoPath(project) {
+  try {
+    return getRepoInfo(project).workingDir;
+  } catch (error) {
+    return undefined;
+  }
+}
+
+function applyGitTokenToUrl(repoUrl, token) {
+  if (!token) return repoUrl;
+  const url = new URL(repoUrl);
+  url.username = token;
+  return url.toString();
+}
+
 async function prepareRepository(project, effectiveBaseBranch) {
   await ensureWorkdir();
-  const repoDir = getRepoPath(project);
+  const { repoUrl, workingDir } = getRepoInfo(project);
+  const repoDir = workingDir;
   const baseBranch = effectiveBaseBranch || project.baseBranch || DEFAULT_BASE_BRANCH;
 
   let repoExists = true;
@@ -27,7 +80,9 @@ async function prepareRepository(project, effectiveBaseBranch) {
 
   if (!repoExists) {
     const gitInWorkdir = simpleGit(WORKDIR);
-    await gitInWorkdir.clone(`https://github.com/${project.owner}/${project.repo}.git`, repoDir);
+    const token = getGithubToken(project);
+    const cloneUrl = applyGitTokenToUrl(repoUrl, token);
+    await gitInWorkdir.clone(cloneUrl, repoDir);
   }
 
   const git = simpleGit(repoDir);
@@ -85,4 +140,7 @@ module.exports = {
   commitAndPush,
   fetchDryRun,
   getRepoPath,
+  getRepoInfo,
+  getGithubToken,
+  getDefaultWorkingDir,
 };
