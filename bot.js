@@ -3026,7 +3026,6 @@ async function promptNextProjectField(ctx, state) {
   }
 
   await renderOrEdit(ctx, prompts[state.step], {
-    parse_mode: 'Markdown',
     reply_markup: getWizardKeyboard(state.step),
   });
 }

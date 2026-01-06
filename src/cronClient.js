@@ -31,7 +31,7 @@ async function callCronApi(method, path, body) {
     },
   };
   if (body) {
-    const payload = ['POST', 'PATCH'].includes(method) ? { job: body } : body;
+    const payload = ['POST', 'PUT', 'PATCH'].includes(method) ? { job: body } : body;
     options.body = JSON.stringify(payload);
   }
 
@@ -109,7 +109,7 @@ async function getJob(jobId) {
 }
 
 async function createJob(payload) {
-  const data = await callCronApi('POST', '/jobs', payload);
+  const data = await callCronApi('PUT', '/jobs', payload);
   const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
   return { id: id != null ? String(id) : null };
 }
