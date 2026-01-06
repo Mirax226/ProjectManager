@@ -459,6 +459,12 @@ async function handleStatefulMessage(ctx, state) {
     case 'cron_edit_url':
       await handleCronEditUrlMessage(ctx, state);
       break;
+    case 'cron_edit_name':
+      await handleCronEditNameMessage(ctx, state);
+      break;
+    case 'cron_edit_timezone':
+      await handleCronEditTimezoneMessage(ctx, state);
+      break;
     case 'projcron_keepalive_schedule':
     case 'projcron_keepalive_recreate':
     case 'projcron_deploy_schedule':
@@ -932,15 +938,8 @@ async function handleCronCallback(ctx, data) {
       break;
     case 'toggle': {
       try {
-        const job = await getJob(jobId);
-        const cronSettings = await getEffectiveCronSettings();
-        const payload = buildCronJobPayload({
-          name: getCronJobTitle(job),
-          url: getCronJobUrl(job),
-          schedule: job?.schedule || { cron: job?.schedule?.cron || job?.schedule?.expression },
-          timezone: job?.schedule?.timezone || cronSettings.defaultTimezone,
-          enabled: !job?.enabled,
-        });
+        const job = await fetchCronJob(jobId);
+        const payload = buildCronJobUpdatePayload(job, { enabled: !job?.enabled });
         await updateJob(jobId, payload);
         await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
       } catch (error) {
@@ -950,11 +949,17 @@ async function handleCronCallback(ctx, data) {
       }
       break;
     }
+    case 'edit_name':
+      await promptCronNameInput(ctx, jobId, 'cron:job:' + jobId);
+      break;
     case 'change_schedule':
       await promptCronScheduleInput(ctx, jobId, 'cron:job:' + jobId);
       break;
     case 'change_url':
       await promptCronUrlInput(ctx, jobId, 'cron:job:' + jobId);
+      break;
+    case 'edit_timezone':
+      await promptCronTimezoneInput(ctx, jobId, 'cron:job:' + jobId);
       break;
     case 'delete': {
       const inline = new InlineKeyboard()
@@ -1101,25 +1106,160 @@ function getCronJobId(job) {
 }
 
 function getCronJobTitle(job) {
-  return job?.title || job?.name || job?.jobTitle || job?.jobName || '(unnamed)';
+  return job?.title ?? job?.name ?? job?.jobTitle ?? job?.jobName ?? '';
+}
+
+function getCronJobDisplayName(job) {
+  const title = getCronJobTitle(job);
+  return title ? title : '(unnamed)';
 }
 
 function getCronJobUrl(job) {
   return job?.url || job?.request?.url || job?.httpTargetUrl || '';
 }
 
-function formatCronSchedule(job) {
+function unwrapCronJobPayload(payload) {
+  if (!payload) return null;
+  if (payload.job) {
+    return unwrapCronJobPayload(payload.job);
+  }
+  return payload;
+}
+
+function normalizeCronField(value) {
+  if (value == null) return null;
+  if (value === -1 || value === '-1') return -1;
+  if (Array.isArray(value)) {
+    const parsed = value.map((item) => Number(item)).filter(Number.isFinite);
+    if (parsed.length === 1 && parsed[0] === -1) return -1;
+    return parsed.length ? parsed : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (trimmed === '-1') return -1;
+    const parsed = trimmed
+      .split(',')
+      .map((item) => Number(item.trim()))
+      .filter(Number.isFinite);
+    return parsed.length ? parsed : null;
+  }
+  if (typeof value === 'number') return [value];
+  return null;
+}
+
+function normalizeCronJob(payload) {
+  const job = unwrapCronJobPayload(payload);
+  if (!job) return null;
   const schedule = job?.schedule || {};
-  const expression = schedule.cron || schedule.expression;
+  const minutes = normalizeCronField(schedule.minutes);
+  const hours = normalizeCronField(schedule.hours);
+  const expression = schedule.cron || schedule.expression || null;
+  return {
+    id: getCronJobId(job),
+    name: getCronJobTitle(job),
+    enabled: job?.enabled !== false,
+    url: getCronJobUrl(job),
+    schedule,
+    timezone: schedule.timezone || null,
+    minutes,
+    hours,
+    expression,
+    raw: job,
+  };
+}
+
+function formatCronField(value) {
+  if (value === -1 || value == null) return 'any';
+  if (Array.isArray(value) && value.length) return value.join(',');
+  return String(value);
+}
+
+function getStepValue(values, range) {
+  if (!Array.isArray(values) || values.length < 2) return null;
+  const sorted = [...new Set(values)].sort((a, b) => a - b);
+  if (sorted[0] !== 0) return null;
+  const step = sorted[1] - sorted[0];
+  if (!Number.isFinite(step) || step <= 0) return null;
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (sorted[i] !== i * step) return null;
+  }
+  if (sorted[sorted.length - 1] >= range) return null;
+  if (Math.ceil(range / step) !== sorted.length) return null;
+  return step;
+}
+
+function formatTimePart(value) {
+  return String(value).padStart(2, '0');
+}
+
+function describeCronSchedule(job, options = {}) {
+  if (!job) return '-';
+  const { includeAllHours = false } = options;
+  const minutes = job.minutes;
+  const hours = job.hours;
+  const expression = job.expression;
+
+  if (minutes == null && hours == null) {
+    return expression || '-';
+  }
+
+  if (minutes === -1 && hours === -1) {
+    return 'every minute';
+  }
+
+  const minuteStep = getStepValue(minutes, 60);
+  const hourList = Array.isArray(hours) ? [...new Set(hours)].sort((a, b) => a - b) : null;
+
+  if (minuteStep && hours === -1) {
+    if (minuteStep === 1) return 'every minute';
+    return includeAllHours ? `every ${minuteStep} minutes (all hours)` : `every ${minuteStep} minutes`;
+  }
+
+  if (minuteStep && hourList && hourList.length === 1) {
+    return `every ${minuteStep} minutes at ${formatTimePart(hourList[0])}:00`;
+  }
+
+  if (Array.isArray(minutes) && minutes.length === 1 && hourList && hourList.length === 1) {
+    return `daily at ${formatTimePart(hourList[0])}:${formatTimePart(minutes[0])}`;
+  }
+
+  if (Array.isArray(minutes) && minutes.length === 1 && hours === -1) {
+    return `hourly at :${formatTimePart(minutes[0])}`;
+  }
+
   if (expression) {
     return expression;
   }
-  if (Array.isArray(schedule.minutes) || Array.isArray(schedule.hours)) {
-    const minutes = Array.isArray(schedule.minutes) ? schedule.minutes.join(',') : '-';
-    const hours = Array.isArray(schedule.hours) ? schedule.hours.join(',') : '-';
-    return `Minutes: ${minutes}; Hours: ${hours}`;
+
+  return `Minutes: ${formatCronField(minutes)}; Hours: ${formatCronField(hours)}`;
+}
+
+async function fetchCronJobs() {
+  const jobs = await listJobs();
+  return jobs.map(normalizeCronJob).filter((job) => job && job.id != null);
+}
+
+async function fetchCronJob(jobId) {
+  const job = await getJob(jobId);
+  return normalizeCronJob(job);
+}
+
+function buildCronJobUpdatePayload(job, overrides = {}) {
+  if (!job) {
+    throw new Error('Cron job not found.');
   }
-  return '-';
+  const schedule = overrides.schedule ?? job.schedule ?? (job.expression ? { cron: job.expression } : null);
+  if (!schedule) {
+    throw new Error('Cron job schedule missing.');
+  }
+  return buildCronJobPayload({
+    name: overrides.name ?? job.name ?? '',
+    url: overrides.url ?? job.url ?? '',
+    schedule,
+    timezone: overrides.timezone ?? job.timezone ?? job.schedule?.timezone,
+    enabled: overrides.enabled ?? job.enabled,
+  });
 }
 
 function buildCronJobPayload({ name, url, schedule, timezone, enabled }) {
@@ -1159,7 +1299,7 @@ async function renderCronMenu(ctx) {
   }
   let jobs = [];
   try {
-    jobs = await listJobs();
+    jobs = await fetchCronJobs();
   } catch (error) {
     await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
       reply_markup: buildBackKeyboard('main:back'),
@@ -1187,7 +1327,7 @@ async function renderCronJobList(ctx) {
   }
   let jobs;
   try {
-    jobs = await listJobs();
+    jobs = await fetchCronJobs();
   } catch (error) {
     await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
       reply_markup: buildBackKeyboard('cron:menu'),
@@ -1197,22 +1337,19 @@ async function renderCronJobList(ctx) {
   const slice = jobs.slice(0, 10);
   const lines = ['Cron jobs:'];
   slice.forEach((job) => {
-    const id = getCronJobId(job);
-    const name = getCronJobTitle(job);
-    const enabled = job?.enabled ? 'enabled' : 'disabled';
-    const schedule = formatCronSchedule(job);
-    lines.push(`- #${id} "${name}" — ${enabled} — ${schedule}`);
+    const statusIcon = job.enabled ? '✅' : '⏸️';
+    const name = getCronJobDisplayName(job);
+    const schedule = job.enabled ? describeCronSchedule(job, { includeAllHours: true }) : 'disabled';
+    lines.push(`- ${statusIcon} ${name} (#${job.id}), ${schedule}`);
   });
   if (!slice.length) {
-    lines.push('(no jobs)');
+    lines.push('No Cron jobs found for this account.');
   }
 
   const inline = new InlineKeyboard();
   slice.forEach((job) => {
-    const id = getCronJobId(job);
-    if (id != null) {
-      inline.text(`Job #${id}`, `cron:job:${id}`).row();
-    }
+    const label = job.name ? `🕒 ${job.name}` : `🕒 Job #${job.id}`;
+    inline.text(label, `cron:job:${job.id}`).row();
   });
   inline.text('⬅️ Back', 'cron:menu');
 
@@ -1222,7 +1359,7 @@ async function renderCronJobList(ctx) {
 async function renderCronJobDetails(ctx, jobId, options = {}) {
   let job;
   try {
-    job = await getJob(jobId);
+    job = await fetchCronJob(jobId);
   } catch (error) {
     await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
       reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu'),
@@ -1236,12 +1373,12 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
     return;
   }
 
-  const schedule = formatCronSchedule(job);
-  const timezone = job?.schedule?.timezone || '-';
-  const url = getCronJobUrl(job) || '-';
+  const schedule = describeCronSchedule(job, { includeAllHours: true });
+  const timezone = job?.timezone || '-';
+  const url = job?.url || '-';
   const lines = [
     `Cron job #${jobId}:`,
-    `Name: ${getCronJobTitle(job)}`,
+    `Name: ${getCronJobDisplayName(job)}`,
     `Enabled: ${job?.enabled ? 'Yes' : 'No'}`,
     `URL: ${url}`,
     `Schedule: ${schedule}`,
@@ -1249,7 +1386,15 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
   ];
 
   const inline = new InlineKeyboard()
-    .text('✏️ Edit', `cron:edit:${jobId}`)
+    .text('✏️ Edit name', `cron:edit_name:${jobId}`)
+    .row()
+    .text('🔗 Edit URL', `cron:change_url:${jobId}`)
+    .row()
+    .text('⏯ Toggle enabled', `cron:toggle:${jobId}`)
+    .row()
+    .text('⏰ Edit schedule', `cron:change_schedule:${jobId}`)
+    .row()
+    .text('🌍 Edit timezone', `cron:edit_timezone:${jobId}`)
     .row()
     .text('🗑 Delete', `cron:delete:${jobId}`)
     .row()
@@ -1261,7 +1406,7 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
 async function renderCronJobEditMenu(ctx, jobId) {
   let job;
   try {
-    job = await getJob(jobId);
+    job = await fetchCronJob(jobId);
   } catch (error) {
     await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
       reply_markup: buildBackKeyboard('cron:menu'),
@@ -1272,8 +1417,10 @@ async function renderCronJobEditMenu(ctx, jobId) {
   const lines = [
     `Edit Cron job #${jobId}:`,
     `- Enabled: ${job?.enabled ? '✅' : '❌'}`,
-    `- Schedule: ${formatCronSchedule(job)}`,
-    `- URL: ${getCronJobUrl(job) || '-'}`,
+    `- Schedule: ${describeCronSchedule(job, { includeAllHours: true })}`,
+    `- URL: ${job?.url || '-'}`,
+    `- Timezone: ${job?.timezone || '-'}`,
+    `- Name: ${getCronJobDisplayName(job)}`,
   ];
 
   const inline = new InlineKeyboard()
@@ -1281,7 +1428,11 @@ async function renderCronJobEditMenu(ctx, jobId) {
     .row()
     .text('⏱ Change schedule', `cron:change_schedule:${jobId}`)
     .row()
+    .text('✏️ Change name', `cron:edit_name:${jobId}`)
+    .row()
     .text('🔗 Change URL', `cron:change_url:${jobId}`)
+    .row()
+    .text('🌍 Change timezone', `cron:edit_timezone:${jobId}`)
     .row()
     .text('⬅️ Back', `cron:job:${jobId}`);
 
@@ -1307,6 +1458,28 @@ async function promptCronUrlInput(ctx, jobId, backCallback) {
     backCallback,
   });
   await ctx.reply('Send new URL for this job. Or press Cancel.', {
+    reply_markup: buildCancelKeyboard(),
+  });
+}
+
+async function promptCronNameInput(ctx, jobId, backCallback) {
+  setUserState(ctx.from.id, {
+    type: 'cron_edit_name',
+    jobId,
+    backCallback,
+  });
+  await ctx.reply('Send new name for this job (or type "clear" to remove).', {
+    reply_markup: buildCancelKeyboard(),
+  });
+}
+
+async function promptCronTimezoneInput(ctx, jobId, backCallback) {
+  setUserState(ctx.from.id, {
+    type: 'cron_edit_timezone',
+    jobId,
+    backCallback,
+  });
+  await ctx.reply('Send timezone (e.g. Europe/Berlin). Or press Cancel.', {
     reply_markup: buildCancelKeyboard(),
   });
 }
@@ -1426,15 +1599,8 @@ async function handleCronEditScheduleMessage(ctx, state) {
     return;
   }
   try {
-    const job = await getJob(state.jobId);
-    const cronSettings = await getEffectiveCronSettings();
-    const payload = buildCronJobPayload({
-      name: getCronJobTitle(job),
-      url: getCronJobUrl(job),
-      schedule: schedule.cron,
-      timezone: job?.schedule?.timezone || cronSettings.defaultTimezone,
-      enabled: job?.enabled !== false,
-    });
+    const job = await fetchCronJob(state.jobId);
+    const payload = buildCronJobUpdatePayload(job, { schedule: schedule.cron });
     await updateJob(state.jobId, payload);
     clearUserState(ctx.from.id);
     await ctx.reply('Cron job updated.');
@@ -1451,15 +1617,45 @@ async function handleCronEditUrlMessage(ctx, state) {
     return;
   }
   try {
-    const job = await getJob(state.jobId);
-    const cronSettings = await getEffectiveCronSettings();
-    const payload = buildCronJobPayload({
-      name: getCronJobTitle(job),
-      url: text,
-      schedule: job?.schedule || { cron: job?.schedule?.cron || job?.schedule?.expression },
-      timezone: job?.schedule?.timezone || cronSettings.defaultTimezone,
-      enabled: job?.enabled !== false,
-    });
+    const job = await fetchCronJob(state.jobId);
+    const payload = buildCronJobUpdatePayload(job, { url: text });
+    await updateJob(state.jobId, payload);
+    clearUserState(ctx.from.id);
+    await ctx.reply('Cron job updated.');
+    await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
+  } catch (error) {
+    await ctx.reply(`Failed to update cron job: ${error.message}`);
+  }
+}
+
+async function handleCronEditNameMessage(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a name or press Cancel.');
+    return;
+  }
+  const name = text.toLowerCase() === 'clear' ? '' : text;
+  try {
+    const job = await fetchCronJob(state.jobId);
+    const payload = buildCronJobUpdatePayload(job, { name });
+    await updateJob(state.jobId, payload);
+    clearUserState(ctx.from.id);
+    await ctx.reply('Cron job updated.');
+    await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
+  } catch (error) {
+    await ctx.reply(`Failed to update cron job: ${error.message}`);
+  }
+}
+
+async function handleCronEditTimezoneMessage(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a timezone or press Cancel.');
+    return;
+  }
+  try {
+    const job = await fetchCronJob(state.jobId);
+    const payload = buildCronJobUpdatePayload(job, { timezone: text });
     await updateJob(state.jobId, payload);
     clearUserState(ctx.from.id);
     await ctx.reply('Cron job updated.');
