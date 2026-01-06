@@ -23,6 +23,7 @@ function buildCronError({ method, path, status, body, message }) {
 async function callCronApi(method, path, body) {
   assertCronApiKey();
   const url = `${CRON_API_BASE}${path}`;
+  const requestBody = body ?? null;
   const options = {
     method,
     headers: {
@@ -51,15 +52,25 @@ async function callCronApi(method, path, body) {
 
   if (!response.ok) {
     const excerpt = text ? text.slice(0, 200) : '';
-    const message = `Cron API ${method} ${path} failed (${response.status}): ${
-      excerpt || 'request failed'
-    }`;
-    console.error('[cronClient] Request failed', {
+    console.error('[cronClient] Cron API error', {
       method,
       path,
       status: response.status,
-      body: text,
+      body: requestBody,
+      responseText: text,
     });
+    if (response.status === 429) {
+      throw buildCronError({
+        method,
+        path,
+        status: response.status,
+        body: text,
+        message: 'Cron API rate limited (429)',
+      });
+    }
+    const message = `Cron API ${method} ${path} failed (${response.status}): ${
+      excerpt || 'request failed'
+    }`;
     throw buildCronError({
       method,
       path,
