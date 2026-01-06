@@ -38,7 +38,8 @@ const { configureSelfLogger, forwardSelfLog } = require('./logger');
 const {
   CRON_API_KEY,
   listJobs,
-  getJob,
+  getJobDetails,
+  patchJob,
   createJob,
   updateJob,
   deleteJob,
@@ -911,7 +912,7 @@ async function handleCronCallback(ctx, data) {
       break;
     case 'create':
       if (!CRON_API_KEY) {
-        await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+        await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
           reply_markup: buildBackKeyboard('main:back'),
         });
         return;
@@ -939,8 +940,7 @@ async function handleCronCallback(ctx, data) {
     case 'toggle': {
       try {
         const job = await fetchCronJob(jobId);
-        const payload = buildCronJobUpdatePayload(job, { enabled: !job?.enabled });
-        await updateJob(jobId, payload);
+        await patchJob(jobId, { enabled: !job?.enabled });
         await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
       } catch (error) {
         await renderOrEdit(ctx, `Failed to toggle cron job: ${error.message}`, {
@@ -1236,12 +1236,13 @@ function describeCronSchedule(job, options = {}) {
 }
 
 async function fetchCronJobs() {
-  const jobs = await listJobs();
-  return jobs.map(normalizeCronJob).filter((job) => job && job.id != null);
+  const { jobs, someFailed } = await listJobs();
+  const normalized = jobs.map(normalizeCronJob).filter((job) => job && job.id != null);
+  return { jobs: normalized, someFailed };
 }
 
 async function fetchCronJob(jobId) {
-  const job = await getJob(jobId);
+  const job = await getJobDetails(jobId);
   return normalizeCronJob(job);
 }
 
@@ -1283,6 +1284,30 @@ function buildCronJobPayload({ name, url, schedule, timezone, enabled }) {
   };
 }
 
+function formatScheduleValue(value, everyLabel) {
+  const normalized = normalizeCronField(value);
+  if (normalized == null) return '-';
+  if (normalized === -1) return everyLabel;
+  if (Array.isArray(normalized)) return normalized.join(',');
+  return String(normalized);
+}
+
+function buildCronJobButtonLabel(job) {
+  const maxLength = 32;
+  const title = getCronJobDisplayName(job);
+  let label = title === '(unnamed)' ? `⏰ Job ${job.id}` : `⏰ ${title}`;
+  if (label.length > maxLength) {
+    const suffix = ` (${job.id})`;
+    const available = maxLength - suffix.length;
+    if (available > 4) {
+      label = `${label.slice(0, available - 1)}…${suffix}`;
+    } else {
+      label = `${label.slice(0, maxLength - 1)}…`;
+    }
+  }
+  return label;
+}
+
 async function renderCronMenu(ctx) {
   const cronSettings = await getEffectiveCronSettings();
   if (!cronSettings.enabled) {
@@ -1292,14 +1317,15 @@ async function renderCronMenu(ctx) {
     return;
   }
   if (!CRON_API_KEY) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
       reply_markup: buildBackKeyboard('main:back'),
     });
     return;
   }
   let jobs = [];
   try {
-    jobs = await fetchCronJobs();
+    const response = await fetchCronJobs();
+    jobs = response.jobs;
   } catch (error) {
     await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
       reply_markup: buildBackKeyboard('main:back'),
@@ -1307,7 +1333,7 @@ async function renderCronMenu(ctx) {
     return;
   }
 
-  const lines = ['⏱ Cron jobs', '', `Total jobs: ${jobs.length}`, 'Showing first 10 by name/id.'];
+  const lines = ['⏰ Cron jobs', '', `Total jobs: ${jobs.length}`];
   const inline = new InlineKeyboard()
     .text('📋 List jobs', 'cron:list')
     .row()
@@ -1320,38 +1346,42 @@ async function renderCronMenu(ctx) {
 
 async function renderCronJobList(ctx) {
   if (!CRON_API_KEY) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
       reply_markup: buildBackKeyboard('main:back'),
     });
     return;
   }
   let jobs;
+  let someFailed = false;
   try {
-    jobs = await fetchCronJobs();
+    const response = await fetchCronJobs();
+    jobs = response.jobs;
+    someFailed = response.someFailed;
   } catch (error) {
     await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
       reply_markup: buildBackKeyboard('cron:menu'),
     });
     return;
   }
-  const slice = jobs.slice(0, 10);
   const lines = ['Cron jobs:'];
-  slice.forEach((job) => {
-    const statusIcon = job.enabled ? '✅' : '⏸️';
+  jobs.forEach((job) => {
+    const status = job.enabled ? 'Enabled' : 'Disabled';
     const name = getCronJobDisplayName(job);
-    const schedule = job.enabled ? describeCronSchedule(job, { includeAllHours: true }) : 'disabled';
-    lines.push(`- ${statusIcon} ${name} (#${job.id}), ${schedule}`);
+    lines.push(`- ${job.id} — "${name}" — ${status}`);
   });
-  if (!slice.length) {
-    lines.push('No Cron jobs found for this account.');
+  if (!jobs.length) {
+    lines.push('No cron jobs found.');
+  }
+  if (someFailed) {
+    lines.push('', '⚠️ Some jobs failed to load from cron-job.org.');
   }
 
   const inline = new InlineKeyboard();
-  slice.forEach((job) => {
-    const label = job.name ? `🕒 ${job.name}` : `🕒 Job #${job.id}`;
+  jobs.forEach((job) => {
+    const label = buildCronJobButtonLabel(job);
     inline.text(label, `cron:job:${job.id}`).row();
   });
-  inline.text('⬅️ Back', 'cron:menu');
+  inline.text('⬅️ Back', 'main:back');
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
@@ -1374,23 +1404,33 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
   }
 
   const schedule = describeCronSchedule(job, { includeAllHours: true });
-  const timezone = job?.timezone || '-';
+  const timezone = job?.schedule?.timezone || job?.timezone || '-';
   const url = job?.url || '-';
+  const scheduleDetails = [
+    `- Timezone: ${timezone}`,
+    `- Minutes: ${formatScheduleValue(job?.schedule?.minutes, 'every minute')}`,
+    `- Hours: ${formatScheduleValue(job?.schedule?.hours, 'every hour')}`,
+    `- Days of month: ${formatScheduleValue(job?.schedule?.mdays, 'every day')}`,
+    `- Months: ${formatScheduleValue(job?.schedule?.months, 'every month')}`,
+    `- Weekdays: ${formatScheduleValue(job?.schedule?.wdays, 'every day')}`,
+  ];
   const lines = [
     `Cron job #${jobId}:`,
-    `Name: ${getCronJobDisplayName(job)}`,
+    `Title: ${getCronJobDisplayName(job)}`,
     `Enabled: ${job?.enabled ? 'Yes' : 'No'}`,
     `URL: ${url}`,
-    `Schedule: ${schedule}`,
-    `Timezone: ${timezone}`,
+    'Schedule:',
+    ...scheduleDetails,
+    `Schedule summary: ${schedule}`,
   ];
 
+  const toggleLabel = job?.enabled ? '⏸️ Disable' : '✅ Enable';
   const inline = new InlineKeyboard()
     .text('✏️ Edit name', `cron:edit_name:${jobId}`)
     .row()
     .text('🔗 Edit URL', `cron:change_url:${jobId}`)
     .row()
-    .text('⏯ Toggle enabled', `cron:toggle:${jobId}`)
+    .text(toggleLabel, `cron:toggle:${jobId}`)
     .row()
     .text('⏰ Edit schedule', `cron:change_schedule:${jobId}`)
     .row()
@@ -2863,7 +2903,7 @@ async function renderProjectCronBindings(ctx, projectId) {
     return;
   }
   if (!CRON_API_KEY) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRONJOB_API_KEY missing).', {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
       reply_markup: buildBackKeyboard(`proj:server_menu:${projectId}`),
     });
     return;
@@ -3110,7 +3150,7 @@ async function buildDataCenterView() {
     .row();
 
   if (cronSettings.enabled) {
-    inline.text('⏱ Cron jobs', 'cron:menu').row();
+    inline.text('⏰ Cron jobs', 'cron:menu').row();
   }
 
   inline.text('⬅️ Back', 'main:back');
