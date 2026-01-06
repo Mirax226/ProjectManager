@@ -74,6 +74,10 @@ const runtimeStatus = {
   configDbOk: false,
   configDbError: null,
 };
+const CRON_RATE_LIMIT_MESSAGE = 'Cron API rate limit reached. Please wait a bit and try again.';
+const CRON_JOBS_CACHE_TTL_MS = 30_000;
+let lastCronJobsCache = null;
+let lastCronJobsFetchedAt = 0;
 
 function normalizeLogLevels(levels) {
   if (!Array.isArray(levels)) return [];
@@ -125,6 +129,24 @@ async function renderOrEdit(ctx, text, extra) {
     }
   }
   return ctx.reply(text, extra);
+}
+
+function isCronRateLimitError(error) {
+  if (!error) return false;
+  if (error.status === 429) return true;
+  return /rate limit/i.test(error.message || '');
+}
+
+async function renderCronRateLimitIfNeeded(ctx, error, extra) {
+  if (!isCronRateLimitError(error)) return false;
+  await renderOrEdit(ctx, CRON_RATE_LIMIT_MESSAGE, extra);
+  return true;
+}
+
+async function replyCronRateLimitIfNeeded(ctx, error) {
+  if (!isCronRateLimitError(error)) return false;
+  await ctx.reply(CRON_RATE_LIMIT_MESSAGE);
+  return true;
 }
 
 function resetUserState(ctx) {
@@ -211,7 +233,7 @@ async function getCronStatusLine(cronSettings) {
     return 'Cron: disabled (no API token).';
   }
   try {
-    await listJobs();
+    await fetchCronJobs();
     return 'Cron: ✅ API OK.';
   } catch (error) {
     return `Cron: ⚠️ API error: ${truncateText(error.message, 80)}`;
@@ -943,8 +965,16 @@ async function handleCronCallback(ctx, data) {
       try {
         const job = await fetchCronJob(jobId);
         await toggleJob(jobId, !job?.enabled);
+        clearCronJobsCache();
         await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
       } catch (error) {
+        if (
+          await renderCronRateLimitIfNeeded(ctx, error, {
+            reply_markup: buildBackKeyboard('cron:menu'),
+          })
+        ) {
+          return;
+        }
         await renderOrEdit(ctx, `Failed to toggle cron job: ${error.message}`, {
           reply_markup: buildBackKeyboard('cron:menu'),
         });
@@ -973,10 +1003,18 @@ async function handleCronCallback(ctx, data) {
     case 'delete_confirm':
       try {
         await deleteJob(jobId);
+        clearCronJobsCache();
         await renderOrEdit(ctx, 'Cron job deleted.', {
           reply_markup: buildBackKeyboard('cron:menu'),
         });
       } catch (error) {
+        if (
+          await renderCronRateLimitIfNeeded(ctx, error, {
+            reply_markup: buildBackKeyboard('cron:menu'),
+          })
+        ) {
+          return;
+        }
         await renderOrEdit(ctx, `Failed to delete cron job: ${error.message}`, {
           reply_markup: buildBackKeyboard('cron:menu'),
         });
@@ -1323,12 +1361,16 @@ async function handleCronWizardCallback(ctx, data) {
       if (state.mode === 'edit') {
         try {
           await updateJob(state.temp.jobId, { schedule: state.temp.schedule });
+          clearCronJobsCache();
           clearUserState(ctx.from.id);
           await ctx.reply(`Cron job #${state.temp.jobId} schedule updated.`);
           await renderCronJobDetails(ctx, state.temp.jobId, {
             backCallback: state.backCallback || 'cron:list',
           });
         } catch (error) {
+          if (await replyCronRateLimitIfNeeded(ctx, error)) {
+            return;
+          }
           const message =
             error?.status === 400
               ? `Cron API rejected schedule: ${error.message}`
@@ -1484,10 +1526,14 @@ async function handleCronWizardInput(ctx, state) {
         enabled: true,
       });
       const created = await createJob(payload);
+      clearCronJobsCache();
       clearUserState(ctx.from.id);
       await ctx.reply(`Cron job created (id: #${created.id}, title: ${jobName}).`);
       await renderCronMenu(ctx);
     } catch (error) {
+      if (await replyCronRateLimitIfNeeded(ctx, error)) {
+        return;
+      }
       const message =
         error?.status === 400
           ? `Cron API rejected schedule: ${error.message}`
@@ -1747,10 +1793,20 @@ function describeCronSchedule(job, options = {}) {
   return `Minutes: ${formatCronField(minutes)}; Hours: ${formatCronField(hours)}`;
 }
 
+function clearCronJobsCache() {
+  lastCronJobsCache = null;
+  lastCronJobsFetchedAt = 0;
+}
+
 async function fetchCronJobs() {
+  if (lastCronJobsCache && Date.now() - lastCronJobsFetchedAt < CRON_JOBS_CACHE_TTL_MS) {
+    return lastCronJobsCache;
+  }
   const { jobs, someFailed } = await listJobs();
   const normalized = jobs.map(normalizeCronJob).filter((job) => job && job.id != null);
-  return { jobs: normalized, someFailed };
+  lastCronJobsCache = { jobs: normalized, someFailed };
+  lastCronJobsFetchedAt = Date.now();
+  return lastCronJobsCache;
 }
 
 async function fetchCronJob(jobId) {
@@ -2022,6 +2078,13 @@ async function startCronEditScheduleWizard(ctx, jobId, backCallback) {
   try {
     job = await fetchCronJob(jobId);
   } catch (error) {
+    if (
+      await renderCronRateLimitIfNeeded(ctx, error, {
+        reply_markup: buildBackKeyboard(backCallback || 'cron:list'),
+      })
+    ) {
+      return;
+    }
     await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
       reply_markup: buildBackKeyboard(backCallback || 'cron:list'),
     });
@@ -2269,6 +2332,13 @@ async function renderCronMenu(ctx) {
     const response = await fetchCronJobs();
     jobs = response.jobs;
   } catch (error) {
+    if (
+      await renderCronRateLimitIfNeeded(ctx, error, {
+        reply_markup: buildBackKeyboard('main:back'),
+      })
+    ) {
+      return;
+    }
     await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
       reply_markup: buildBackKeyboard('main:back'),
     });
@@ -2300,6 +2370,13 @@ async function renderCronJobList(ctx) {
     jobs = response.jobs;
     someFailed = response.someFailed;
   } catch (error) {
+    if (
+      await renderCronRateLimitIfNeeded(ctx, error, {
+        reply_markup: buildBackKeyboard('cron:menu'),
+      })
+    ) {
+      return;
+    }
     await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
       reply_markup: buildBackKeyboard('cron:menu'),
     });
@@ -2333,6 +2410,13 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
   try {
     job = await fetchCronJob(jobId);
   } catch (error) {
+    if (
+      await renderCronRateLimitIfNeeded(ctx, error, {
+        reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu'),
+      })
+    ) {
+      return;
+    }
     await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
       reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu'),
     });
@@ -2390,6 +2474,13 @@ async function renderCronJobEditMenu(ctx, jobId) {
   try {
     job = await fetchCronJob(jobId);
   } catch (error) {
+    if (
+      await renderCronRateLimitIfNeeded(ctx, error, {
+        reply_markup: buildBackKeyboard('cron:menu'),
+      })
+    ) {
+      return;
+    }
     await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
       reply_markup: buildBackKeyboard('cron:menu'),
     });
@@ -2535,10 +2626,14 @@ async function handleCronEditScheduleMessage(ctx, state) {
     const job = await fetchCronJob(state.jobId);
     const payload = buildCronJobUpdatePayload(job, { schedule: schedule.cron });
     await updateJob(state.jobId, payload);
+    clearCronJobsCache();
     clearUserState(ctx.from.id);
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
+    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+      return;
+    }
     await ctx.reply(`Failed to update cron job: ${error.message}`);
   }
 }
@@ -2553,10 +2648,14 @@ async function handleCronEditUrlMessage(ctx, state) {
     const job = await fetchCronJob(state.jobId);
     const payload = buildCronJobUpdatePayload(job, { url: text });
     await updateJob(state.jobId, payload);
+    clearCronJobsCache();
     clearUserState(ctx.from.id);
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
+    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+      return;
+    }
     await ctx.reply(`Failed to update cron job: ${error.message}`);
   }
 }
@@ -2572,10 +2671,14 @@ async function handleCronEditNameMessage(ctx, state) {
     const job = await fetchCronJob(state.jobId);
     const payload = buildCronJobUpdatePayload(job, { name });
     await updateJob(state.jobId, payload);
+    clearCronJobsCache();
     clearUserState(ctx.from.id);
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
+    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+      return;
+    }
     await ctx.reply(`Failed to update cron job: ${error.message}`);
   }
 }
@@ -2590,10 +2693,14 @@ async function handleCronEditTimezoneMessage(ctx, state) {
     const job = await fetchCronJob(state.jobId);
     const payload = buildCronJobUpdatePayload(job, { timezone: text });
     await updateJob(state.jobId, payload);
+    clearCronJobsCache();
     clearUserState(ctx.from.id);
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
+    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+      return;
+    }
     await ctx.reply(`Failed to update cron job: ${error.message}`);
   }
 }
@@ -2662,12 +2769,17 @@ async function handleProjectCronScheduleMessage(ctx, state) {
       if (oldJobId) {
         try {
           await deleteJob(oldJobId);
+          clearCronJobsCache();
         } catch (error) {
+          if (await replyCronRateLimitIfNeeded(ctx, error)) {
+            return;
+          }
           console.error('[cron] Failed to delete existing job', error);
         }
       }
     }
     const created = await createJob(payload);
+    clearCronJobsCache();
     if (isKeepAlive) {
       project.cronKeepAliveJobId = created.id;
     } else {
@@ -2678,6 +2790,9 @@ async function handleProjectCronScheduleMessage(ctx, state) {
     await ctx.reply(`Cron job created. ID: ${created.id}`);
     await renderProjectCronBindings(ctx, project.id);
   } catch (error) {
+    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+      return;
+    }
     await ctx.reply(`Failed to create cron job: ${error.message}`);
   }
 }
@@ -3924,7 +4039,15 @@ async function unlinkProjectCronJob(ctx, projectId, type) {
   if (jobId) {
     try {
       await deleteJob(jobId);
+      clearCronJobsCache();
     } catch (error) {
+      if (
+        await renderCronRateLimitIfNeeded(ctx, error, {
+          reply_markup: buildBackKeyboard(`projcron:menu:${projectId}`),
+        })
+      ) {
+        return;
+      }
       console.error('[cron] Failed to delete cron job during unlink', error);
     }
   }
