@@ -1,11 +1,12 @@
 const fetch = require('node-fetch');
 
-const CRON_API_KEY = process.env.CRON_API_KEY || process.env.CRONJOB_API_KEY;
+const CRON_API_TOKEN =
+  process.env.CRON_API_TOKEN || process.env.CRON_API_KEY || process.env.CRONJOB_API_KEY;
 const CRON_API_BASE = process.env.CRONJOB_API_BASE || 'https://api.cron-job.org';
 
 function assertCronApiKey() {
-  if (!CRON_API_KEY) {
-    throw new Error('CRON_API_KEY not configured');
+  if (!CRON_API_TOKEN) {
+    throw new Error('CRON_API_TOKEN not configured');
   }
 }
 
@@ -19,18 +20,19 @@ function buildCronError({ method, path, status, body, message }) {
   return error;
 }
 
-async function cronRequest(method, path, body) {
+async function callCronApi(method, path, body) {
   assertCronApiKey();
   const url = `${CRON_API_BASE}${path}`;
   const options = {
     method,
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${CRON_API_KEY}`,
+      Authorization: `Bearer ${CRON_API_TOKEN}`,
     },
   };
   if (body) {
-    options.body = JSON.stringify(body);
+    const payload = ['POST', 'PATCH'].includes(method) ? { job: body } : body;
+    options.body = JSON.stringify(payload);
   }
 
   let response;
@@ -87,46 +89,65 @@ async function cronRequest(method, path, body) {
 }
 
 async function listJobs() {
-  const data = await cronRequest('GET', '/jobs');
+  const data = await callCronApi('GET', '/jobs');
   return {
     jobs: Array.isArray(data?.jobs) ? data.jobs : [],
     someFailed: data?.someFailed === true,
   };
 }
 
-async function getJobDetails(jobId) {
-  const data = await cronRequest('GET', `/jobs/${jobId}`);
-  return data?.jobDetails || data?.job || data;
+async function getJob(jobId) {
+  try {
+    const data = await callCronApi('GET', `/jobs/${jobId}`);
+    return data?.jobDetails || data?.job || data;
+  } catch (error) {
+    if (error?.status === 404) {
+      throw new Error('Cron job not found or invalid request');
+    }
+    throw error;
+  }
 }
 
 async function createJob(payload) {
-  const data = await cronRequest('POST', '/jobs', { job: payload });
+  const data = await callCronApi('POST', '/jobs', payload);
   const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
   return { id: id != null ? String(id) : null };
 }
 
 async function updateJob(jobId, patch) {
   try {
-    await cronRequest('PATCH', `/jobs/${jobId}`, { job: patch });
+    await callCronApi('PATCH', `/jobs/${jobId}`, patch);
   } catch (error) {
     if (error?.status === 404) {
-      throw new Error('Cron job not found or invalid request format');
+      throw new Error('Cron job not found or invalid request');
     }
     throw error;
   }
 }
 
+async function toggleJob(jobId, enabled) {
+  return updateJob(jobId, { enabled });
+}
+
 async function deleteJob(jobId) {
-  await cronRequest('DELETE', `/jobs/${jobId}`);
+  try {
+    await callCronApi('DELETE', `/jobs/${jobId}`);
+  } catch (error) {
+    if (error?.status === 404) {
+      throw new Error('Cron job not found or invalid request');
+    }
+    throw error;
+  }
 }
 
 module.exports = {
-  CRON_API_KEY,
+  CRON_API_TOKEN,
   CRON_API_BASE,
-  cronRequest,
+  callCronApi,
   listJobs,
-  getJobDetails,
+  getJob,
   createJob,
   updateJob,
+  toggleJob,
   deleteJob,
 };

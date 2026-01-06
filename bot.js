@@ -36,11 +36,12 @@ const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
 const {
-  CRON_API_KEY,
+  CRON_API_TOKEN,
   listJobs,
-  getJobDetails,
+  getJob,
   createJob,
   updateJob,
+  toggleJob,
   deleteJob,
 } = require('./src/cronClient');
 
@@ -206,8 +207,8 @@ async function getCronStatusLine(cronSettings) {
   if (!cronSettings?.enabled) {
     return 'Cron: disabled (settings).';
   }
-  if (!CRON_API_KEY) {
-    return 'Cron: disabled (no API key).';
+  if (!CRON_API_TOKEN) {
+    return 'Cron: disabled (no API token).';
   }
   try {
     await listJobs();
@@ -408,6 +409,10 @@ bot.on('callback_query:data', async (ctx) => {
     await handleCronCallback(ctx, data);
     return;
   }
+  if (data.startsWith('cronwiz:')) {
+    await handleCronWizardCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('projcron:')) {
     await handleProjectCronCallback(ctx, data);
   }
@@ -449,12 +454,10 @@ async function handleStatefulMessage(ctx, state) {
       await handleSupabaseAddMessage(ctx, state);
       break;
     case 'cron_create_url':
-    case 'cron_create_schedule':
-    case 'cron_create_name':
       await handleCronCreateMessage(ctx, state);
       break;
-    case 'cron_edit_schedule':
-      await handleCronEditScheduleMessage(ctx, state);
+    case 'cron_wizard':
+      await handleCronWizardInput(ctx, state);
       break;
     case 'cron_edit_url':
       await handleCronEditUrlMessage(ctx, state);
@@ -910,8 +913,8 @@ async function handleCronCallback(ctx, data) {
       await renderCronJobList(ctx);
       break;
     case 'create':
-      if (!CRON_API_KEY) {
-        await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
+      if (!CRON_API_TOKEN) {
+        await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
           reply_markup: buildBackKeyboard('main:back'),
         });
         return;
@@ -927,7 +930,7 @@ async function handleCronCallback(ctx, data) {
       }
       setUserState(ctx.from.id, { type: 'cron_create_url', backCallback: 'cron:menu' });
       await ctx.reply('Send target URL (e.g. keep-alive or deploy hook).', {
-        reply_markup: buildCancelKeyboard(),
+        reply_markup: buildCronWizardCancelKeyboard(),
       });
       break;
     case 'job':
@@ -939,7 +942,7 @@ async function handleCronCallback(ctx, data) {
     case 'toggle': {
       try {
         const job = await fetchCronJob(jobId);
-        await updateJob(jobId, { enabled: !job?.enabled });
+        await toggleJob(jobId, !job?.enabled);
         await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
       } catch (error) {
         await renderOrEdit(ctx, `Failed to toggle cron job: ${error.message}`, {
@@ -952,7 +955,7 @@ async function handleCronCallback(ctx, data) {
       await promptCronNameInput(ctx, jobId, 'cron:job:' + jobId);
       break;
     case 'change_schedule':
-      await promptCronScheduleInput(ctx, jobId, 'cron:job:' + jobId);
+      await startCronEditScheduleWizard(ctx, jobId, 'cron:job:' + jobId);
       break;
     case 'change_url':
       await promptCronUrlInput(ctx, jobId, 'cron:job:' + jobId);
@@ -981,6 +984,516 @@ async function handleCronCallback(ctx, data) {
       break;
     default:
       break;
+  }
+}
+
+async function handleCronWizardCancel(ctx, state) {
+  clearUserState(ctx.from.id);
+  try {
+    await ctx.editMessageText('Canceled.');
+  } catch (error) {
+    await ctx.reply('Canceled.');
+  }
+  if (state.mode === 'edit' && state.temp?.jobId) {
+    await renderCronJobDetails(ctx, state.temp.jobId, {
+      backCallback: state.backCallback || 'cron:list',
+    });
+    return;
+  }
+  await renderCronMenu(ctx);
+}
+
+async function handleCronWizardCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const state = getUserState(ctx.from.id);
+  if (!state) {
+    return;
+  }
+  const parts = data.split(':');
+  const action = parts[1];
+  const subAction = parts[2];
+  const extra = parts[3];
+
+  if (action === 'cancel') {
+    if (state.type === 'cron_wizard') {
+      await handleCronWizardCancel(ctx, state);
+      return;
+    }
+    clearUserState(ctx.from.id);
+    try {
+      await ctx.editMessageText('Canceled.');
+    } catch (error) {
+      await ctx.reply('Canceled.');
+    }
+    await renderCronMenu(ctx);
+    return;
+  }
+
+  if (state.type !== 'cron_wizard') {
+    return;
+  }
+
+  if (action === 'entry') {
+    if (subAction === 'pattern') {
+      state.step = 'choose-pattern';
+      state.temp.previousStep = 'edit-entry';
+      await renderCronWizardPatternMenu(ctx, state);
+      return;
+    }
+    if (subAction === 'advanced') {
+      state.step = 'advanced-menu';
+      state.temp.previousStep = 'edit-entry';
+      await renderCronWizardAdvancedMenu(ctx, state);
+    }
+    return;
+  }
+
+  if (action === 'back') {
+    if (subAction === 'pattern') {
+      state.step = 'choose-pattern';
+      await renderCronWizardPatternMenu(ctx, state);
+      return;
+    }
+    if (subAction === 'weekly_days') {
+      state.step = 'pattern-weekly-days';
+      await renderCronWizardWeeklyDaysMenu(ctx, state);
+    }
+    return;
+  }
+
+  if (action === 'pattern') {
+    if (subAction === 'minutes') {
+      state.step = 'pattern-minutes';
+      await renderCronWizardMinutesMenu(ctx);
+      return;
+    }
+    if (subAction === 'hours') {
+      state.step = 'pattern-hours';
+      await renderCronWizardHoursMenu(ctx);
+      return;
+    }
+    if (subAction === 'daily') {
+      state.step = 'pattern-daily';
+      await renderCronWizardDailyMenu(ctx);
+      return;
+    }
+    if (subAction === 'weekly') {
+      state.step = 'pattern-weekly-days';
+      if (!Array.isArray(state.temp.schedule.wdays) || state.temp.schedule.wdays.includes(-1)) {
+        state.temp.schedule.wdays = [];
+      }
+      await renderCronWizardWeeklyDaysMenu(ctx, state);
+      return;
+    }
+    if (subAction === 'advanced') {
+      state.step = 'advanced-menu';
+      state.temp.previousStep = 'choose-pattern';
+      await renderCronWizardAdvancedMenu(ctx, state);
+    }
+    return;
+  }
+
+  if (action === 'minutes') {
+    if (subAction === 'custom') {
+      state.step = 'input';
+      state.temp.inputType = 'custom-minutes';
+      await renderOrEdit(ctx, 'Send interval in minutes (1-720).', {
+        reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
+      });
+      return;
+    }
+    const interval = Number(subAction);
+    if (!Number.isFinite(interval) || interval <= 0) {
+      return;
+    }
+    const timezone = state.temp.schedule.timezone;
+    if (interval > 60) {
+      if (interval % 60 !== 0) {
+        await renderOrEdit(ctx, 'Interval must be 60 or a multiple of 60 minutes.', {
+          reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
+        });
+        return;
+      }
+      state.temp.schedule = buildEveryNHoursSchedule(interval / 60, timezone);
+    } else {
+      state.temp.schedule = buildEveryNMinutesSchedule(interval, timezone);
+    }
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (action === 'hours') {
+    if (subAction === 'custom') {
+      state.step = 'input';
+      state.temp.inputType = 'custom-hours';
+      await renderOrEdit(ctx, 'Send interval in hours (1-24).', {
+        reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
+      });
+      return;
+    }
+    const interval = Number(subAction);
+    if (!Number.isFinite(interval) || interval <= 0) {
+      return;
+    }
+    const timezone = state.temp.schedule.timezone;
+    state.temp.schedule = buildEveryNHoursSchedule(interval, timezone);
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (action === 'daily') {
+    if (subAction === 'custom') {
+      state.step = 'input';
+      state.temp.inputType = 'custom-daily-time';
+      await renderOrEdit(ctx, 'Send time as HH:MM (24h).', {
+        reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
+      });
+      return;
+    }
+    const time = parseTimeInput(`${subAction}:${extra}`);
+    if (!time) {
+      return;
+    }
+    const timezone = state.temp.schedule.timezone;
+    state.temp.schedule = buildDailySchedule(time, timezone);
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (action === 'weekly_day') {
+    const day = Number(subAction);
+    if (!Number.isFinite(day)) return;
+    const current = Array.isArray(state.temp.schedule.wdays)
+      ? state.temp.schedule.wdays.filter((value) => value !== -1)
+      : [];
+    const selected = new Set(current);
+    if (selected.has(day)) {
+      selected.delete(day);
+    } else {
+      selected.add(day);
+    }
+    state.temp.schedule.wdays = uniqueSorted(Array.from(selected));
+    await renderCronWizardWeeklyDaysMenu(ctx, state);
+    return;
+  }
+
+  if (action === 'weekly_done') {
+    const selected = Array.isArray(state.temp.schedule.wdays)
+      ? state.temp.schedule.wdays.filter((value) => value !== -1)
+      : [];
+    if (!selected.length) {
+      await ctx.reply('Select at least one weekday.');
+      return;
+    }
+    state.step = 'pattern-weekly-time';
+    await renderCronWizardWeeklyTimeMenu(ctx);
+    return;
+  }
+
+  if (action === 'weekly_time') {
+    if (subAction === 'custom') {
+      state.step = 'input';
+      state.temp.inputType = 'custom-weekly-time';
+      await renderOrEdit(ctx, 'Send time as HH:MM (24h).', {
+        reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:weekly_days'),
+      });
+      return;
+    }
+    const time = parseTimeInput(`${subAction}:${extra}`);
+    if (!time) {
+      return;
+    }
+    const selected = Array.isArray(state.temp.schedule.wdays)
+      ? state.temp.schedule.wdays.filter((value) => value !== -1)
+      : [];
+    const timezone = state.temp.schedule.timezone;
+    state.temp.schedule = buildWeeklySchedule(selected, time, timezone);
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (action === 'advanced') {
+    if (subAction === 'done') {
+      state.step = 'confirm';
+      state.temp.previousStep = 'advanced-menu';
+      await renderCronWizardConfirm(ctx, state);
+      return;
+    }
+    if (subAction === 'back') {
+      if (state.temp.previousStep === 'edit-entry' && state.mode === 'edit') {
+        state.step = 'edit-entry';
+        await renderCronWizardEditEntry(ctx, state);
+      } else {
+        state.step = 'choose-pattern';
+        await renderCronWizardPatternMenu(ctx, state);
+      }
+      return;
+    }
+    if (subAction === 'timezone') {
+      state.step = 'input';
+      state.temp.inputType = 'timezone';
+      await renderOrEdit(ctx, 'Send timezone (e.g. Asia/Tehran).', {
+        reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:advanced:back'),
+      });
+      return;
+    }
+    if (['minutes', 'hours', 'mdays', 'months', 'wdays'].includes(subAction)) {
+      state.step = 'advanced-edit-field';
+      state.temp.fieldBeingEdited = subAction;
+      await renderCronWizardAdvancedFieldMenu(ctx, subAction);
+    }
+    return;
+  }
+
+  if (action === 'field') {
+    const field = subAction;
+    const fieldAction = extra;
+    if (!field || !fieldAction) return;
+    if (fieldAction === 'all') {
+      state.temp.schedule[field] = [-1];
+      await renderCronWizardAdvancedMenu(ctx, state);
+      return;
+    }
+    if (fieldAction === 'custom') {
+      state.step = 'input';
+      state.temp.inputType = 'advanced-custom-list';
+      state.temp.fieldBeingEdited = field;
+      const fieldLabel = field === 'mdays' ? 'month days (1-31)' : field;
+      await renderOrEdit(ctx, `Send comma-separated list for ${fieldLabel}.`, {
+        reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:advanced:back'),
+      });
+      return;
+    }
+    if (fieldAction === 'preset') {
+      const preset = parts[4];
+      if (field === 'minutes') {
+        if (preset === 'every5') {
+          state.temp.schedule.minutes = buildEveryNMinutesSchedule(5).minutes;
+        }
+        if (preset === 'every10') {
+          state.temp.schedule.minutes = buildEveryNMinutesSchedule(10).minutes;
+        }
+      }
+      if (field === 'hours') {
+        if (preset === 'every2') {
+          state.temp.schedule.hours = buildEveryNHoursSchedule(2).hours;
+        }
+        if (preset === 'work') {
+          state.temp.schedule.hours = uniqueSorted(
+            Array.from({ length: 9 }, (_, idx) => idx + 9),
+          );
+        }
+      }
+      if (field === 'mdays') {
+        if (preset === 'first') {
+          state.temp.schedule.mdays = [1];
+        }
+        if (preset === 'mid') {
+          state.temp.schedule.mdays = [15];
+        }
+      }
+      if (field === 'months') {
+        if (preset === 'quarterly') {
+          state.temp.schedule.months = [1, 4, 7, 10];
+        }
+      }
+      if (field === 'wdays') {
+        if (preset === 'weekdays') {
+          state.temp.schedule.wdays = [1, 2, 3, 4, 5];
+        }
+        if (preset === 'weekends') {
+          state.temp.schedule.wdays = [0, 6];
+        }
+      }
+      await renderCronWizardAdvancedMenu(ctx, state);
+    }
+    return;
+  }
+
+  if (action === 'confirm') {
+    if (subAction === 'use') {
+      if (state.mode === 'edit') {
+        try {
+          await updateJob(state.temp.jobId, { schedule: state.temp.schedule });
+          clearUserState(ctx.from.id);
+          await ctx.reply(`Cron job #${state.temp.jobId} schedule updated.`);
+          await renderCronJobDetails(ctx, state.temp.jobId, {
+            backCallback: state.backCallback || 'cron:list',
+          });
+        } catch (error) {
+          const message =
+            error?.status === 400
+              ? `Cron API rejected schedule: ${error.message}`
+              : `Failed to update cron job: ${error.message}`;
+          await ctx.reply(message);
+        }
+        return;
+      }
+      state.step = 'ask-name';
+      state.temp.inputType = 'ask-name';
+      await ctx.reply("Send job name (or type 'skip' for default). Or press Cancel.", {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
+      return;
+    }
+    if (subAction === 'adjust') {
+      if (state.temp.previousStep === 'advanced-menu') {
+        state.step = 'advanced-menu';
+        await renderCronWizardAdvancedMenu(ctx, state);
+      } else if (state.temp.previousStep === 'edit-entry' && state.mode === 'edit') {
+        state.step = 'edit-entry';
+        await renderCronWizardEditEntry(ctx, state);
+      } else {
+        state.step = 'choose-pattern';
+        await renderCronWizardPatternMenu(ctx, state);
+      }
+    }
+  }
+}
+
+async function handleCronWizardInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a value or press Cancel.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    await handleCronWizardCancel(ctx, state);
+    return;
+  }
+
+  const inputType = state.temp.inputType;
+  const timezone = state.temp.schedule?.timezone;
+
+  if (inputType === 'custom-minutes') {
+    const value = Number(text);
+    if (!Number.isInteger(value) || value <= 0 || value > 720) {
+      await ctx.reply('Please send a valid number of minutes (1-720).');
+      return;
+    }
+    if (value > 60 && value % 60 !== 0) {
+      await ctx.reply('Minutes over 60 must be divisible by 60.');
+      return;
+    }
+    state.temp.schedule =
+      value > 60
+        ? buildEveryNHoursSchedule(value / 60, timezone)
+        : buildEveryNMinutesSchedule(value, timezone);
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (inputType === 'custom-hours') {
+    const value = Number(text);
+    if (!Number.isInteger(value) || value <= 0 || value > 24) {
+      await ctx.reply('Please send a valid number of hours (1-24).');
+      return;
+    }
+    state.temp.schedule = buildEveryNHoursSchedule(value, timezone);
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (inputType === 'custom-daily-time') {
+    const time = parseTimeInput(text);
+    if (!time) {
+      await ctx.reply('Invalid time format. Use HH:MM.');
+      return;
+    }
+    state.temp.schedule = buildDailySchedule(time, timezone);
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (inputType === 'custom-weekly-time') {
+    const time = parseTimeInput(text);
+    if (!time) {
+      await ctx.reply('Invalid time format. Use HH:MM.');
+      return;
+    }
+    const selected = Array.isArray(state.temp.schedule.wdays)
+      ? state.temp.schedule.wdays.filter((value) => value !== -1)
+      : [];
+    if (!selected.length) {
+      await ctx.reply('Select weekdays first.');
+      return;
+    }
+    state.temp.schedule = buildWeeklySchedule(selected, time, timezone);
+    state.step = 'confirm';
+    state.temp.previousStep = 'choose-pattern';
+    await renderCronWizardConfirm(ctx, state);
+    return;
+  }
+
+  if (inputType === 'advanced-custom-list') {
+    const field = state.temp.fieldBeingEdited;
+    const ranges = {
+      minutes: { min: 0, max: 59 },
+      hours: { min: 0, max: 23 },
+      mdays: { min: 1, max: 31 },
+      months: { min: 1, max: 12 },
+      wdays: { min: 0, max: 6 },
+    };
+    const range = ranges[field];
+    if (!range) {
+      await ctx.reply('Invalid field.');
+      return;
+    }
+    const values = parseNumberList(text, range);
+    if (!values) {
+      await ctx.reply('Invalid list. Please send comma-separated numbers.');
+      return;
+    }
+    state.temp.schedule[field] = values;
+    state.step = 'advanced-menu';
+    await renderCronWizardAdvancedMenu(ctx, state);
+    return;
+  }
+
+  if (inputType === 'timezone') {
+    state.temp.schedule.timezone = text;
+    state.step = 'advanced-menu';
+    await renderCronWizardAdvancedMenu(ctx, state);
+    return;
+  }
+
+  if (inputType === 'ask-name') {
+    const name = text.toLowerCase() === 'skip' ? null : text;
+    const cronSettings = await getEffectiveCronSettings();
+    const jobName = name || `path-applier:custom:${Date.now()}`;
+    try {
+      const payload = buildCronJobPayload({
+        name: jobName,
+        url: state.temp.url,
+        schedule: state.temp.schedule,
+        timezone: cronSettings.defaultTimezone,
+        enabled: true,
+      });
+      const created = await createJob(payload);
+      clearUserState(ctx.from.id);
+      await ctx.reply(`Cron job created (id: #${created.id}, title: ${jobName}).`);
+      await renderCronMenu(ctx);
+    } catch (error) {
+      const message =
+        error?.status === 400
+          ? `Cron API rejected schedule: ${error.message}`
+          : `Failed to create cron job: ${error.message}`;
+      await ctx.reply(message);
+    }
   }
 }
 
@@ -1241,7 +1754,7 @@ async function fetchCronJobs() {
 }
 
 async function fetchCronJob(jobId) {
-  const job = await getJobDetails(jobId);
+  const job = await getJob(jobId);
   return normalizeCronJob(job);
 }
 
@@ -1283,6 +1796,174 @@ function buildCronJobPayload({ name, url, schedule, timezone, enabled }) {
   };
 }
 
+const CRON_WEEKDAYS = [
+  { label: 'Mo', value: 1 },
+  { label: 'Tu', value: 2 },
+  { label: 'We', value: 3 },
+  { label: 'Th', value: 4 },
+  { label: 'Fr', value: 5 },
+  { label: 'Sa', value: 6 },
+  { label: 'Su', value: 0 },
+];
+
+function normalizeScheduleArray(value, fallback = [-1]) {
+  const normalized = normalizeCronField(value);
+  if (normalized == null) return [...fallback];
+  if (normalized === -1) return [-1];
+  if (Array.isArray(normalized)) return normalized;
+  return [Number(normalized)].filter(Number.isFinite);
+}
+
+function buildDefaultCronSchedule(timezone) {
+  const minutes = [];
+  for (let i = 0; i < 60; i += 5) {
+    minutes.push(i);
+  }
+  return {
+    timezone: timezone || 'UTC',
+    minutes,
+    hours: [-1],
+    mdays: [-1],
+    months: [-1],
+    wdays: [-1],
+    expiresAt: null,
+  };
+}
+
+function buildCronScheduleFromJob(job, timezone) {
+  const schedule = job?.schedule || {};
+  return {
+    timezone: schedule.timezone || job?.timezone || timezone || 'UTC',
+    minutes: normalizeScheduleArray(schedule.minutes),
+    hours: normalizeScheduleArray(schedule.hours),
+    mdays: normalizeScheduleArray(schedule.mdays),
+    months: normalizeScheduleArray(schedule.months),
+    wdays: normalizeScheduleArray(schedule.wdays),
+    expiresAt: schedule.expiresAt ?? null,
+  };
+}
+
+function scheduleFieldValue(values) {
+  if (!Array.isArray(values) || values.length === 0) return -1;
+  return values.includes(-1) ? -1 : values;
+}
+
+function summarizeSchedule(schedule) {
+  const summary = describeCronSchedule(
+    {
+      minutes: scheduleFieldValue(schedule.minutes),
+      hours: scheduleFieldValue(schedule.hours),
+      expression: schedule?.cron,
+    },
+    { includeAllHours: true },
+  );
+  const lines = [
+    `Timezone: ${schedule.timezone || 'UTC'}`,
+    `Minutes: ${formatScheduleValue(schedule.minutes, 'every minute')}`,
+    `Hours: ${formatScheduleValue(schedule.hours, 'every hour')}`,
+    `Days of month: ${formatScheduleValue(schedule.mdays, 'every day')}`,
+    `Months: ${formatScheduleValue(schedule.months, 'every month')}`,
+    `Weekdays: ${formatScheduleValue(schedule.wdays, 'every day')}`,
+    `Summary: ${summary}`,
+  ];
+  return lines.join('\n');
+}
+
+function buildEveryNMinutesSchedule(interval, timezone) {
+  const minutes = [];
+  for (let i = 0; i < 60; i += interval) {
+    minutes.push(i);
+  }
+  return {
+    timezone: timezone || 'UTC',
+    minutes,
+    hours: [-1],
+    mdays: [-1],
+    months: [-1],
+    wdays: [-1],
+    expiresAt: null,
+  };
+}
+
+function buildEveryNHoursSchedule(interval, timezone) {
+  const hours = [];
+  if (interval === 1) {
+    hours.push(-1);
+  } else {
+    for (let i = 0; i < 24; i += interval) {
+      hours.push(i);
+    }
+  }
+  return {
+    timezone: timezone || 'UTC',
+    minutes: [0],
+    hours,
+    mdays: [-1],
+    months: [-1],
+    wdays: [-1],
+    expiresAt: null,
+  };
+}
+
+function buildDailySchedule(time, timezone) {
+  return {
+    timezone: timezone || 'UTC',
+    minutes: [time.minutes],
+    hours: [time.hours],
+    mdays: [-1],
+    months: [-1],
+    wdays: [-1],
+    expiresAt: null,
+  };
+}
+
+function buildWeeklySchedule(days, time, timezone) {
+  return {
+    timezone: timezone || 'UTC',
+    minutes: [time.minutes],
+    hours: [time.hours],
+    mdays: [-1],
+    months: [-1],
+    wdays: days.length ? days : [-1],
+    expiresAt: null,
+  };
+}
+
+function parseTimeInput(raw) {
+  const text = raw?.trim();
+  if (!text) return null;
+  const match = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return { hours, minutes };
+}
+
+function parseNumberList(raw, { min, max }) {
+  const text = raw?.trim();
+  if (!text) return null;
+  const items = text
+    .split(',')
+    .map((item) => Number(item.trim()))
+    .filter((value) => Number.isFinite(value));
+  if (!items.length) return null;
+  const unique = Array.from(new Set(items));
+  const valid = unique.every((value) => value >= min && value <= max);
+  if (!valid) return null;
+  return unique.sort((a, b) => a - b);
+}
+
+function uniqueSorted(values) {
+  return Array.from(new Set(values)).sort((a, b) => a - b);
+}
+
+function getWeekdayLabel(value) {
+  const match = CRON_WEEKDAYS.find((day) => day.value === value);
+  return match ? match.label : String(value);
+}
+
 function formatScheduleValue(value, everyLabel) {
   const normalized = normalizeCronField(value);
   if (normalized == null) return '-';
@@ -1307,6 +1988,268 @@ function buildCronJobButtonLabel(job) {
   return label;
 }
 
+function buildCronWizardCancelKeyboard() {
+  return new InlineKeyboard().text('❌ Cancel', 'cronwiz:cancel');
+}
+
+function buildCronWizardBackCancelKeyboard(backAction, backLabel = '⬅️ Back') {
+  return new InlineKeyboard()
+    .text(backLabel, backAction)
+    .text('❌ Cancel', 'cronwiz:cancel');
+}
+
+async function startCronCreateWizard(ctx, url, backCallback) {
+  const cronSettings = await getEffectiveCronSettings();
+  const schedule = buildDefaultCronSchedule(cronSettings.defaultTimezone);
+  const state = {
+    type: 'cron_wizard',
+    mode: 'create',
+    step: 'choose-pattern',
+    backCallback,
+    temp: {
+      url,
+      schedule,
+      pattern: null,
+      previousStep: null,
+    },
+  };
+  setUserState(ctx.from.id, state);
+  await renderCronWizardPatternMenu(ctx, state);
+}
+
+async function startCronEditScheduleWizard(ctx, jobId, backCallback) {
+  let job;
+  try {
+    job = await fetchCronJob(jobId);
+  } catch (error) {
+    await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
+      reply_markup: buildBackKeyboard(backCallback || 'cron:list'),
+    });
+    return;
+  }
+  if (!job) {
+    await renderOrEdit(ctx, 'Cron job not found.', {
+      reply_markup: buildBackKeyboard(backCallback || 'cron:list'),
+    });
+    return;
+  }
+
+  const cronSettings = await getEffectiveCronSettings();
+  const schedule = buildCronScheduleFromJob(job, cronSettings.defaultTimezone);
+  const state = {
+    type: 'cron_wizard',
+    mode: 'edit',
+    step: 'edit-entry',
+    backCallback: backCallback || `cron:job:${jobId}`,
+    temp: {
+      schedule,
+      jobId,
+      pattern: null,
+      previousStep: null,
+    },
+  };
+  setUserState(ctx.from.id, state);
+  await renderCronWizardEditEntry(ctx, state);
+}
+
+async function renderCronWizardEditEntry(ctx, state) {
+  const summary = summarizeSchedule(state.temp.schedule);
+  const inline = new InlineKeyboard()
+    .text('♻️ Change pattern', 'cronwiz:entry:pattern')
+    .row()
+    .text('⚙️ Advanced fields', 'cronwiz:entry:advanced')
+    .row()
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, `Current schedule:\n${summary}\n\nChoose how you want to edit:`, {
+    reply_markup: inline,
+  });
+}
+
+async function renderCronWizardPatternMenu(ctx, state) {
+  const inline = new InlineKeyboard()
+    .text('⏱ Every N minutes', 'cronwiz:pattern:minutes')
+    .text('🕒 Every N hours', 'cronwiz:pattern:hours')
+    .row()
+    .text('🌅 Daily at time', 'cronwiz:pattern:daily')
+    .text('📅 Weekly at time', 'cronwiz:pattern:weekly')
+    .row()
+    .text('⚙️ Advanced fields', 'cronwiz:pattern:advanced')
+    .row()
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, 'Choose how often this job should run:', { reply_markup: inline });
+}
+
+async function renderCronWizardMinutesMenu(ctx) {
+  const inline = new InlineKeyboard()
+    .text('5m', 'cronwiz:minutes:5')
+    .text('10m', 'cronwiz:minutes:10')
+    .text('15m', 'cronwiz:minutes:15')
+    .text('30m', 'cronwiz:minutes:30')
+    .text('60m', 'cronwiz:minutes:60')
+    .row()
+    .text('Custom…', 'cronwiz:minutes:custom')
+    .text('⬅️ Back', 'cronwiz:back:pattern')
+    .row()
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, 'Every how many minutes?', { reply_markup: inline });
+}
+
+async function renderCronWizardHoursMenu(ctx) {
+  const inline = new InlineKeyboard()
+    .text('1h', 'cronwiz:hours:1')
+    .text('2h', 'cronwiz:hours:2')
+    .text('3h', 'cronwiz:hours:3')
+    .text('6h', 'cronwiz:hours:6')
+    .text('12h', 'cronwiz:hours:12')
+    .row()
+    .text('24h', 'cronwiz:hours:24')
+    .text('Custom…', 'cronwiz:hours:custom')
+    .row()
+    .text('⬅️ Back', 'cronwiz:back:pattern')
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, 'Every how many hours?', { reply_markup: inline });
+}
+
+async function renderCronWizardDailyMenu(ctx) {
+  const inline = new InlineKeyboard()
+    .text('06:00', 'cronwiz:daily:06:00')
+    .text('08:00', 'cronwiz:daily:08:00')
+    .text('09:00', 'cronwiz:daily:09:00')
+    .text('10:00', 'cronwiz:daily:10:00')
+    .row()
+    .text('12:00', 'cronwiz:daily:12:00')
+    .text('15:00', 'cronwiz:daily:15:00')
+    .text('18:00', 'cronwiz:daily:18:00')
+    .text('21:00', 'cronwiz:daily:21:00')
+    .row()
+    .text('Custom…', 'cronwiz:daily:custom')
+    .text('⬅️ Back', 'cronwiz:back:pattern')
+    .row()
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, 'Choose a daily run time:', { reply_markup: inline });
+}
+
+function buildWeeklyDayKeyboard(selectedDays) {
+  const inline = new InlineKeyboard();
+  CRON_WEEKDAYS.forEach((day, index) => {
+    const selected = selectedDays.includes(day.value);
+    const label = selected ? `✅ ${day.label}` : day.label;
+    inline.text(label, `cronwiz:weekly_day:${day.value}`);
+    if (index % 3 === 2) {
+      inline.row();
+    }
+  });
+  inline.row().text('✅ Done', 'cronwiz:weekly_done').text('⬅️ Back', 'cronwiz:back:pattern');
+  inline.row().text('❌ Cancel', 'cronwiz:cancel');
+  return inline;
+}
+
+async function renderCronWizardWeeklyDaysMenu(ctx, state) {
+  const selectedDays = (state.temp.schedule.wdays || []).filter((day) => day !== -1);
+  await renderOrEdit(
+    ctx,
+    `Select weekdays (${selectedDays.length ? selectedDays.map(getWeekdayLabel).join(', ') : 'none'}):`,
+    { reply_markup: buildWeeklyDayKeyboard(selectedDays) },
+  );
+}
+
+async function renderCronWizardWeeklyTimeMenu(ctx) {
+  const inline = new InlineKeyboard()
+    .text('06:00', 'cronwiz:weekly_time:06:00')
+    .text('08:00', 'cronwiz:weekly_time:08:00')
+    .text('09:00', 'cronwiz:weekly_time:09:00')
+    .text('10:00', 'cronwiz:weekly_time:10:00')
+    .row()
+    .text('12:00', 'cronwiz:weekly_time:12:00')
+    .text('15:00', 'cronwiz:weekly_time:15:00')
+    .text('18:00', 'cronwiz:weekly_time:18:00')
+    .text('21:00', 'cronwiz:weekly_time:21:00')
+    .row()
+    .text('Custom…', 'cronwiz:weekly_time:custom')
+    .text('⬅️ Back', 'cronwiz:back:weekly_days')
+    .row()
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, 'Choose a weekly run time:', { reply_markup: inline });
+}
+
+async function renderCronWizardAdvancedMenu(ctx, state) {
+  const summary = summarizeSchedule(state.temp.schedule);
+  const inline = new InlineKeyboard()
+    .text('🧮 Edit minutes', 'cronwiz:advanced:minutes')
+    .row()
+    .text('🕒 Edit hours', 'cronwiz:advanced:hours')
+    .row()
+    .text('📆 Edit month days', 'cronwiz:advanced:mdays')
+    .row()
+    .text('📅 Edit months', 'cronwiz:advanced:months')
+    .row()
+    .text('📊 Edit weekdays', 'cronwiz:advanced:wdays')
+    .row()
+    .text('🌐 Edit timezone', 'cronwiz:advanced:timezone')
+    .row()
+    .text('✅ Done', 'cronwiz:advanced:done')
+    .row()
+    .text('⬅️ Back', 'cronwiz:advanced:back')
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, `Advanced schedule fields:\n${summary}`, { reply_markup: inline });
+}
+
+function buildAdvancedFieldKeyboard(field) {
+  const inline = new InlineKeyboard();
+  inline.text('All', `cronwiz:field:${field}:all`).row();
+
+  if (field === 'minutes') {
+    inline
+      .text('Every 5m', 'cronwiz:field:minutes:preset:every5')
+      .text('Every 10m', 'cronwiz:field:minutes:preset:every10')
+      .row();
+  }
+  if (field === 'hours') {
+    inline
+      .text('Every 2h', 'cronwiz:field:hours:preset:every2')
+      .text('Work hours', 'cronwiz:field:hours:preset:work')
+      .row();
+  }
+  if (field === 'mdays') {
+    inline
+      .text('1st', 'cronwiz:field:mdays:preset:first')
+      .text('15th', 'cronwiz:field:mdays:preset:mid')
+      .row();
+  }
+  if (field === 'months') {
+    inline
+      .text('Quarterly', 'cronwiz:field:months:preset:quarterly')
+      .row();
+  }
+  if (field === 'wdays') {
+    inline
+      .text('Weekdays', 'cronwiz:field:wdays:preset:weekdays')
+      .text('Weekends', 'cronwiz:field:wdays:preset:weekends')
+      .row();
+  }
+
+  inline
+    .text('Custom list…', `cronwiz:field:${field}:custom`)
+    .row()
+    .text('⬅️ Back', 'cronwiz:advanced:back')
+    .text('❌ Cancel', 'cronwiz:cancel');
+  return inline;
+}
+
+async function renderCronWizardAdvancedFieldMenu(ctx, field) {
+  await renderOrEdit(ctx, `Edit ${field}.`, { reply_markup: buildAdvancedFieldKeyboard(field) });
+}
+
+async function renderCronWizardConfirm(ctx, state) {
+  const summary = summarizeSchedule(state.temp.schedule);
+  const inline = new InlineKeyboard()
+    .text('✅ Use this schedule', 'cronwiz:confirm:use')
+    .text('♻️ Adjust', 'cronwiz:confirm:adjust')
+    .row()
+    .text('❌ Cancel', 'cronwiz:cancel');
+  await renderOrEdit(ctx, `Proposed schedule:\n${summary}`, { reply_markup: inline });
+}
+
 async function renderCronMenu(ctx) {
   const cronSettings = await getEffectiveCronSettings();
   if (!cronSettings.enabled) {
@@ -1315,8 +2258,8 @@ async function renderCronMenu(ctx) {
     });
     return;
   }
-  if (!CRON_API_KEY) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
+  if (!CRON_API_TOKEN) {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
       reply_markup: buildBackKeyboard('main:back'),
     });
     return;
@@ -1344,8 +2287,8 @@ async function renderCronMenu(ctx) {
 }
 
 async function renderCronJobList(ctx) {
-  if (!CRON_API_KEY) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
+  if (!CRON_API_TOKEN) {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
       reply_markup: buildBackKeyboard('main:back'),
     });
     return;
@@ -1571,56 +2514,7 @@ async function handleCronCreateMessage(ctx, state) {
   }
 
   if (state.type === 'cron_create_url') {
-    setUserState(ctx.from.id, {
-      type: 'cron_create_schedule',
-      url: text,
-      backCallback: state.backCallback,
-    });
-    await ctx.reply(
-      "Send schedule (cron string or 'every 10m', 'every 1h'). Or press Cancel.",
-      { reply_markup: buildCancelKeyboard() },
-    );
-    return;
-  }
-
-  if (state.type === 'cron_create_schedule') {
-    let schedule;
-    try {
-      schedule = parseScheduleInput(text);
-    } catch (error) {
-      await ctx.reply(`Invalid schedule: ${error.message}`);
-      return;
-    }
-    setUserState(ctx.from.id, {
-      type: 'cron_create_name',
-      url: state.url,
-      schedule,
-      backCallback: state.backCallback,
-    });
-    await ctx.reply('Send job name (or type "skip" for default).', {
-      reply_markup: buildCancelKeyboard(),
-    });
-    return;
-  }
-
-  if (state.type === 'cron_create_name') {
-    const name = text.toLowerCase() === 'skip' ? null : text;
-    const cronSettings = await getEffectiveCronSettings();
-    try {
-      const payload = buildCronJobPayload({
-        name: name || `path-applier:custom:${Date.now()}`,
-        url: state.url,
-        schedule: state.schedule.cron,
-        timezone: cronSettings.defaultTimezone,
-        enabled: true,
-      });
-      const created = await createJob(payload);
-      clearUserState(ctx.from.id);
-      await ctx.reply(`Cron job created. ID: ${created.id}`);
-      await renderCronMenu(ctx);
-    } catch (error) {
-      await ctx.reply(`Failed to create cron job: ${error.message}`);
-    }
+    await startCronCreateWizard(ctx, text, state.backCallback);
   }
 }
 
@@ -2901,8 +3795,8 @@ async function renderProjectCronBindings(ctx, projectId) {
     });
     return;
   }
-  if (!CRON_API_KEY) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_KEY missing).', {
+  if (!CRON_API_TOKEN) {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
       reply_markup: buildBackKeyboard(`proj:server_menu:${projectId}`),
     });
     return;
