@@ -39,7 +39,6 @@ const {
   CRON_API_KEY,
   listJobs,
   getJobDetails,
-  patchJob,
   createJob,
   updateJob,
   deleteJob,
@@ -940,7 +939,7 @@ async function handleCronCallback(ctx, data) {
     case 'toggle': {
       try {
         const job = await fetchCronJob(jobId);
-        await patchJob(jobId, { enabled: !job?.enabled });
+        await updateJob(jobId, { enabled: !job?.enabled });
         await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
       } catch (error) {
         await renderOrEdit(ctx, `Failed to toggle cron job: ${error.message}`, {

@@ -99,25 +99,21 @@ async function getJobDetails(jobId) {
   return data?.jobDetails || data?.job || data;
 }
 
-async function patchJob(jobId, jobDelta) {
-  try {
-    await cronRequest('PATCH', `/jobs/${jobId}`, { job: jobDelta });
-  } catch (error) {
-    if (error?.status === 404) {
-      throw new Error('Cron API 404: job not found');
-    }
-    throw error;
-  }
-}
-
 async function createJob(payload) {
   const data = await cronRequest('POST', '/jobs', { job: payload });
   const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
   return { id: id != null ? String(id) : null };
 }
 
-async function updateJob(jobId, payload) {
-  await cronRequest('PUT', `/jobs/${jobId}`, { job: payload });
+async function updateJob(jobId, patch) {
+  try {
+    await cronRequest('PATCH', `/jobs/${jobId}`, { job: patch });
+  } catch (error) {
+    if (error?.status === 404) {
+      throw new Error('Cron job not found or invalid request format');
+    }
+    throw error;
+  }
 }
 
 async function deleteJob(jobId) {
@@ -130,7 +126,6 @@ module.exports = {
   cronRequest,
   listJobs,
   getJobDetails,
-  patchJob,
   createJob,
   updateJob,
   deleteJob,
