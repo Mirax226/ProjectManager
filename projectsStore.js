@@ -50,6 +50,14 @@ function normalizeProject(rawProject) {
   }
 
   project.githubTokenEnvKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';
+  project.projectType = project.projectType || project.project_type || 'other';
+  if (!project.project_type) {
+    project.project_type = project.projectType;
+  }
+  project.defaultEnvSetId = project.defaultEnvSetId || project.default_env_set_id;
+  if (project.defaultEnvSetId && !project.default_env_set_id) {
+    project.default_env_set_id = project.defaultEnvSetId;
+  }
 
   return project;
 }
