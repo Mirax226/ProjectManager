@@ -67,6 +67,11 @@ const {
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+const SUPABASE_ENV_VAULT_PROJECT_ID = 'supabase_connections';
+const SUPABASE_MESSAGE_LIMIT = 3500;
+const SUPABASE_ROWS_PAGE_SIZE = 20;
+const SUPABASE_CELL_TRUNCATE_LIMIT = 120;
+const SUPABASE_QUERY_TIMEOUT_MS = 5000;
 
 if (!BOT_TOKEN) {
   throw new Error('BOT_TOKEN is required');
@@ -1144,7 +1149,7 @@ async function handleGlobalSettingsCallback(ctx, data) {
 
 async function handleSupabaseCallback(ctx, data) {
   await ctx.answerCallbackQuery();
-  const [, action, connectionId] = data.split(':');
+  const [, action, connectionId, tableToken, extra] = data.split(':');
   switch (action) {
     case 'add':
       resetUserState(ctx);
@@ -1173,6 +1178,23 @@ async function handleSupabaseCallback(ctx, data) {
       resetUserState(ctx);
       setUserState(ctx.from.id, { type: 'supabase_console', connectionId, mode: null });
       await listSupabaseTables(ctx, connectionId);
+      break;
+    case 'table':
+      resetUserState(ctx);
+      await renderSupabaseTableDetails(ctx, connectionId, decodeSupabaseTableName(tableToken));
+      break;
+    case 'rows':
+      resetUserState(ctx);
+      await renderSupabaseTableRows(
+        ctx,
+        connectionId,
+        decodeSupabaseTableName(tableToken),
+        Number(extra) || 0,
+      );
+      break;
+    case 'count':
+      resetUserState(ctx);
+      await renderSupabaseTableCount(ctx, connectionId, decodeSupabaseTableName(tableToken));
       break;
     case 'sql':
       resetUserState(ctx);
@@ -2802,6 +2824,130 @@ async function renderTelegramStatus(ctx, projectId) {
   }
 }
 
+function isEnvVaultAvailable() {
+  return Boolean(process.env.ENV_VAULT_MASTER_KEY);
+}
+
+async function ensureSupabaseEnvSet() {
+  if (!isEnvVaultAvailable()) {
+    return null;
+  }
+  return ensureDefaultEnvVarSet(SUPABASE_ENV_VAULT_PROJECT_ID);
+}
+
+async function resolveSupabaseConnectionDsn(connection) {
+  if (!connection?.envKey) {
+    return { dsn: null, source: null, error: 'missing envKey' };
+  }
+  if (!isEnvVaultAvailable()) {
+    return { dsn: null, source: connection.envKey, error: 'Env Vault unavailable' };
+  }
+  const envSetId = await ensureSupabaseEnvSet();
+  if (!envSetId) {
+    return { dsn: null, source: connection.envKey, error: 'Env Vault not initialized' };
+  }
+  try {
+    const dsn = await getEnvVarValue(SUPABASE_ENV_VAULT_PROJECT_ID, connection.envKey, envSetId);
+    if (!dsn) {
+      return { dsn: null, source: connection.envKey, error: `env ${connection.envKey} missing` };
+    }
+    return { dsn, source: connection.envKey, error: null };
+  } catch (error) {
+    console.error('[supabase] Failed to read DSN from Env Vault', error);
+    await forwardSelfLog('error', 'Failed to read Supabase DSN from Env Vault', {
+      context: {
+        envKey: connection.envKey,
+        error: error?.message,
+      },
+      stack: error?.stack,
+    });
+    return { dsn: null, source: connection.envKey, error: 'Env Vault read failed' };
+  }
+}
+
+async function getSupabasePool(connectionId, dsn) {
+  let pool = supabasePools.get(connectionId);
+  if (!pool) {
+    pool = new Pool({ connectionString: dsn });
+    supabasePools.set(connectionId, pool);
+  }
+  return pool;
+}
+
+function normalizeSupabaseQuery(sql, options = {}) {
+  if (typeof sql === 'string') {
+    return { text: sql, ...options };
+  }
+  return sql;
+}
+
+function isSensitiveColumnName(name) {
+  if (!name) return false;
+  const pattern = /(password|pass|token|secret|api_key|service_role|bearer|key)/i;
+  return pattern.test(name);
+}
+
+function sanitizeCellValue(value) {
+  if (value == null) return 'null';
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      return '[unserializable]';
+    }
+  }
+  return String(value);
+}
+
+function formatCellValue(value, limit = SUPABASE_CELL_TRUNCATE_LIMIT) {
+  const raw = sanitizeCellValue(value);
+  const flattened = raw.replace(/[\r\n\t]+/g, ' ');
+  return truncateText(flattened, limit);
+}
+
+function applyRowMasking(row) {
+  const masked = {};
+  Object.entries(row).forEach(([key, value]) => {
+    masked[key] = isSensitiveColumnName(key) ? '***masked***' : value;
+  });
+  return masked;
+}
+
+function quoteIdentifier(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatRowsAsCodeBlock(rows, columnNames, truncatedNote) {
+  const header = columnNames.join(' | ');
+  const lines = [header];
+  rows.forEach((row) => {
+    const line = columnNames
+      .map((col) => formatCellValue(row[col]))
+      .join(' | ');
+    lines.push(line);
+  });
+  if (truncatedNote) {
+    lines.push(truncatedNote);
+  }
+  return `<pre>${escapeHtml(lines.join('\n'))}</pre>`;
+}
+
+function decodeSupabaseTableName(encoded) {
+  try {
+    return decodeURIComponent(encoded);
+  } catch (error) {
+    return encoded;
+  }
+}
+
 async function renderSupabaseConnectionsMenu(ctx) {
   const connections = await loadSupabaseConnections();
   if (!connections.length) {
@@ -2810,12 +2956,40 @@ async function renderSupabaseConnectionsMenu(ctx) {
     });
     return;
   }
+  const statuses = await Promise.all(
+    connections.map(async (connection) => {
+      const dsnInfo = await resolveSupabaseConnectionDsn(connection);
+      if (!dsnInfo.dsn) {
+        return {
+          connection,
+          dsnStatus: `❌ ${dsnInfo.error}`,
+          connectStatus: 'n/a',
+        };
+      }
+      try {
+        const pool = await getSupabasePool(connection.id, dsnInfo.dsn);
+        await pool.query({ text: 'SELECT 1', query_timeout: SUPABASE_QUERY_TIMEOUT_MS });
+        return { connection, dsnStatus: '✅ present', connectStatus: '✅ ok' };
+      } catch (error) {
+        const reason = truncateText(error.message || 'failed', 60);
+        return { connection, dsnStatus: '✅ present', connectStatus: `❌ ${reason}` };
+      }
+    }),
+  );
+  const lines = ['Supabase connections:'];
   const inline = new InlineKeyboard();
-  connections.forEach((connection) => {
-    inline.text(`🗄️ ${connection.name}`, `supabase:conn:${connection.id}`).row();
+  statuses.forEach((status) => {
+    lines.push(
+      `• ${status.connection.name} (${status.connection.id}) — env: ${status.connection.envKey} — DSN: ${status.dsnStatus} — Connect: ${status.connectStatus}`,
+    );
+    inline
+      .text(`🗄️ ${status.connection.name}`, `supabase:conn:${status.connection.id}`)
+      .row();
   });
   inline.text('⬅️ Back', 'supabase:back');
-  await renderOrEdit(ctx, 'Select a Supabase connection:', { reply_markup: inline });
+  await renderOrEdit(ctx, truncateMessage(lines.join('\n'), SUPABASE_MESSAGE_LIMIT), {
+    reply_markup: inline,
+  });
 }
 
 async function renderSupabaseConnectionMenu(ctx, connectionId) {
@@ -2824,14 +2998,22 @@ async function renderSupabaseConnectionMenu(ctx, connectionId) {
     await ctx.reply('Supabase connection not found.');
     return;
   }
+  const dsnInfo = await resolveSupabaseConnectionDsn(connection);
+  const lines = [
+    `DB Explorer: ${connection.name}`,
+    `Env key: ${connection.envKey}`,
+    `DSN: ${dsnInfo.dsn ? '✅ present' : `❌ ${dsnInfo.error}`}`,
+  ];
   const inline = new InlineKeyboard()
-    .text('📋 List tables', `supabase:tables:${connectionId}`)
+    .text('📋 Tables', `supabase:tables:${connectionId}`)
     .row()
-    .text('📝 Run SQL', `supabase:sql:${connectionId}`)
+    .text('🔎 Query', `supabase:sql:${connectionId}`)
     .row()
     .text('⬅️ Back', 'supabase:connections');
 
-  await renderOrEdit(ctx, `Supabase: ${connection.name}`, { reply_markup: inline });
+  await renderOrEdit(ctx, truncateMessage(lines.join('\n'), SUPABASE_MESSAGE_LIMIT), {
+    reply_markup: inline,
+  });
 }
 
 function parseScheduleInput(input) {
@@ -4516,19 +4698,213 @@ async function promptSupabaseSql(ctx, connectionId) {
 }
 
 async function listSupabaseTables(ctx, connectionId) {
-  const query = `
-    SELECT schemaname, tablename
-    FROM pg_tables
-    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-    ORDER BY schemaname, tablename;
-  `;
   try {
-    const { rows } = await runSupabaseQuery(connectionId, query);
-    const lines = rows.map((row) => `- ${row.schemaname}.${row.tablename}`);
-    const output = truncateMessage(`Supabase tables:\n${lines.join('\n')}`, 3500);
-    await ctx.reply(output);
+    const { rows } = await runSupabaseQuery(connectionId, {
+      text: `
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name;
+      `,
+    });
+    const tableNames = rows.map((row) => row.table_name);
+    const inline = new InlineKeyboard();
+    tableNames.forEach((name) => {
+      inline.text(name, `supabase:table:${connectionId}:${encodeURIComponent(name)}`).row();
+    });
+    inline.text('⬅️ Back', `supabase:conn:${connectionId}`);
+    const lines = [
+      `Tables (${tableNames.length})`,
+      '',
+      ...tableNames.map((name) => `• ${name}`),
+    ];
+    await renderOrEdit(ctx, truncateMessage(lines.join('\n'), SUPABASE_MESSAGE_LIMIT), {
+      reply_markup: inline,
+    });
   } catch (error) {
-    await ctx.reply(`SQL error: ${error.message}`);
+    console.error('[supabase] Failed to list tables', error);
+    await renderOrEdit(ctx, `SQL error: ${error.message}`, {
+      reply_markup: buildBackKeyboard(`supabase:conn:${connectionId}`),
+    });
+  }
+}
+
+async function fetchSupabaseTableColumns(connectionId, tableName) {
+  const { rows } = await runSupabaseQuery(connectionId, {
+    text: `
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1
+      ORDER BY ordinal_position;
+    `,
+    values: [tableName],
+  });
+  return rows;
+}
+
+async function fetchSupabasePrimaryKeyColumns(connectionId, tableName) {
+  const qualified = `public.${quoteIdentifier(tableName)}`;
+  const { rows } = await runSupabaseQuery(connectionId, {
+    text: `
+      SELECT a.attname
+      FROM pg_index i
+      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+      WHERE i.indrelid = $1::regclass AND i.indisprimary;
+    `,
+    values: [qualified],
+  });
+  return rows.map((row) => row.attname);
+}
+
+async function fetchSupabaseRowEstimate(connectionId, tableName) {
+  const qualified = `public.${quoteIdentifier(tableName)}`;
+  const { rows } = await runSupabaseQuery(connectionId, {
+    text: 'SELECT reltuples::bigint AS estimate FROM pg_class WHERE oid = $1::regclass;',
+    values: [qualified],
+  });
+  return rows[0]?.estimate ?? null;
+}
+
+async function renderSupabaseTableDetails(ctx, connectionId, tableName) {
+  const connection = await findSupabaseConnection(connectionId);
+  if (!connection) {
+    await renderOrEdit(ctx, 'Supabase connection not found.', {
+      reply_markup: buildBackKeyboard('supabase:connections'),
+    });
+    return;
+  }
+  try {
+    const [columns, estimate] = await Promise.all([
+      fetchSupabaseTableColumns(connectionId, tableName),
+      fetchSupabaseRowEstimate(connectionId, tableName),
+    ]);
+    const lines = [
+      `Table: ${tableName}`,
+      '',
+      'Columns:',
+      ...columns.map((column) => `• ${column.column_name} (${column.data_type})`),
+      '',
+      `Row count (estimate): ${estimate ?? 'unknown'}`,
+    ];
+    const inline = new InlineKeyboard()
+      .text('👁 View rows', `supabase:rows:${connectionId}:${encodeURIComponent(tableName)}:0`)
+      .row()
+      .text('🔢 Row count', `supabase:count:${connectionId}:${encodeURIComponent(tableName)}`)
+      .row()
+      .text('⬅️ Back', `supabase:tables:${connectionId}`);
+    await renderOrEdit(ctx, truncateMessage(lines.join('\n'), SUPABASE_MESSAGE_LIMIT), {
+      reply_markup: inline,
+    });
+  } catch (error) {
+    console.error('[supabase] Failed to load table details', error);
+    await renderOrEdit(ctx, `SQL error: ${error.message}`, {
+      reply_markup: buildBackKeyboard(`supabase:tables:${connectionId}`),
+    });
+  }
+}
+
+async function renderSupabaseTableCount(ctx, connectionId, tableName) {
+  try {
+    const estimate = await fetchSupabaseRowEstimate(connectionId, tableName);
+    let exact = null;
+    let countError = null;
+    try {
+      const { rows } = await runSupabaseQuery(connectionId, {
+        text: `SELECT COUNT(*)::bigint AS count FROM ${quoteIdentifier('public')}.${quoteIdentifier(tableName)};`,
+        query_timeout: SUPABASE_QUERY_TIMEOUT_MS,
+      });
+      exact = rows[0]?.count ?? null;
+    } catch (error) {
+      countError = error;
+    }
+    const lines = [
+      `Table: ${tableName}`,
+      '',
+      `Row count (estimate): ${estimate ?? 'unknown'}`,
+      exact ? `Row count (exact): ${exact}` : null,
+      countError ? `Exact count unavailable: ${truncateText(countError.message, 80)}` : null,
+    ].filter(Boolean);
+    const inline = new InlineKeyboard()
+      .text('👁 View rows', `supabase:rows:${connectionId}:${encodeURIComponent(tableName)}:0`)
+      .row()
+      .text('⬅️ Back', `supabase:table:${connectionId}:${encodeURIComponent(tableName)}`);
+    await renderOrEdit(ctx, truncateMessage(lines.join('\n'), SUPABASE_MESSAGE_LIMIT), {
+      reply_markup: inline,
+    });
+  } catch (error) {
+    console.error('[supabase] Failed to count rows', error);
+    await renderOrEdit(ctx, `SQL error: ${error.message}`, {
+      reply_markup: buildBackKeyboard(`supabase:table:${connectionId}:${encodeURIComponent(tableName)}`),
+    });
+  }
+}
+
+async function renderSupabaseTableRows(ctx, connectionId, tableName, page) {
+  const safePage = Number.isFinite(page) && page >= 0 ? page : 0;
+  const offset = safePage * SUPABASE_ROWS_PAGE_SIZE;
+  try {
+    const columns = await fetchSupabaseTableColumns(connectionId, tableName);
+    const columnNames = columns.map((column) => column.column_name);
+    const primaryKeys = await fetchSupabasePrimaryKeyColumns(connectionId, tableName);
+    const orderBy = primaryKeys.length
+      ? `ORDER BY ${primaryKeys.map((key) => quoteIdentifier(key)).join(', ')}`
+      : '';
+    const { rows } = await runSupabaseQuery(connectionId, {
+      text: `
+        SELECT *
+        FROM ${quoteIdentifier('public')}.${quoteIdentifier(tableName)}
+        ${orderBy}
+        LIMIT $1 OFFSET $2;
+      `,
+      values: [SUPABASE_ROWS_PAGE_SIZE + 1, offset],
+    });
+    const hasNext = rows.length > SUPABASE_ROWS_PAGE_SIZE;
+    const trimmed = rows.slice(0, SUPABASE_ROWS_PAGE_SIZE).map(applyRowMasking);
+    const inline = new InlineKeyboard();
+    if (safePage > 0) {
+      inline.text(
+        '⬅ Prev',
+        `supabase:rows:${connectionId}:${encodeURIComponent(tableName)}:${safePage - 1}`,
+      );
+    }
+    if (hasNext) {
+      inline.text(
+        '➡ Next',
+        `supabase:rows:${connectionId}:${encodeURIComponent(tableName)}:${safePage + 1}`,
+      );
+    }
+    if (safePage > 0 || hasNext) {
+      inline.row();
+    }
+    inline.text('⬅️ Back', `supabase:table:${connectionId}:${encodeURIComponent(tableName)}`);
+    const headerLines = [
+      `Table: ${tableName}`,
+      `Rows: ${SUPABASE_ROWS_PAGE_SIZE} (page ${safePage + 1})`,
+      '',
+    ].map(escapeHtml);
+    let displayed = trimmed;
+    let body = trimmed.length
+      ? formatRowsAsCodeBlock(displayed, columnNames)
+      : '<pre>(no rows)</pre>';
+    let message = `${headerLines.join('\n')}${body}`;
+    while (message.length > SUPABASE_MESSAGE_LIMIT && displayed.length > 1) {
+      displayed = displayed.slice(0, -1);
+      body = formatRowsAsCodeBlock(displayed, columnNames, '(truncated)');
+      message = `${headerLines.join('\n')}${body}`;
+    }
+    if (message.length > SUPABASE_MESSAGE_LIMIT) {
+      body = '<pre>(truncated)</pre>';
+      message = `${headerLines.join('\n')}${body}`;
+    }
+    await renderOrEdit(ctx, message, {
+      reply_markup: inline,
+      parse_mode: 'HTML',
+    });
+  } catch (error) {
+    console.error('[supabase] Failed to load rows', error);
+    await renderOrEdit(ctx, `SQL error: ${error.message}`, {
+      reply_markup: buildBackKeyboard(`supabase:table:${connectionId}:${encodeURIComponent(tableName)}`),
+    });
   }
 }
 
@@ -4537,7 +4913,7 @@ async function runSupabaseSql(ctx, connectionId, sql) {
     const result = await runSupabaseQuery(connectionId, sql);
     if (result.rows && result.rows.length) {
       const lines = result.rows.slice(0, 50).map((row) => formatSqlRow(row));
-      const output = truncateMessage(lines.join('\n'), 3500);
+      const output = truncateMessage(lines.join('\n'), SUPABASE_MESSAGE_LIMIT);
       await ctx.reply(output);
       return;
     }
@@ -4560,16 +4936,12 @@ async function runSupabaseQuery(connectionId, sql) {
   if (!connection) {
     throw new Error('Supabase connection not found.');
   }
-  const dsn = process.env[connection.envKey];
-  if (!dsn) {
-    throw new Error(`Supabase DSN not configured for ${connection.name}.`);
+  const dsnInfo = await resolveSupabaseConnectionDsn(connection);
+  if (!dsnInfo.dsn) {
+    throw new Error(dsnInfo.error || `Supabase DSN not configured for ${connection.name}.`);
   }
-  let pool = supabasePools.get(connectionId);
-  if (!pool) {
-    pool = new Pool({ connectionString: dsn });
-    supabasePools.set(connectionId, pool);
-  }
-  return pool.query(sql);
+  const pool = await getSupabasePool(connectionId, dsnInfo.dsn);
+  return pool.query(normalizeSupabaseQuery(sql));
 }
 
 function formatSqlRow(row) {
@@ -5673,9 +6045,9 @@ async function buildSupabaseBindingStatus(project) {
   if (!connection) {
     return { ready: false, summary: 'missing connection' };
   }
-  const dsn = process.env[connection.envKey];
-  if (!dsn) {
-    return { ready: false, summary: `env ${connection.envKey} missing` };
+  const dsnInfo = await resolveSupabaseConnectionDsn(connection);
+  if (!dsnInfo.dsn) {
+    return { ready: false, summary: dsnInfo.error || `env ${connection.envKey} missing` };
   }
   return { ready: true, summary: `✅ ${connection.id}` };
 }
