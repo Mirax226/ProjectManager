@@ -8,6 +8,26 @@ const { Pool } = require('pg');
 const { loadProjects, saveProjects, findProjectById } = require('./projectsStore');
 const { setUserState, getUserState, clearUserState } = require('./state');
 const {
+  ensureDefaultEnvVarSet,
+  listEnvVarKeys,
+  listEnvVars,
+  getEnvVarRecord,
+  getEnvVarValue,
+  upsertEnvVar,
+  deleteEnvVar,
+} = require('./envVaultStore');
+const {
+  getProjectTelegramBot,
+  getTelegramBotToken,
+  upsertTelegramBotToken,
+  clearTelegramBotToken,
+  updateTelegramWebhook,
+  updateTelegramTestStatus,
+} = require('./telegramBotStore');
+const { setWebhook, getWebhookInfo, sendMessage } = require('./telegramApi');
+const { listCronJobLinks, getCronJobLink, upsertCronJobLink } = require('./cronJobLinksStore');
+const { QUICK_KEYS, getProjectTypeTemplate, getProjectTypeOptions } = require('./envVaultTemplates');
+const {
   prepareRepository,
   createWorkingBranch,
   applyPatchToRepo,
@@ -58,6 +78,7 @@ if (!ADMIN_TELEGRAM_ID) {
 
 const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
+const envVaultPools = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
 const userState = new Map();
@@ -78,6 +99,7 @@ const CRON_RATE_LIMIT_MESSAGE = 'Cron API rate limit reached. Please wait a bit 
 const CRON_JOBS_CACHE_TTL_MS = 30_000;
 let lastCronJobsCache = null;
 let lastCronJobsFetchedAt = 0;
+const TELEGRAM_WEBHOOK_PATH_PREFIX = '/webhook';
 
 function normalizeLogLevels(levels) {
   if (!Array.isArray(levels)) return [];
@@ -234,6 +256,43 @@ function validateCronExpression(raw) {
     return { valid: false, message: 'Cron expression has invalid characters.' };
   }
   return { valid: true };
+}
+
+function maskSecretValue(value) {
+  if (!value) return '********';
+  return '********';
+}
+
+function normalizeEnvKeyInput(value) {
+  return String(value || '').trim().toUpperCase().replace(/\s+/g, '_');
+}
+
+function isSupabaseUrl(value) {
+  return typeof value === 'string' && value.startsWith('https://') && value.includes('.supabase.co');
+}
+
+function validateEnvValue(key, value) {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) {
+    return { valid: false, message: 'Value cannot be empty.' };
+  }
+  if (key === 'SUPABASE_URL' && !isSupabaseUrl(trimmed)) {
+    return { valid: false, message: 'SUPABASE_URL must start with https:// and contain .supabase.co' };
+  }
+  if (key === 'TZ') {
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: trimmed });
+    } catch (error) {
+      return { valid: false, message: 'TZ must be a valid IANA timezone.' };
+    }
+  }
+  return { valid: true };
+}
+
+function getProjectTypeLabel(project) {
+  const type = project?.projectType || project?.project_type || 'other';
+  const option = getProjectTypeOptions().find((entry) => entry.id === type);
+  return option ? option.label : type;
 }
 
 async function renderCronWizardMessage(ctx, state, text, extra) {
@@ -599,6 +658,19 @@ bot.on('callback_query:data', async (ctx) => {
   }
   if (data.startsWith('projcron:')) {
     await handleProjectCronCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('envvault:')) {
+    await handleEnvVaultCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('cronlink:')) {
+    await handleCronLinkCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('tgbot:')) {
+    await handleTelegramBotCallback(ctx, data);
+    return;
   }
 });
 
@@ -654,6 +726,24 @@ async function handleStatefulMessage(ctx, state) {
     case 'projcron_deploy_schedule':
     case 'projcron_deploy_recreate':
       await handleProjectCronScheduleMessage(ctx, state);
+      break;
+    case 'env_vault_custom_key':
+      await handleEnvVaultCustomKeyInput(ctx, state);
+      break;
+    case 'env_vault_value':
+      await handleEnvVaultValueInput(ctx, state);
+      break;
+    case 'env_vault_import':
+      await handleEnvVaultImportInput(ctx, state);
+      break;
+    case 'cron_link_label':
+      await handleCronLinkLabelInput(ctx, state);
+      break;
+    case 'telegram_token_input':
+      await handleTelegramTokenInput(ctx, state);
+      break;
+    case 'project_sql_input':
+      await handleProjectSqlInput(ctx, state);
       break;
     default:
       clearUserState(ctx.from.id);
@@ -809,6 +899,12 @@ async function handleProjectCallback(ctx, data) {
     case 'commands':
       await renderCommandsScreen(ctx, projectId);
       break;
+    case 'project_type':
+      await renderProjectTypeMenu(ctx, projectId);
+      break;
+    case 'project_type_set':
+      await updateProjectType(ctx, projectId, extra);
+      break;
     case 'cmd_edit':
       setUserState(ctx.from.id, {
         type: 'edit_command_input',
@@ -870,6 +966,12 @@ async function handleProjectCallback(ctx, data) {
     case 'supabase_clear':
       await updateProjectField(projectId, 'supabaseConnectionId', undefined);
       await renderProjectSettings(ctx, projectId);
+      break;
+    case 'sql_menu':
+      await renderProjectSqlMenu(ctx, projectId);
+      break;
+    case 'sql_supabase':
+      await startProjectSqlInput(ctx, projectId, 'supabase');
       break;
     case 'set_default':
       await setDefaultProject(projectId);
@@ -1904,6 +2006,802 @@ async function handleProjectCronCallback(ctx, data) {
   }
 }
 
+async function handleEnvVaultCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const parts = data.split(':');
+  const action = parts[1];
+  const projectId = parts[2];
+  const key = parts[3];
+  const extra = parts[4];
+
+  if (!projectId) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  if (!process.env.ENV_VAULT_MASTER_KEY) {
+    await renderOrEdit(ctx, 'Env Vault is unavailable (ENV_VAULT_MASTER_KEY missing).', {
+      reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
+    });
+    return;
+  }
+
+  switch (action) {
+    case 'menu':
+      await renderEnvVaultMenu(ctx, projectId);
+      break;
+    case 'list':
+      await renderEnvVaultKeyList(ctx, projectId);
+      break;
+    case 'key':
+      await renderEnvVaultKeyDetails(ctx, projectId, key);
+      break;
+    case 'add':
+      await renderEnvVaultQuickKeyMenu(ctx, projectId);
+      break;
+    case 'set_key':
+      await promptEnvVaultValue(ctx, projectId, key);
+      break;
+    case 'set_custom':
+      setUserState(ctx.from.id, {
+        type: 'env_vault_custom_key',
+        projectId,
+        backCallback: `envvault:menu:${projectId}`,
+      });
+      await ctx.reply('Send the ENV key name.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'delete_menu':
+      await renderEnvVaultDeleteMenu(ctx, projectId);
+      break;
+    case 'delete':
+      await handleEnvVaultDelete(ctx, projectId, key);
+      break;
+    case 'clear':
+      await handleEnvVaultDelete(ctx, projectId, key);
+      break;
+    case 'reveal':
+      await revealEnvVaultValue(ctx, projectId, key);
+      break;
+    case 'import':
+      setUserState(ctx.from.id, {
+        type: 'env_vault_import',
+        projectId,
+        backCallback: `envvault:menu:${projectId}`,
+      });
+      await ctx.reply('Send KEY=VALUE lines (multi-line). Values will be encrypted.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'export':
+      await renderEnvVaultExport(ctx, projectId);
+      break;
+    case 'recommend':
+      await renderEnvVaultProjectTypeMenu(ctx, projectId);
+      break;
+    case 'recommend_type':
+      await renderEnvVaultRecommendedOptions(ctx, projectId, key);
+      break;
+    case 'recommend_required':
+      await startEnvVaultRecommendedSequence(ctx, projectId, key, 'required');
+      break;
+    case 'recommend_optional':
+      await startEnvVaultRecommendedSequence(ctx, projectId, key, 'optional');
+      break;
+    case 'recommend_pick':
+      await startEnvVaultPickMenu(ctx, projectId, key);
+      break;
+    case 'recommend_toggle':
+      await toggleEnvVaultPickKey(ctx, projectId, key, extra);
+      break;
+    case 'recommend_confirm':
+      await confirmEnvVaultPickKeys(ctx, projectId);
+      break;
+    case 'skip':
+      await skipEnvVaultKey(ctx, projectId);
+      break;
+    case 'add_missing':
+      await startEnvVaultRecommendedSequence(ctx, projectId, null, 'required');
+      break;
+    case 'sql':
+      await startProjectSqlInput(ctx, projectId, 'env_vault');
+      break;
+    default:
+      break;
+  }
+}
+
+async function handleCronLinkCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const parts = data.split(':');
+  const action = parts[1];
+  const jobId = parts[2];
+  const extra = parts[3];
+
+  switch (action) {
+    case 'menu':
+      await renderCronLinkMenu(ctx);
+      break;
+    case 'select':
+      await renderCronLinkProjectPicker(ctx, jobId);
+      break;
+    case 'set':
+      await updateCronJobLink(ctx, jobId, extra);
+      break;
+    case 'set_other':
+      await updateCronJobLink(ctx, jobId, null);
+      break;
+    case 'label':
+      setUserState(ctx.from.id, {
+        type: 'cron_link_label',
+        jobId,
+        backCallback: `cronlink:select:${jobId}`,
+      });
+      await ctx.reply('Send a custom label for this cron job.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'other':
+      await renderCronJobList(ctx, { otherOnly: true });
+      break;
+    case 'filter_menu':
+      await renderCronProjectFilterMenu(ctx);
+      break;
+    case 'filter':
+      await renderCronJobList(ctx, { projectId: jobId || null });
+      break;
+    default:
+      break;
+  }
+}
+
+async function handleTelegramBotCallback(ctx, data) {
+  await ctx.answerCallbackQuery();
+  const parts = data.split(':');
+  const action = parts[1];
+  const projectId = parts[2];
+
+  if (!projectId) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  if (!process.env.ENV_VAULT_MASTER_KEY) {
+    await renderOrEdit(ctx, 'Telegram setup unavailable (ENV_VAULT_MASTER_KEY missing).', {
+      reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
+    });
+    return;
+  }
+
+  switch (action) {
+    case 'menu':
+      await renderTelegramSetupMenu(ctx, projectId);
+      break;
+    case 'set_token':
+      setUserState(ctx.from.id, {
+        type: 'telegram_token_input',
+        projectId,
+        backCallback: `tgbot:menu:${projectId}`,
+      });
+      await ctx.reply('Send the Telegram bot token.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'clear_token':
+      await clearTelegramBotToken(projectId);
+      await renderTelegramSetupMenu(ctx, projectId);
+      break;
+    case 'set_webhook':
+      await setProjectTelegramWebhook(ctx, projectId);
+      break;
+    case 'test':
+      await runTelegramWebhookTest(ctx, projectId);
+      break;
+    case 'status':
+      await renderTelegramStatus(ctx, projectId);
+      break;
+    default:
+      break;
+  }
+}
+
+async function renderEnvVaultMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const keys = await listEnvVarKeys(projectId, envSetId);
+  const warnings = [];
+  if (!process.env.PATH_APPLIER_CONFIG_DSN) {
+    warnings.push('⚠️ Config DB is not configured; Env Vault is in-memory only.');
+  }
+  const lines = [
+    `🔐 Env Vault — ${project.name || project.id}`,
+    `Keys stored: ${keys.length}`,
+    '',
+  ];
+  if (warnings.length) {
+    lines.push(...warnings, '');
+  }
+  lines.push('Choose an action:');
+
+  const inline = new InlineKeyboard()
+    .text('➕ Add/Update ENV var', `envvault:add:${projectId}`)
+    .row()
+    .text('🧾 List keys', `envvault:list:${projectId}`)
+    .row()
+    .text('🗑 Delete key', `envvault:delete_menu:${projectId}`)
+    .row()
+    .text('🧩 Recommended keys', `envvault:recommend:${projectId}`)
+    .row()
+    .text('🧩 Import from text', `envvault:import:${projectId}`)
+    .row()
+    .text('📤 Export keys', `envvault:export:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderEnvVaultKeyList(ctx, projectId) {
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const keys = await listEnvVarKeys(projectId, envSetId);
+  const lines = [`Keys for ${projectId}:`];
+  if (!keys.length) {
+    lines.push('No keys stored yet.');
+  } else {
+    keys.forEach((key) => lines.push(`- ${key}`));
+  }
+
+  const inline = new InlineKeyboard();
+  keys.forEach((key) => {
+    inline.text(key, `envvault:key:${projectId}:${key}`).row();
+  });
+  inline.text('⬅️ Back', `envvault:menu:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+function findEnvKeyInfo(project, key) {
+  const template = getProjectTypeTemplate(project.projectType || project.project_type || 'other');
+  const entries = [...(template?.required || []), ...(template?.optional || [])];
+  return entries.find((entry) => entry.key === key) || null;
+}
+
+async function renderEnvVaultKeyDetails(ctx, projectId, key) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const record = await getEnvVarRecord(projectId, key, envSetId);
+  const info = findEnvKeyInfo(project, key);
+  const lines = [
+    `Key: ${key}`,
+    `Value: ${record ? maskSecretValue(record.valueEnc) : '(not set)'}`,
+  ];
+  if (info?.notes) {
+    lines.push(`Notes: ${info.notes}`);
+  }
+
+  const inline = new InlineKeyboard()
+    .text('🔁 Update value', `envvault:set_key:${projectId}:${key}`)
+    .row();
+
+  if (record) {
+    inline.text('👁 Reveal once', `envvault:reveal:${projectId}:${key}`).row();
+    inline.text('🧹 Clear key', `envvault:clear:${projectId}:${key}`).row();
+  }
+
+  inline.text('⬅️ Back', `envvault:list:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderEnvVaultDeleteMenu(ctx, projectId) {
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const keys = await listEnvVarKeys(projectId, envSetId);
+  const lines = ['Select a key to delete:'];
+  if (!keys.length) {
+    lines.push('No keys stored.');
+  }
+
+  const inline = new InlineKeyboard();
+  keys.forEach((key) => {
+    inline.text(key, `envvault:delete:${projectId}:${key}`).row();
+  });
+  inline.text('⬅️ Back', `envvault:menu:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function handleEnvVaultDelete(ctx, projectId, key) {
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const deleted = await deleteEnvVar(projectId, key, envSetId);
+  const message = deleted ? `Key ${key} deleted.` : `Key ${key} not found.`;
+  await renderOrEdit(ctx, message, {
+    reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
+  });
+}
+
+async function revealEnvVaultValue(ctx, projectId, key) {
+  const envSetId = await ensureProjectEnvSet(projectId);
+  try {
+    const value = await getEnvVarValue(projectId, key, envSetId);
+    if (!value) {
+      await ctx.reply('Key not found.');
+      return;
+    }
+    await ctx.reply(`🔐 ${key}:\n${value}`);
+  } catch (error) {
+    await ctx.reply(`Failed to decrypt key: ${error.message}`);
+  }
+}
+
+async function renderEnvVaultExport(ctx, projectId) {
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const keys = await listEnvVarKeys(projectId, envSetId);
+  if (!keys.length) {
+    await renderOrEdit(ctx, 'No keys stored.', {
+      reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
+    });
+    return;
+  }
+  const output = keys.join('\n');
+  await renderOrEdit(ctx, `Exported keys (no values):\n${output}`, {
+    reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
+  });
+}
+
+async function renderEnvVaultQuickKeyMenu(ctx, projectId) {
+  const inline = new InlineKeyboard();
+  QUICK_KEYS.forEach((key) => {
+    inline.text(key, `envvault:set_key:${projectId}:${key}`).row();
+  });
+  inline.text('✍️ Custom key', `envvault:set_custom:${projectId}`).row();
+  inline.text('⬅️ Back', `envvault:menu:${projectId}`);
+  await renderOrEdit(ctx, 'Choose an ENV key to add/update:', { reply_markup: inline });
+}
+
+async function promptEnvVaultValue(ctx, projectId, key, options = {}) {
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const state = {
+    type: 'env_vault_value',
+    projectId,
+    envSetId,
+    queue: Array.isArray(options.queue) ? [...options.queue] : [key],
+    currentKey: key,
+    allowSkip: options.allowSkip === true,
+    skipExisting: options.skipExisting === true,
+    requiredKeys: options.requiredKeys || [],
+    added: [],
+    skipped: [],
+    existing: [],
+    backCallback: `envvault:menu:${projectId}`,
+  };
+  await promptNextEnvVaultKey(ctx, state);
+}
+
+async function promptNextEnvVaultKey(ctx, state) {
+  while (state.queue.length) {
+    const nextKey = state.queue[0];
+    const existing = await getEnvVarRecord(state.projectId, nextKey, state.envSetId);
+    if (existing && state.skipExisting) {
+      state.existing.push(nextKey);
+      state.queue.shift();
+      continue;
+    }
+    state.currentKey = nextKey;
+    setUserState(ctx.from.id, state);
+    const inline = new InlineKeyboard().text('❌ Cancel', 'cancel_input');
+    if (state.allowSkip) {
+      inline.text('⏭ Skip this key', 'envvault:skip:' + state.projectId);
+    }
+    await ctx.reply(`Send value for ${nextKey} (masked). Or Cancel.`, {
+      reply_markup: inline,
+    });
+    return;
+  }
+  await finishEnvVaultSequence(ctx, state);
+}
+
+async function finishEnvVaultSequence(ctx, state) {
+  const keys = await listEnvVarKeys(state.projectId, state.envSetId);
+  const missingRequired = (state.requiredKeys || []).filter((key) => !keys.includes(key));
+  const lines = [
+    'Env Vault update complete.',
+    `Added: ${state.added.length}`,
+    `Skipped: ${state.skipped.length}`,
+  ];
+  if (missingRequired.length) {
+    lines.push(`Missing required: ${missingRequired.join(', ')}`);
+  }
+  clearUserState(ctx.from.id);
+  await renderOrEdit(ctx, lines.join('\n'), {
+    reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
+  });
+}
+
+async function handleEnvVaultCustomKeyInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send the ENV key name.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
+    });
+    return;
+  }
+  const key = normalizeEnvKeyInput(text);
+  await promptEnvVaultValue(ctx, state.projectId, key);
+}
+
+async function handleEnvVaultValueInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a value.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
+    });
+    return;
+  }
+  if (state.allowSkip && text.toLowerCase() === 'skip') {
+    state.skipped.push(state.currentKey);
+    state.queue.shift();
+    await promptNextEnvVaultKey(ctx, state);
+    return;
+  }
+
+  const validation = validateEnvValue(state.currentKey, text);
+  if (!validation.valid) {
+    await ctx.reply(`❌ ${validation.message}`);
+    return;
+  }
+  try {
+    await upsertEnvVar(state.projectId, state.currentKey, text, state.envSetId);
+    state.added.push(state.currentKey);
+    state.queue.shift();
+    await promptNextEnvVaultKey(ctx, state);
+  } catch (error) {
+    await ctx.reply(`Failed to save key: ${error.message}`);
+  }
+}
+
+async function skipEnvVaultKey(ctx, projectId) {
+  const state = getUserState(ctx.from.id);
+  if (!state || state.type !== 'env_vault_value' || state.projectId !== projectId) {
+    await ctx.reply('Nothing to skip.');
+    return;
+  }
+  state.skipped.push(state.currentKey);
+  state.queue.shift();
+  await promptNextEnvVaultKey(ctx, state);
+}
+
+async function handleEnvVaultImportInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send KEY=VALUE lines.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
+    });
+    return;
+  }
+  const envSetId = await ensureProjectEnvSet(state.projectId);
+  const lines = text.split('\n');
+  let added = 0;
+  let skipped = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const [rawKey, ...rest] = trimmed.split('=');
+    if (!rawKey || !rest.length) {
+      skipped += 1;
+      continue;
+    }
+    const key = normalizeEnvKeyInput(rawKey);
+    const value = rest.join('=').trim();
+    const validation = validateEnvValue(key, value);
+    if (!validation.valid) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await upsertEnvVar(state.projectId, key, value, envSetId);
+      added += 1;
+    } catch (error) {
+      skipped += 1;
+    }
+  }
+  clearUserState(ctx.from.id);
+  await renderOrEdit(ctx, `Import complete. Added: ${added}. Skipped: ${skipped}.`, {
+    reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
+  });
+}
+
+async function renderEnvVaultProjectTypeMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const options = getProjectTypeOptions();
+  const current = project.projectType || project.project_type || 'other';
+  const inline = new InlineKeyboard();
+  options.forEach((option) => {
+    const label = option.id === current ? `✅ ${option.label}` : option.label;
+    inline.text(label, `envvault:recommend_type:${projectId}:${option.id}`).row();
+  });
+  inline.text('⬅️ Back', `envvault:menu:${projectId}`);
+  await renderOrEdit(ctx, 'Choose a project type for recommended keys:', { reply_markup: inline });
+}
+
+async function renderEnvVaultRecommendedOptions(ctx, projectId, typeId) {
+  const template = getProjectTypeTemplate(typeId);
+  const requiredCount = template?.required?.length || 0;
+  const optionalCount = template?.optional?.length || 0;
+  const inline = new InlineKeyboard()
+    .text(`✅ Add all required (${requiredCount})`, `envvault:recommend_required:${projectId}:${typeId}`)
+    .row()
+    .text(`➕ Add optional pack (${optionalCount})`, `envvault:recommend_optional:${projectId}:${typeId}`)
+    .row()
+    .text('📋 Pick individually', `envvault:recommend_pick:${projectId}:${typeId}`)
+    .row()
+    .text('⬅️ Back', `envvault:recommend:${projectId}`);
+  await renderOrEdit(ctx, `Recommended keys for ${template?.label || typeId}:`, { reply_markup: inline });
+}
+
+async function startEnvVaultRecommendedSequence(ctx, projectId, typeId, mode) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const resolvedType = typeId || project.projectType || project.project_type || 'other';
+  const template = getProjectTypeTemplate(resolvedType);
+  const keys = mode === 'optional' ? template.optional || [] : template.required || [];
+  if (!keys.length) {
+    await renderOrEdit(ctx, 'No recommended keys for this project type.', {
+      reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
+    });
+    return;
+  }
+  const keyNames = keys.map((entry) => entry.key);
+  await promptEnvVaultValue(ctx, projectId, keyNames[0], {
+    queue: keyNames,
+    allowSkip: true,
+    skipExisting: true,
+    requiredKeys: (template.required || []).map((entry) => entry.key),
+  });
+}
+
+async function startEnvVaultPickMenu(ctx, projectId, typeId) {
+  const template = getProjectTypeTemplate(typeId);
+  const keys = [...(template.required || []), ...(template.optional || [])].map((entry) => entry.key);
+  const state = {
+    type: 'env_vault_pick',
+    projectId,
+    typeId,
+    selectedKeys: [],
+    availableKeys: keys,
+  };
+  setUserState(ctx.from.id, state);
+  await renderEnvVaultPickMenu(ctx, state);
+}
+
+async function renderEnvVaultPickMenu(ctx, state) {
+  const inline = new InlineKeyboard();
+  state.availableKeys.forEach((key) => {
+    const selected = state.selectedKeys.includes(key);
+    inline.text(`${selected ? '✅' : '➕'} ${key}`, `envvault:recommend_toggle:${state.projectId}:${key}:${state.typeId}`).row();
+  });
+  inline.text('✅ Done', `envvault:recommend_confirm:${state.projectId}`).row();
+  inline.text('⬅️ Back', `envvault:recommend:${state.projectId}`);
+  await renderOrEdit(ctx, 'Pick keys to add:', { reply_markup: inline });
+}
+
+async function toggleEnvVaultPickKey(ctx, projectId, key, typeId) {
+  const state = getUserState(ctx.from.id);
+  if (!state || state.type !== 'env_vault_pick') {
+    await renderOrEdit(ctx, 'Pick session expired.', { reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`) });
+    return;
+  }
+  const selected = new Set(state.selectedKeys);
+  if (selected.has(key)) {
+    selected.delete(key);
+  } else {
+    selected.add(key);
+  }
+  state.selectedKeys = Array.from(selected);
+  state.typeId = typeId || state.typeId;
+  setUserState(ctx.from.id, state);
+  await renderEnvVaultPickMenu(ctx, state);
+}
+
+async function confirmEnvVaultPickKeys(ctx, projectId) {
+  const state = getUserState(ctx.from.id);
+  if (!state || state.type !== 'env_vault_pick') {
+    await renderOrEdit(ctx, 'Pick session expired.', { reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`) });
+    return;
+  }
+  if (!state.selectedKeys.length) {
+    await ctx.reply('No keys selected.');
+    return;
+  }
+  const template = getProjectTypeTemplate(state.typeId || 'other');
+  await promptEnvVaultValue(ctx, projectId, state.selectedKeys[0], {
+    queue: state.selectedKeys,
+    allowSkip: true,
+    skipExisting: true,
+    requiredKeys: (template.required || []).map((entry) => entry.key),
+  });
+}
+
+function buildProjectWebhookPath(projectId) {
+  return `${TELEGRAM_WEBHOOK_PATH_PREFIX}/${projectId}`;
+}
+
+function buildProjectWebhookUrl(project, webhookPath) {
+  if (!project?.renderServiceUrl) return null;
+  return new URL(webhookPath, project.renderServiceUrl).toString();
+}
+
+async function renderTelegramSetupMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const record = await getProjectTelegramBot(projectId);
+  const tokenStatus = record?.botTokenEnc ? 'set' : 'not set';
+  const lines = [
+    `🤖 Telegram Setup — ${project.name || project.id}`,
+    `Token: ${tokenStatus}`,
+    `Webhook: ${record?.webhookUrl || '-'}`,
+    `Last set: ${record?.lastSetAt || '-'}`,
+    `Last test: ${record?.lastTestAt || '-'} ${record?.lastTestStatus ? `(${record.lastTestStatus})` : ''}`,
+    `Enabled: ${record?.enabled ? 'yes' : 'no'}`,
+  ];
+
+  const inline = new InlineKeyboard()
+    .text(record?.botTokenEnc ? '🔑 Update bot token' : '🔑 Set bot token', `tgbot:set_token:${projectId}`)
+    .row()
+    .text('🔗 Set webhook', `tgbot:set_webhook:${projectId}`)
+    .row()
+    .text('🧪 Run test', `tgbot:test:${projectId}`)
+    .row()
+    .text('🧾 Status', `tgbot:status:${projectId}`)
+    .row();
+
+  if (record?.botTokenEnc) {
+    inline.text('🧹 Clear token', `tgbot:clear_token:${projectId}`).row();
+  }
+  inline.text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function handleTelegramTokenInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send the token.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
+    });
+    return;
+  }
+  await upsertTelegramBotToken(state.projectId, text);
+  clearUserState(ctx.from.id);
+  await renderTelegramSetupMenu(ctx, state.projectId);
+}
+
+async function setProjectTelegramWebhook(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  if (!project.renderServiceUrl) {
+    await renderOrEdit(ctx, 'Project server URL missing. Set it first (Edit URLs).', {
+      reply_markup: buildBackKeyboard(`proj:render_menu:${projectId}`),
+    });
+    return;
+  }
+  const token = await getTelegramBotToken(projectId);
+  if (!token) {
+    await renderOrEdit(ctx, 'Bot token missing. Set the token first.', {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+    return;
+  }
+  const webhookPath = buildProjectWebhookPath(projectId);
+  const webhookUrl = buildProjectWebhookUrl(project, webhookPath);
+  if (!webhookUrl) {
+    await renderOrEdit(ctx, 'Unable to derive webhook URL.', {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+    return;
+  }
+
+  try {
+    await setWebhook(token, webhookUrl, false);
+    const info = await getWebhookInfo(token);
+    await updateTelegramWebhook(projectId, {
+      webhookUrl,
+      webhookPath,
+      lastSetAt: new Date().toISOString(),
+      enabled: true,
+    });
+    const lines = [
+      'Webhook configured.',
+      `URL: ${info?.url || webhookUrl}`,
+      `Pending updates: ${info?.pending_update_count ?? '-'}`,
+      info?.last_error_message ? `Last error: ${info.last_error_message}` : null,
+    ].filter(Boolean);
+    await renderOrEdit(ctx, lines.join('\n'), {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+  } catch (error) {
+    await updateTelegramWebhook(projectId, {
+      webhookUrl,
+      webhookPath,
+      lastSetAt: new Date().toISOString(),
+      enabled: false,
+    });
+    await renderOrEdit(ctx, `Failed to set webhook: ${error.message}`, {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+  }
+}
+
+async function runTelegramWebhookTest(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const token = await getTelegramBotToken(projectId);
+  if (!token) {
+    await renderOrEdit(ctx, 'Bot token missing. Set the token first.', {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+    return;
+  }
+  try {
+    await sendMessage(token, ctx.from.id, `✅ Webhook test OK for ${project.name || project.id}`);
+    await updateTelegramTestStatus(projectId, 'ok');
+    await renderOrEdit(ctx, 'Test message sent.', {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+  } catch (error) {
+    await updateTelegramTestStatus(projectId, error.message);
+    await renderOrEdit(ctx, `Test failed: ${error.message}`, {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+  }
+}
+
+async function renderTelegramStatus(ctx, projectId) {
+  const token = await getTelegramBotToken(projectId);
+  if (!token) {
+    await renderOrEdit(ctx, 'Bot token missing. Set the token first.', {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+    return;
+  }
+  try {
+    const info = await getWebhookInfo(token);
+    const lines = [
+      `Webhook URL: ${info?.url || '-'}`,
+      `Pending updates: ${info?.pending_update_count ?? '-'}`,
+      info?.last_error_message ? `Last error: ${info.last_error_message}` : null,
+    ].filter(Boolean);
+    await renderOrEdit(ctx, lines.join('\n'), {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+  } catch (error) {
+    await renderOrEdit(ctx, `Failed to load webhook info: ${error.message}`, {
+      reply_markup: buildBackKeyboard(`tgbot:menu:${projectId}`),
+    });
+  }
+}
+
 async function renderSupabaseConnectionsMenu(ctx) {
   const connections = await loadSupabaseConnections();
   if (!connections.length) {
@@ -2349,15 +3247,12 @@ function formatScheduleValue(value, everyLabel) {
 function buildCronJobButtonLabel(job) {
   const maxLength = 32;
   const title = getCronJobDisplayName(job);
-  let label = title === '(unnamed)' ? `⏰ Job ${job.id}` : `⏰ ${title}`;
+  let label = title === '(unnamed)' ? '⏰ Job' : `⏰ ${title}`;
+  if (job?.enabled === false) {
+    label += ' (off)';
+  }
   if (label.length > maxLength) {
-    const suffix = ` (${job.id})`;
-    const available = maxLength - suffix.length;
-    if (available > 4) {
-      label = `${label.slice(0, available - 1)}…${suffix}`;
-    } else {
-      label = `${label.slice(0, maxLength - 1)}…`;
-    }
+    label = `${label.slice(0, maxLength - 1)}…`;
   }
   return label;
 }
@@ -2814,12 +3709,18 @@ async function renderCronMenu(ctx) {
     .row()
     .text('➕ Create job', 'cron:create')
     .row()
+    .text('🧷 Link job to project', 'cronlink:menu')
+    .row()
+    .text('🧹 Show “Other” only', 'cronlink:other')
+    .row()
+    .text('🔎 Filter by project', 'cronlink:filter_menu')
+    .row()
     .text('⬅️ Back', 'main:back');
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
-async function renderCronJobList(ctx) {
+async function renderCronJobList(ctx, options = {}) {
   if (!CRON_API_TOKEN) {
     await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
       reply_markup: buildBackKeyboard('main:back'),
@@ -2855,27 +3756,248 @@ async function renderCronJobList(ctx) {
     );
     return;
   }
+  const projects = await loadProjects();
+  const links = await listCronJobLinks();
+  const linkMap = new Map(links.map((link) => [String(link.cronJobId), link]));
+  await autoLinkCronJobs(jobs, projects, linkMap);
+
+  const filtered = filterCronJobsByProject(jobs, projects, linkMap, options);
+  const grouped = groupCronJobs(filtered, projects, linkMap);
+
   const lines = ['Cron jobs:'];
-  jobs.forEach((job) => {
-    const status = job.enabled ? 'Enabled' : 'Disabled';
-    const name = getCronJobDisplayName(job);
-    lines.push(`- ${job.id} — "${name}" — ${status}`);
-  });
-  if (!jobs.length) {
+  if (!grouped.length) {
     lines.push('No cron jobs found.');
   }
+  grouped.forEach((group) => {
+    group.jobs.forEach((job) => {
+      const schedule = describeCronSchedule(job);
+      lines.push(
+        `[${group.label}] — ${getCronJobDisplayName(job)} — ${job.enabled ? 'Enabled' : 'Disabled'} — ${schedule}`,
+      );
+    });
+  });
   if (someFailed) {
     lines.push('', '⚠️ Some jobs failed to load from cron-job.org.');
   }
 
   const inline = new InlineKeyboard();
-  jobs.forEach((job) => {
-    const label = buildCronJobButtonLabel(job);
-    inline.text(label, `cron:job:${job.id}`).row();
+  grouped.forEach((group) => {
+    group.jobs.forEach((job) => {
+      const label = buildCronJobButtonLabel(job);
+      inline.text(label, `cron:job:${job.id}`).row();
+    });
   });
-  inline.text('⬅️ Back', 'main:back');
+  inline.text('⬅️ Back', 'cron:menu');
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+function resolveCronProjectId(job, link, projects) {
+  if (link?.projectId) return link.projectId;
+  const match = findProjectForCronUrl(projects, job?.url);
+  return match?.id || null;
+}
+
+function resolveCronProjectLabel(job, link, projects) {
+  if (link?.label) return link.label;
+  const projectId = resolveCronProjectId(job, link, projects);
+  if (!projectId) return 'Other';
+  const project = findProjectById(projects, projectId);
+  return project?.name || projectId || 'Other';
+}
+
+function normalizeUrlForMatch(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/$/, '');
+  } catch (error) {
+    return null;
+  }
+}
+
+function urlMatchesBase(targetUrl, baseUrl) {
+  const target = normalizeUrlForMatch(targetUrl);
+  const base = normalizeUrlForMatch(baseUrl);
+  if (!target || !base) return false;
+  if (!target.startsWith(base)) return false;
+  return true;
+}
+
+function findProjectForCronUrl(projects, url) {
+  if (!url) return null;
+  const baseUrl = getPublicBaseUrl().replace(/\/$/, '');
+  const keepAliveMatch = projects.find((project) =>
+    urlMatchesBase(url, `${baseUrl}/keep-alive/${project.id}`),
+  );
+  if (keepAliveMatch) return keepAliveMatch;
+
+  return projects.find((project) => {
+    const candidates = [
+      project.renderServiceUrl,
+      project.renderDeployHookUrl,
+      project.renderServiceUrl ? `${project.renderServiceUrl.replace(/\/$/, '')}${TELEGRAM_WEBHOOK_PATH_PREFIX}/${project.id}` : null,
+    ].filter(Boolean);
+    return candidates.some((candidate) => urlMatchesBase(url, candidate));
+  }) || null;
+}
+
+async function autoLinkCronJobs(jobs, projects, linkMap) {
+  for (const job of jobs) {
+    const jobId = String(job.id);
+    if (linkMap.has(jobId)) continue;
+    const match = findProjectForCronUrl(projects, job.url);
+    if (!match) continue;
+    const link = await upsertCronJobLink(jobId, match.id, null);
+    console.info('[cron] auto-linked job', { jobId, projectId: match.id });
+    linkMap.set(jobId, link);
+  }
+}
+
+function filterCronJobsByProject(jobs, projects, linkMap, options) {
+  if (!options?.projectId && !options?.otherOnly) return jobs;
+  return jobs.filter((job) => {
+    const link = linkMap.get(String(job.id));
+    const projectId = resolveCronProjectId(job, link, projects);
+    if (options.otherOnly) return !projectId;
+    return projectId === options.projectId;
+  });
+}
+
+function groupCronJobs(jobs, projects, linkMap) {
+  const grouped = new Map();
+  jobs.forEach((job) => {
+    const link = linkMap.get(String(job.id));
+    const label = resolveCronProjectLabel(job, link, projects);
+    if (!grouped.has(label)) grouped.set(label, []);
+    grouped.get(label).push(job);
+  });
+
+  const groups = Array.from(grouped.entries()).map(([label, entries]) => {
+    const sorted = entries.sort((a, b) => {
+      if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
+      return getCronJobDisplayName(a).localeCompare(getCronJobDisplayName(b));
+    });
+    return { label, jobs: sorted };
+  });
+
+  return groups.sort((a, b) => {
+    if (a.label === 'Other') return 1;
+    if (b.label === 'Other') return -1;
+    return a.label.localeCompare(b.label);
+  });
+}
+
+async function renderCronLinkMenu(ctx) {
+  if (!CRON_API_TOKEN) {
+    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
+      reply_markup: buildBackKeyboard('cron:menu'),
+    });
+    return;
+  }
+  let jobs = [];
+  try {
+    const response = await fetchCronJobs();
+    jobs = response.jobs || [];
+  } catch (error) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'list',
+      error,
+      userId: ctx.from?.id,
+      projectId: null,
+      correlationId,
+    });
+    if (
+      await renderCronRateLimitIfNeeded(ctx, error, {
+        reply_markup: buildBackKeyboard('cron:menu'),
+      }, correlationId)
+    ) {
+      return;
+    }
+    await renderOrEdit(
+      ctx,
+      formatCronApiErrorNotice('Failed to list cron jobs', error, correlationId),
+      { reply_markup: buildBackKeyboard('cron:menu') },
+    );
+    return;
+  }
+  const projects = await loadProjects();
+  const links = await listCronJobLinks();
+  const linkMap = new Map(links.map((link) => [String(link.cronJobId), link]));
+  await autoLinkCronJobs(jobs, projects, linkMap);
+  const grouped = groupCronJobs(jobs, projects, linkMap);
+
+  const lines = ['🧷 Link cron jobs to projects:', ''];
+  grouped.forEach((group) => {
+    group.jobs.forEach((job) => {
+      lines.push(`[${group.label}] ${getCronJobDisplayName(job)}`);
+    });
+  });
+
+  const inline = new InlineKeyboard();
+  grouped.forEach((group) => {
+    group.jobs.forEach((job) => {
+      const label = buildCronJobButtonLabel(job);
+      inline.text(label, `cronlink:select:${job.id}`).row();
+    });
+  });
+  inline.text('⬅️ Back', 'cron:menu');
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderCronProjectFilterMenu(ctx) {
+  const projects = await loadProjects();
+  const inline = new InlineKeyboard();
+  inline.text('📋 All projects', 'cron:list').row();
+  projects.forEach((project) => {
+    inline.text(project.name || project.id, `cronlink:filter:${project.id}`).row();
+  });
+  inline.text('🧹 Other only', 'cronlink:other').row();
+  inline.text('⬅️ Back', 'cron:menu');
+  await renderOrEdit(ctx, 'Filter cron jobs by project:', { reply_markup: inline });
+}
+
+async function renderCronLinkProjectPicker(ctx, jobId) {
+  const projects = await loadProjects();
+  const link = await getCronJobLink(jobId);
+  const current = link?.projectId || null;
+  const lines = ['Select a project for this cron job:'];
+  const inline = new InlineKeyboard();
+  projects.forEach((project) => {
+    const label = project.id === current ? `✅ ${project.name || project.id}` : project.name || project.id;
+    inline.text(label, `cronlink:set:${jobId}:${project.id}`).row();
+  });
+  inline.text(current ? '✅ Other' : 'Other', `cronlink:set_other:${jobId}`).row();
+  inline.text('🏷 Set label', `cronlink:label:${jobId}`).row();
+  inline.text('⬅️ Back', 'cronlink:menu');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function updateCronJobLink(ctx, jobId, projectId) {
+  const link = await getCronJobLink(jobId);
+  const label = link?.label || null;
+  await upsertCronJobLink(jobId, projectId, label);
+  await renderCronLinkProjectPicker(ctx, jobId);
+}
+
+async function handleCronLinkLabelInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a label.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(state.backCallback || 'cron:menu'),
+    });
+    return;
+  }
+  const link = await getCronJobLink(state.jobId);
+  await upsertCronJobLink(state.jobId, link?.projectId || null, text);
+  clearUserState(ctx.from.id);
+  await renderCronLinkProjectPicker(ctx, state.jobId);
 }
 
 async function renderCronJobDetails(ctx, jobId, options = {}) {
@@ -2915,6 +4037,9 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
   const schedule = describeCronSchedule(job, { includeAllHours: true });
   const timezone = job?.schedule?.timezone || job?.timezone || '-';
   const url = job?.url || '-';
+  const projects = await loadProjects();
+  const link = await getCronJobLink(jobId);
+  const projectLabel = resolveCronProjectLabel(job, link, projects);
   const scheduleDetails = [
     `- Timezone: ${timezone}`,
     `- Minutes: ${formatScheduleValue(job?.schedule?.minutes, 'every minute')}`,
@@ -2926,6 +4051,7 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
   const lines = [
     `Cron job #${jobId}:`,
     `Title: ${getCronJobDisplayName(job)}`,
+    `Project: ${projectLabel}`,
     `Enabled: ${job?.enabled ? 'Yes' : 'No'}`,
     `URL: ${url}`,
     'Schedule:',
@@ -2938,6 +4064,8 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
     .text('✏️ Edit name', `cron:edit_name:${jobId}`)
     .row()
     .text('🔗 Edit URL', `cron:change_url:${jobId}`)
+    .row()
+    .text('🧷 Link project', `cronlink:select:${jobId}`)
     .row()
     .text(toggleLabel, `cron:toggle:${jobId}`)
     .row()
@@ -4307,9 +5435,12 @@ function buildProjectSettingsView(project, globalSettings) {
   const name = project.name || project.id;
   const tokenKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';
   const tokenLabel = tokenKey === 'GITHUB_TOKEN' ? 'GITHUB_TOKEN (default)' : tokenKey;
+  const projectTypeLabel = getProjectTypeLabel(project);
 
   const lines = [
     `Project: ${isDefault ? '⭐ ' : ''}${name} (id: ${project.id})`,
+    '',
+    `Project type: ${projectTypeLabel}`,
     '',
     'Repo:',
     `- slug: ${project.repoSlug || 'not set'}`,
@@ -4335,6 +5466,8 @@ function buildProjectSettingsView(project, globalSettings) {
     .text('✏️ Edit project', `proj:project_menu:${project.id}`)
     .text('🌱 Change base branch', `proj:change_base:${project.id}`)
     .row()
+    .text('🏷 Project type', `proj:project_type:${project.id}`)
+    .row()
     .text('📝 Edit repo', `proj:edit_repo:${project.id}`)
     .text('📁 Edit working dir', `proj:edit_workdir:${project.id}`)
     .row()
@@ -4344,6 +5477,11 @@ function buildProjectSettingsView(project, globalSettings) {
     .row()
     .text('📡 Server', `proj:server_menu:${project.id}`)
     .text('🗄 Supabase binding', `proj:supabase:${project.id}`)
+    .row()
+    .text('🔐 Env Vault', `envvault:menu:${project.id}`)
+    .text('🤖 Telegram Setup', `tgbot:menu:${project.id}`)
+    .row()
+    .text('📝 SQL runner', `proj:sql_menu:${project.id}`)
     .row()
     .text('📣 Log alerts', `projlog:menu:${project.id}`)
     .row();
@@ -4355,6 +5493,35 @@ function buildProjectSettingsView(project, globalSettings) {
   inline.text('🗑 Delete project', `proj:delete:${project.id}`).text('⬅️ Back', 'proj:list');
 
   return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectTypeMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const options = getProjectTypeOptions();
+  const current = project.projectType || project.project_type || 'other';
+  const inline = new InlineKeyboard();
+  options.forEach((option) => {
+    const label = option.id === current ? `✅ ${option.label}` : option.label;
+    inline.text(label, `proj:project_type_set:${projectId}:${option.id}`).row();
+  });
+  inline.text('⬅️ Back', `proj:open:${projectId}`);
+  await renderOrEdit(ctx, `Select project type for ${project.name || project.id}:`, {
+    reply_markup: inline,
+  });
+}
+
+async function updateProjectType(ctx, projectId, typeId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  project.projectType = typeId;
+  project.project_type = typeId;
+  await saveProjects(projects);
+  await renderProjectSettings(ctx, projectId);
 }
 
 function buildProjectLogAlertsView(project) {
@@ -4437,6 +5604,197 @@ async function renderProjectMenu(ctx, projectId) {
   await renderOrEdit(ctx, `📂 Project menu: ${project.name || project.id}`, {
     reply_markup: inline,
   });
+}
+
+async function renderProjectSqlMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const envStatus = await buildEnvVaultDbStatus(project, envSetId);
+  const supabaseStatus = await buildSupabaseBindingStatus(project);
+  const missingRequired = envStatus.missingRequired || [];
+
+  const lines = [
+    `📝 SQL runner — ${project.name || project.id}`,
+    '',
+    `Env Vault: ${envStatus.summary}`,
+    `Supabase binding: ${supabaseStatus.summary}`,
+  ];
+
+  const inline = new InlineKeyboard();
+  if (envStatus.ready) {
+    inline.text('🔐 Use Env Vault', `envvault:sql:${projectId}`).row();
+  } else if (missingRequired.length) {
+    inline.text('➕ Add missing required keys', `envvault:add_missing:${projectId}`).row();
+  }
+  if (project.supabaseConnectionId) {
+    inline.text('🗄 Use Supabase binding', `proj:sql_supabase:${projectId}`).row();
+  }
+  inline.text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function ensureProjectEnvSet(projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) return null;
+  let envSetId = project.defaultEnvSetId;
+  if (!envSetId) {
+    envSetId = await ensureDefaultEnvVarSet(projectId);
+    project.defaultEnvSetId = envSetId;
+    project.default_env_set_id = envSetId;
+    await saveProjects(projects);
+  }
+  return envSetId;
+}
+
+async function buildEnvVaultDbStatus(project, envSetId) {
+  const keys = await listEnvVarKeys(project.id, envSetId);
+  const hasDsn = keys.includes('DATABASE_URL') || keys.includes('SUPABASE_DSN');
+  const hasServiceRole = keys.includes('SUPABASE_SERVICE_ROLE_KEY') || keys.includes('SUPABASE_SERVICE_ROLE');
+  const hasSupabasePair = keys.includes('SUPABASE_URL') && hasServiceRole;
+  if (hasDsn || hasSupabasePair) {
+    return { ready: true, summary: '✅ DB ready', missingRequired: [] };
+  }
+  const missing = [];
+  if (!keys.includes('SUPABASE_URL')) missing.push('SUPABASE_URL');
+  if (!hasServiceRole) missing.push('SUPABASE_SERVICE_ROLE_KEY');
+  if (!keys.includes('DATABASE_URL')) missing.push('DATABASE_URL');
+  if (!keys.includes('SUPABASE_DSN')) missing.push('SUPABASE_DSN');
+  return { ready: false, summary: `⚠️ Missing: ${missing.join(', ')}`, missingRequired: missing };
+}
+
+async function buildSupabaseBindingStatus(project) {
+  if (!project.supabaseConnectionId) {
+    return { ready: false, summary: 'not configured' };
+  }
+  const connection = await findSupabaseConnection(project.supabaseConnectionId);
+  if (!connection) {
+    return { ready: false, summary: 'missing connection' };
+  }
+  const dsn = process.env[connection.envKey];
+  if (!dsn) {
+    return { ready: false, summary: `env ${connection.envKey} missing` };
+  }
+  return { ready: true, summary: `✅ ${connection.id}` };
+}
+
+async function resolveEnvVaultConnection(projectId, envSetId) {
+  const envVars = await listEnvVars(projectId, envSetId);
+  const lookup = new Map(envVars.map((entry) => [entry.key, entry]));
+
+  const dsnKey = lookup.get('DATABASE_URL') || lookup.get('SUPABASE_DSN');
+  if (dsnKey) {
+    const value = await getEnvVarValue(projectId, dsnKey.key, envSetId);
+    return { dsn: value, source: dsnKey.key };
+  }
+
+  const supabaseUrl = lookup.get('SUPABASE_URL');
+  const serviceRole = lookup.get('SUPABASE_SERVICE_ROLE_KEY') || lookup.get('SUPABASE_SERVICE_ROLE');
+  if (supabaseUrl && serviceRole) {
+    const urlValue = await getEnvVarValue(projectId, 'SUPABASE_URL', envSetId);
+    const roleKey = serviceRole.key;
+    const roleValue = await getEnvVarValue(projectId, roleKey, envSetId);
+    const dsn = buildSupabaseDsnFromUrl(urlValue, roleValue);
+    return { dsn, source: `SUPABASE_URL+${roleKey}` };
+  }
+
+  return { dsn: null, source: null };
+}
+
+function buildSupabaseDsnFromUrl(supabaseUrl, serviceRoleKey) {
+  const parsed = new URL(supabaseUrl);
+  const projectRef = parsed.hostname.split('.')[0];
+  const password = encodeURIComponent(serviceRoleKey);
+  return `postgres://postgres:${password}@db.${projectRef}.supabase.co:5432/postgres?sslmode=require`;
+}
+
+async function runEnvVaultQuery(projectId, envSetId, sql) {
+  const connection = await resolveEnvVaultConnection(projectId, envSetId);
+  if (!connection.dsn) {
+    throw new Error('Missing ENV Vault DB connection details.');
+  }
+  const poolKey = `${projectId}:${envSetId}`;
+  let pool = envVaultPools.get(poolKey);
+  if (!pool) {
+    pool = new Pool({ connectionString: connection.dsn });
+    envVaultPools.set(poolKey, pool);
+  }
+  return pool.query(sql);
+}
+
+async function runEnvVaultSql(ctx, projectId, envSetId, sql) {
+  try {
+    const result = await runEnvVaultQuery(projectId, envSetId, sql);
+    if (result.rows && result.rows.length) {
+      const lines = result.rows.slice(0, 50).map((row) => formatSqlRow(row));
+      const output = truncateMessage(lines.join('\n'), 3500);
+      await ctx.reply(output);
+      return;
+    }
+    if (result.command === 'SELECT') {
+      await ctx.reply('No rows returned.');
+      return;
+    }
+    await ctx.reply(`Query executed. ${result.rowCount || 0} rows affected.`);
+  } catch (error) {
+    await ctx.reply(`SQL error: ${error.message}`);
+  }
+}
+
+async function startProjectSqlInput(ctx, projectId, source) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const envSetId = await ensureProjectEnvSet(projectId);
+  if (source === 'env_vault') {
+    const status = await buildEnvVaultDbStatus(project, envSetId);
+    if (!status.ready) {
+      await renderOrEdit(ctx, `Env Vault DB not ready.\n${status.summary}`, {
+        reply_markup: buildBackKeyboard(`proj:sql_menu:${projectId}`),
+      });
+      return;
+    }
+  }
+  setUserState(ctx.from.id, {
+    type: 'project_sql_input',
+    projectId,
+    envSetId,
+    source,
+    backCallback: `proj:sql_menu:${projectId}`,
+  });
+  await ctx.reply('Send the SQL query to execute.\n(Or press Cancel)', {
+    reply_markup: buildCancelKeyboard(),
+  });
+}
+
+async function handleProjectSqlInput(ctx, state) {
+  const sql = ctx.message.text?.trim();
+  if (!sql) {
+    await ctx.reply('Please send the SQL query as text.');
+    return;
+  }
+  if (sql.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await ctx.reply('Operation cancelled.', {
+      reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
+    });
+    return;
+  }
+
+  if (state.source === 'supabase') {
+    const project = await getProjectById(state.projectId, ctx);
+    if (!project?.supabaseConnectionId) {
+      await ctx.reply('Supabase binding is not configured.');
+    } else {
+      await runSupabaseSql(ctx, project.supabaseConnectionId, sql);
+    }
+  } else {
+    await runEnvVaultSql(ctx, state.projectId, state.envSetId, sql);
+  }
+
+  clearUserState(ctx.from.id);
+  await renderProjectSqlMenu(ctx, state.projectId);
 }
 
 async function renderServerMenu(ctx, projectId) {
