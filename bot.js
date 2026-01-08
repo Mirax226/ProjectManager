@@ -131,21 +131,175 @@ async function renderOrEdit(ctx, text, extra) {
   return ctx.reply(text, extra);
 }
 
+function buildCronCorrelationId() {
+  return `CRON-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+function extractCronApiErrorReason(error) {
+  if (!error?.body) return '';
+  const raw = String(error.body).trim();
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed?.message) return String(parsed.message);
+    if (parsed?.error) return String(parsed.error);
+    if (Array.isArray(parsed?.errors) && parsed.errors.length) {
+      const entry = parsed.errors[0];
+      if (entry?.message) return String(entry.message);
+      if (entry?.error) return String(entry.error);
+      return String(entry);
+    }
+  } catch (parseError) {
+    return truncateText(raw, 200);
+  }
+  return truncateText(raw, 200);
+}
+
+function logCronApiError({ operation, error, userId, projectId, correlationId }) {
+  const responseBody = truncateText(error?.body ?? '', 500);
+  console.error('[cron] API error', {
+    correlationId,
+    operation,
+    method: error?.method,
+    path: error?.path,
+    status: error?.status,
+    responseBody,
+    userId,
+    projectId,
+  });
+}
+
+function formatCronApiErrorMessage({ error, hint, correlationId }) {
+  const lines = ['❌ Cron API error'];
+  if (error?.status) {
+    lines.push(`Status: ${error.status}`);
+  }
+  const reason = extractCronApiErrorReason(error);
+  if (reason) {
+    lines.push(`Reason: ${reason}`);
+  }
+  if (hint) {
+    lines.push(`Hint: ${hint}`);
+  }
+  if (correlationId) {
+    lines.push(`Ref: ${correlationId}`);
+  }
+  return lines.join('\n');
+}
+
+function formatCronApiErrorNotice(prefix, error, correlationId) {
+  const reason = extractCronApiErrorReason(error);
+  const statusSuffix = error?.status ? ` (status ${error.status})` : '';
+  const detail = reason || error?.message || 'request failed';
+  return `${prefix}${statusSuffix}: ${detail}\nRef: ${correlationId}`;
+}
+
+function isCronUrlValidationError(error) {
+  if (!error) return false;
+  if (error.status === 422) return true;
+  const reason = extractCronApiErrorReason(error).toLowerCase();
+  return reason.includes('url') || reason.includes('uri') || reason.includes('http');
+}
+
+function validateCronUrlInput(value) {
+  const raw = value?.trim();
+  if (!raw) {
+    return { valid: false, message: 'URL is required.' };
+  }
+  if (raw.length > 2048) {
+    return { valid: false, message: 'URL is too long (max 2048 characters).' };
+  }
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (error) {
+    return { valid: false, message: 'URL must be a valid http/https address.' };
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return { valid: false, message: 'URL must start with http:// or https://.' };
+  }
+  if (!parsed.hostname) {
+    return { valid: false, message: 'URL must include a hostname.' };
+  }
+  return { valid: true, url: raw };
+}
+
+function validateCronExpression(raw) {
+  const parts = raw.trim().split(/\s+/);
+  if (parts.length !== 5) {
+    return { valid: false, message: 'Cron expression must have 5 fields.' };
+  }
+  const fieldPattern = /^[\d*/,\-?]+$/;
+  if (!parts.every((part) => part && fieldPattern.test(part))) {
+    return { valid: false, message: 'Cron expression has invalid characters.' };
+  }
+  return { valid: true };
+}
+
+async function renderCronWizardMessage(ctx, state, text, extra) {
+  if (state && !state.messageContext && ctx.callbackQuery?.message) {
+    state.messageContext = {
+      chatId: ctx.callbackQuery.message.chat.id,
+      messageId: ctx.callbackQuery.message.message_id,
+    };
+  }
+  const messageContext = state?.messageContext;
+  if (messageContext?.chatId && messageContext?.messageId) {
+    try {
+      await ctx.telegram.editMessageText(
+        messageContext.chatId,
+        messageContext.messageId,
+        undefined,
+        text,
+        extra,
+      );
+      return;
+    } catch (error) {
+      console.error('[UI] editMessageText failed, fallback to reply', error);
+    }
+  }
+  const message = await renderOrEdit(ctx, text, extra);
+  if (message?.chat?.id && message?.message_id && state) {
+    state.messageContext = { chatId: message.chat.id, messageId: message.message_id };
+  }
+}
+
+function setCronWizardStep(state, wizardStep, flowStep) {
+  if (!state) return;
+  state.step = wizardStep;
+  if (state.temp && flowStep) {
+    state.temp.flowStep = flowStep;
+  }
+}
+
+function buildCronWizardErrorKeyboard() {
+  return new InlineKeyboard()
+    .text('🔁 Retry step', 'cronwiz:retry')
+    .row()
+    .text('✏️ Change URL', 'cronwiz:change:url')
+    .text('🕒 Change schedule', 'cronwiz:change:schedule')
+    .row()
+    .text('✍️ Change name', 'cronwiz:change:name')
+    .text('❌ Cancel', 'cronwiz:cancel');
+}
+
 function isCronRateLimitError(error) {
   if (!error) return false;
   if (error.status === 429) return true;
   return /rate limit/i.test(error.message || '');
 }
 
-async function renderCronRateLimitIfNeeded(ctx, error, extra) {
+async function renderCronRateLimitIfNeeded(ctx, error, extra, correlationId) {
   if (!isCronRateLimitError(error)) return false;
-  await renderOrEdit(ctx, CRON_RATE_LIMIT_MESSAGE, extra);
+  const message = correlationId ? `${CRON_RATE_LIMIT_MESSAGE}\nRef: ${correlationId}` : CRON_RATE_LIMIT_MESSAGE;
+  await renderOrEdit(ctx, message, extra);
   return true;
 }
 
-async function replyCronRateLimitIfNeeded(ctx, error) {
+async function replyCronRateLimitIfNeeded(ctx, error, correlationId) {
   if (!isCronRateLimitError(error)) return false;
-  await ctx.reply(CRON_RATE_LIMIT_MESSAGE);
+  const message = correlationId ? `${CRON_RATE_LIMIT_MESSAGE}\nRef: ${correlationId}` : CRON_RATE_LIMIT_MESSAGE;
+  await ctx.reply(message);
   return true;
 }
 
@@ -225,7 +379,7 @@ async function checkConfigDbStatus() {
   }
 }
 
-async function getCronStatusLine(cronSettings) {
+async function getCronStatusLine(ctx, cronSettings) {
   if (!cronSettings?.enabled) {
     return 'Cron: disabled (settings).';
   }
@@ -236,7 +390,15 @@ async function getCronStatusLine(cronSettings) {
     await fetchCronJobs();
     return 'Cron: ✅ API OK.';
   } catch (error) {
-    return `Cron: ⚠️ API error: ${truncateText(error.message, 80)}`;
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'list',
+      error,
+      userId: ctx?.from?.id,
+      projectId: null,
+      correlationId,
+    });
+    return `Cron: ⚠️ API error: ${truncateText(error.message, 80)} (Ref: ${correlationId})`;
   }
 }
 
@@ -474,9 +636,6 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'supabase_add':
       await handleSupabaseAddMessage(ctx, state);
-      break;
-    case 'cron_create_url':
-      await handleCronCreateMessage(ctx, state);
       break;
     case 'cron_wizard':
       await handleCronWizardInput(ctx, state);
@@ -950,10 +1109,7 @@ async function handleCronCallback(ctx, data) {
           return;
         }
       }
-      setUserState(ctx.from.id, { type: 'cron_create_url', backCallback: 'cron:menu' });
-      await ctx.reply('Send target URL (e.g. keep-alive or deploy hook).', {
-        reply_markup: buildCronWizardCancelKeyboard(),
-      });
+      await startCronCreateWizard(ctx, null, 'cron:menu');
       break;
     case 'job':
       await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
@@ -968,16 +1124,28 @@ async function handleCronCallback(ctx, data) {
         clearCronJobsCache();
         await renderCronJobDetails(ctx, jobId, { backCallback: 'cron:list' });
       } catch (error) {
+        const correlationId = buildCronCorrelationId();
+        logCronApiError({
+          operation: 'toggle',
+          error,
+          userId: ctx.from?.id,
+          projectId: null,
+          correlationId,
+        });
         if (
           await renderCronRateLimitIfNeeded(ctx, error, {
             reply_markup: buildBackKeyboard('cron:menu'),
-          })
+          }, correlationId)
         ) {
           return;
         }
-        await renderOrEdit(ctx, `Failed to toggle cron job: ${error.message}`, {
-          reply_markup: buildBackKeyboard('cron:menu'),
-        });
+        await renderOrEdit(
+          ctx,
+          formatCronApiErrorNotice('Failed to toggle cron job', error, correlationId),
+          {
+            reply_markup: buildBackKeyboard('cron:menu'),
+          },
+        );
       }
       break;
     }
@@ -1008,16 +1176,26 @@ async function handleCronCallback(ctx, data) {
           reply_markup: buildBackKeyboard('cron:menu'),
         });
       } catch (error) {
+        const correlationId = buildCronCorrelationId();
+        logCronApiError({
+          operation: 'delete',
+          error,
+          userId: ctx.from?.id,
+          projectId: null,
+          correlationId,
+        });
         if (
           await renderCronRateLimitIfNeeded(ctx, error, {
             reply_markup: buildBackKeyboard('cron:menu'),
-          })
+          }, correlationId)
         ) {
           return;
         }
-        await renderOrEdit(ctx, `Failed to delete cron job: ${error.message}`, {
-          reply_markup: buildBackKeyboard('cron:menu'),
-        });
+        await renderOrEdit(
+          ctx,
+          formatCronApiErrorNotice('Failed to delete cron job', error, correlationId),
+          { reply_markup: buildBackKeyboard('cron:menu') },
+        );
       }
       break;
     default:
@@ -1067,19 +1245,68 @@ async function handleCronWizardCallback(ctx, data) {
     return;
   }
 
+  if (action === 'retry' && state.mode === 'create') {
+    if (state.step !== 'confirm') {
+      await renderCronWizardMessage(ctx, state, 'Nothing to retry yet.', {
+        reply_markup: buildCronWizardErrorKeyboard(),
+      });
+      return;
+    }
+    if (state.lastError?.isUrlError) {
+      setCronWizardStep(state, 'url', 'url');
+      state.temp.inputType = 'url';
+      state.temp.urlNextStep = 'confirm';
+      await renderCronWizardMessage(ctx, state, 'Send target URL (e.g. keep-alive or deploy hook).', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
+      return;
+    }
+    await attemptCronWizardCreate(ctx, state);
+    return;
+  }
+
+  if (action === 'change' && state.mode === 'create') {
+    if (subAction === 'url') {
+      setCronWizardStep(state, 'url', 'url');
+      state.temp.inputType = 'url';
+      state.temp.urlNextStep = 'confirm';
+      await renderCronWizardMessage(ctx, state, 'Send target URL (e.g. keep-alive or deploy hook).', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
+      return;
+    }
+    if (subAction === 'schedule') {
+      setCronWizardStep(state, 'schedule', 'choose-pattern');
+      state.temp.previousStep = 'choose-pattern';
+      await renderCronWizardPatternMenu(ctx, state);
+      return;
+    }
+    if (subAction === 'name') {
+      setCronWizardStep(state, 'name', 'name');
+      state.temp.inputType = 'ask-name';
+      await renderCronWizardMessage(
+        ctx,
+        state,
+        "Send job name (or type 'skip' for default). Or press Cancel.",
+        { reply_markup: buildCronWizardCancelKeyboard() },
+      );
+      return;
+    }
+  }
+
   if (state.type !== 'cron_wizard') {
     return;
   }
 
   if (action === 'entry') {
     if (subAction === 'pattern') {
-      state.step = 'choose-pattern';
+      setCronWizardStep(state, 'schedule', 'choose-pattern');
       state.temp.previousStep = 'edit-entry';
       await renderCronWizardPatternMenu(ctx, state);
       return;
     }
     if (subAction === 'advanced') {
-      state.step = 'advanced-menu';
+      setCronWizardStep(state, 'schedule', 'advanced-menu');
       state.temp.previousStep = 'edit-entry';
       await renderCronWizardAdvancedMenu(ctx, state);
     }
@@ -1088,12 +1315,12 @@ async function handleCronWizardCallback(ctx, data) {
 
   if (action === 'back') {
     if (subAction === 'pattern') {
-      state.step = 'choose-pattern';
+      setCronWizardStep(state, 'schedule', 'choose-pattern');
       await renderCronWizardPatternMenu(ctx, state);
       return;
     }
     if (subAction === 'weekly_days') {
-      state.step = 'pattern-weekly-days';
+      setCronWizardStep(state, 'schedule', 'pattern-weekly-days');
       await renderCronWizardWeeklyDaysMenu(ctx, state);
     }
     return;
@@ -1101,22 +1328,22 @@ async function handleCronWizardCallback(ctx, data) {
 
   if (action === 'pattern') {
     if (subAction === 'minutes') {
-      state.step = 'pattern-minutes';
+      setCronWizardStep(state, 'schedule', 'pattern-minutes');
       await renderCronWizardMinutesMenu(ctx);
       return;
     }
     if (subAction === 'hours') {
-      state.step = 'pattern-hours';
+      setCronWizardStep(state, 'schedule', 'pattern-hours');
       await renderCronWizardHoursMenu(ctx);
       return;
     }
     if (subAction === 'daily') {
-      state.step = 'pattern-daily';
+      setCronWizardStep(state, 'schedule', 'pattern-daily');
       await renderCronWizardDailyMenu(ctx);
       return;
     }
     if (subAction === 'weekly') {
-      state.step = 'pattern-weekly-days';
+      setCronWizardStep(state, 'schedule', 'pattern-weekly-days');
       if (!Array.isArray(state.temp.schedule.wdays) || state.temp.schedule.wdays.includes(-1)) {
         state.temp.schedule.wdays = [];
       }
@@ -1124,7 +1351,7 @@ async function handleCronWizardCallback(ctx, data) {
       return;
     }
     if (subAction === 'advanced') {
-      state.step = 'advanced-menu';
+      setCronWizardStep(state, 'schedule', 'advanced-menu');
       state.temp.previousStep = 'choose-pattern';
       await renderCronWizardAdvancedMenu(ctx, state);
     }
@@ -1133,9 +1360,9 @@ async function handleCronWizardCallback(ctx, data) {
 
   if (action === 'minutes') {
     if (subAction === 'custom') {
-      state.step = 'input';
+      setCronWizardStep(state, 'schedule', 'input');
       state.temp.inputType = 'custom-minutes';
-      await renderOrEdit(ctx, 'Send interval in minutes (1-720).', {
+      await renderCronWizardMessage(ctx, state, 'Send interval in minutes (1-720).', {
         reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
       });
       return;
@@ -1147,7 +1374,7 @@ async function handleCronWizardCallback(ctx, data) {
     const timezone = state.temp.schedule.timezone;
     if (interval > 60) {
       if (interval % 60 !== 0) {
-        await renderOrEdit(ctx, 'Interval must be 60 or a multiple of 60 minutes.', {
+        await renderCronWizardMessage(ctx, state, 'Interval must be 60 or a multiple of 60 minutes.', {
           reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
         });
         return;
@@ -1156,7 +1383,10 @@ async function handleCronWizardCallback(ctx, data) {
     } else {
       state.temp.schedule = buildEveryNMinutesSchedule(interval, timezone);
     }
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1164,9 +1394,9 @@ async function handleCronWizardCallback(ctx, data) {
 
   if (action === 'hours') {
     if (subAction === 'custom') {
-      state.step = 'input';
+      setCronWizardStep(state, 'schedule', 'input');
       state.temp.inputType = 'custom-hours';
-      await renderOrEdit(ctx, 'Send interval in hours (1-24).', {
+      await renderCronWizardMessage(ctx, state, 'Send interval in hours (1-24).', {
         reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
       });
       return;
@@ -1177,7 +1407,10 @@ async function handleCronWizardCallback(ctx, data) {
     }
     const timezone = state.temp.schedule.timezone;
     state.temp.schedule = buildEveryNHoursSchedule(interval, timezone);
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1185,9 +1418,9 @@ async function handleCronWizardCallback(ctx, data) {
 
   if (action === 'daily') {
     if (subAction === 'custom') {
-      state.step = 'input';
+      setCronWizardStep(state, 'schedule', 'input');
       state.temp.inputType = 'custom-daily-time';
-      await renderOrEdit(ctx, 'Send time as HH:MM (24h).', {
+      await renderCronWizardMessage(ctx, state, 'Send time as HH:MM (24h).', {
         reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
       });
       return;
@@ -1198,7 +1431,10 @@ async function handleCronWizardCallback(ctx, data) {
     }
     const timezone = state.temp.schedule.timezone;
     state.temp.schedule = buildDailySchedule(time, timezone);
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1217,6 +1453,9 @@ async function handleCronWizardCallback(ctx, data) {
       selected.add(day);
     }
     state.temp.schedule.wdays = uniqueSorted(Array.from(selected));
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
     await renderCronWizardWeeklyDaysMenu(ctx, state);
     return;
   }
@@ -1226,19 +1465,21 @@ async function handleCronWizardCallback(ctx, data) {
       ? state.temp.schedule.wdays.filter((value) => value !== -1)
       : [];
     if (!selected.length) {
-      await ctx.reply('Select at least one weekday.');
+      await renderCronWizardMessage(ctx, state, 'Select at least one weekday.', {
+        reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:pattern'),
+      });
       return;
     }
-    state.step = 'pattern-weekly-time';
+    setCronWizardStep(state, 'schedule', 'pattern-weekly-time');
     await renderCronWizardWeeklyTimeMenu(ctx);
     return;
   }
 
   if (action === 'weekly_time') {
     if (subAction === 'custom') {
-      state.step = 'input';
+      setCronWizardStep(state, 'schedule', 'input');
       state.temp.inputType = 'custom-weekly-time';
-      await renderOrEdit(ctx, 'Send time as HH:MM (24h).', {
+      await renderCronWizardMessage(ctx, state, 'Send time as HH:MM (24h).', {
         reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:back:weekly_days'),
       });
       return;
@@ -1252,7 +1493,10 @@ async function handleCronWizardCallback(ctx, data) {
       : [];
     const timezone = state.temp.schedule.timezone;
     state.temp.schedule = buildWeeklySchedule(selected, time, timezone);
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1260,31 +1504,31 @@ async function handleCronWizardCallback(ctx, data) {
 
   if (action === 'advanced') {
     if (subAction === 'done') {
-      state.step = 'confirm';
+      setCronWizardStep(state, 'confirm', 'confirm');
       state.temp.previousStep = 'advanced-menu';
       await renderCronWizardConfirm(ctx, state);
       return;
     }
     if (subAction === 'back') {
       if (state.temp.previousStep === 'edit-entry' && state.mode === 'edit') {
-        state.step = 'edit-entry';
+        setCronWizardStep(state, 'schedule', 'edit-entry');
         await renderCronWizardEditEntry(ctx, state);
       } else {
-        state.step = 'choose-pattern';
+        setCronWizardStep(state, 'schedule', 'choose-pattern');
         await renderCronWizardPatternMenu(ctx, state);
       }
       return;
     }
     if (subAction === 'timezone') {
-      state.step = 'input';
+      setCronWizardStep(state, 'schedule', 'input');
       state.temp.inputType = 'timezone';
-      await renderOrEdit(ctx, 'Send timezone (e.g. Asia/Tehran).', {
+      await renderCronWizardMessage(ctx, state, 'Send timezone (e.g. Asia/Tehran).', {
         reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:advanced:back'),
       });
       return;
     }
     if (['minutes', 'hours', 'mdays', 'months', 'wdays'].includes(subAction)) {
-      state.step = 'advanced-edit-field';
+      setCronWizardStep(state, 'schedule', 'advanced-edit-field');
       state.temp.fieldBeingEdited = subAction;
       await renderCronWizardAdvancedFieldMenu(ctx, subAction);
     }
@@ -1297,15 +1541,18 @@ async function handleCronWizardCallback(ctx, data) {
     if (!field || !fieldAction) return;
     if (fieldAction === 'all') {
       state.temp.schedule[field] = [-1];
+      if (state.draft) {
+        state.draft.schedule = state.temp.schedule;
+      }
       await renderCronWizardAdvancedMenu(ctx, state);
       return;
     }
     if (fieldAction === 'custom') {
-      state.step = 'input';
+      setCronWizardStep(state, 'schedule', 'input');
       state.temp.inputType = 'advanced-custom-list';
       state.temp.fieldBeingEdited = field;
       const fieldLabel = field === 'mdays' ? 'month days (1-31)' : field;
-      await renderOrEdit(ctx, `Send comma-separated list for ${fieldLabel}.`, {
+      await renderCronWizardMessage(ctx, state, `Send comma-separated list for ${fieldLabel}.`, {
         reply_markup: buildCronWizardBackCancelKeyboard('cronwiz:advanced:back'),
       });
       return;
@@ -1351,6 +1598,9 @@ async function handleCronWizardCallback(ctx, data) {
           state.temp.schedule.wdays = [0, 6];
         }
       }
+      if (state.draft) {
+        state.draft.schedule = state.temp.schedule;
+      }
       await renderCronWizardAdvancedMenu(ctx, state);
     }
     return;
@@ -1368,33 +1618,43 @@ async function handleCronWizardCallback(ctx, data) {
             backCallback: state.backCallback || 'cron:list',
           });
         } catch (error) {
-          if (await replyCronRateLimitIfNeeded(ctx, error)) {
-            return;
-          }
-          const message =
-            error?.status === 400
-              ? `Cron API rejected schedule: ${error.message}`
-              : `Failed to update cron job: ${error.message}`;
-          await ctx.reply(message);
+          const correlationId = buildCronCorrelationId();
+          logCronApiError({
+            operation: 'update',
+            error,
+            userId: ctx.from?.id,
+            projectId: state.projectId,
+            correlationId,
+          });
+          const hint = 'Please re-enter the schedule.';
+          await renderCronWizardMessage(
+            ctx,
+            state,
+            formatCronApiErrorMessage({ error, hint, correlationId }),
+            { reply_markup: buildCronWizardCancelKeyboard() },
+          );
         }
         return;
       }
-      state.step = 'ask-name';
+      setCronWizardStep(state, 'name', 'name');
       state.temp.inputType = 'ask-name';
-      await ctx.reply("Send job name (or type 'skip' for default). Or press Cancel.", {
-        reply_markup: buildCronWizardCancelKeyboard(),
-      });
+      await renderCronWizardMessage(
+        ctx,
+        state,
+        "Send job name (or type 'skip' for default). Or press Cancel.",
+        { reply_markup: buildCronWizardCancelKeyboard() },
+      );
       return;
     }
     if (subAction === 'adjust') {
       if (state.temp.previousStep === 'advanced-menu') {
-        state.step = 'advanced-menu';
+        setCronWizardStep(state, 'schedule', 'advanced-menu');
         await renderCronWizardAdvancedMenu(ctx, state);
       } else if (state.temp.previousStep === 'edit-entry' && state.mode === 'edit') {
-        state.step = 'edit-entry';
+        setCronWizardStep(state, 'schedule', 'edit-entry');
         await renderCronWizardEditEntry(ctx, state);
       } else {
-        state.step = 'choose-pattern';
+        setCronWizardStep(state, 'schedule', 'choose-pattern');
         await renderCronWizardPatternMenu(ctx, state);
       }
     }
@@ -1404,7 +1664,9 @@ async function handleCronWizardCallback(ctx, data) {
 async function handleCronWizardInput(ctx, state) {
   const text = ctx.message.text?.trim();
   if (!text) {
-    await ctx.reply('Please send a value or press Cancel.');
+    await renderCronWizardMessage(ctx, state, 'Please send a value or press Cancel.', {
+      reply_markup: buildCronWizardCancelKeyboard(),
+    });
     return;
   }
   if (text.toLowerCase() === 'cancel') {
@@ -1415,21 +1677,54 @@ async function handleCronWizardInput(ctx, state) {
   const inputType = state.temp.inputType;
   const timezone = state.temp.schedule?.timezone;
 
+  if (inputType === 'url') {
+    const validation = validateCronUrlInput(text);
+    if (!validation.valid) {
+      state.lastError = { status: null, message: validation.message, isUrlError: true };
+      await renderCronWizardMessage(ctx, state, `❌ Invalid URL\nReason: ${validation.message}\nHint: Please re-enter the URL.`, {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
+      return;
+    }
+    state.temp.url = validation.url;
+    state.draft.url = validation.url;
+    state.lastError = null;
+    if (state.temp.urlNextStep === 'confirm' && state.temp.schedule) {
+      setCronWizardStep(state, 'confirm', 'confirm');
+      state.temp.inputType = null;
+      await renderCronWizardMessage(ctx, state, buildCronWizardDraftSummary(state), {
+        reply_markup: buildCronWizardErrorKeyboard(),
+      });
+      return;
+    }
+    setCronWizardStep(state, 'schedule', 'choose-pattern');
+    state.temp.inputType = null;
+    await renderCronWizardPatternMenu(ctx, state);
+    return;
+  }
+
   if (inputType === 'custom-minutes') {
     const value = Number(text);
     if (!Number.isInteger(value) || value <= 0 || value > 720) {
-      await ctx.reply('Please send a valid number of minutes (1-720).');
+      await renderCronWizardMessage(ctx, state, 'Please send a valid number of minutes (1-720).', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
       return;
     }
     if (value > 60 && value % 60 !== 0) {
-      await ctx.reply('Minutes over 60 must be divisible by 60.');
+      await renderCronWizardMessage(ctx, state, 'Minutes over 60 must be divisible by 60.', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
       return;
     }
     state.temp.schedule =
       value > 60
         ? buildEveryNHoursSchedule(value / 60, timezone)
         : buildEveryNMinutesSchedule(value, timezone);
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1438,11 +1733,16 @@ async function handleCronWizardInput(ctx, state) {
   if (inputType === 'custom-hours') {
     const value = Number(text);
     if (!Number.isInteger(value) || value <= 0 || value > 24) {
-      await ctx.reply('Please send a valid number of hours (1-24).');
+      await renderCronWizardMessage(ctx, state, 'Please send a valid number of hours (1-24).', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
       return;
     }
     state.temp.schedule = buildEveryNHoursSchedule(value, timezone);
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1451,11 +1751,16 @@ async function handleCronWizardInput(ctx, state) {
   if (inputType === 'custom-daily-time') {
     const time = parseTimeInput(text);
     if (!time) {
-      await ctx.reply('Invalid time format. Use HH:MM.');
+      await renderCronWizardMessage(ctx, state, 'Invalid time format. Use HH:MM.', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
       return;
     }
     state.temp.schedule = buildDailySchedule(time, timezone);
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1464,18 +1769,25 @@ async function handleCronWizardInput(ctx, state) {
   if (inputType === 'custom-weekly-time') {
     const time = parseTimeInput(text);
     if (!time) {
-      await ctx.reply('Invalid time format. Use HH:MM.');
+      await renderCronWizardMessage(ctx, state, 'Invalid time format. Use HH:MM.', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
       return;
     }
     const selected = Array.isArray(state.temp.schedule.wdays)
       ? state.temp.schedule.wdays.filter((value) => value !== -1)
       : [];
     if (!selected.length) {
-      await ctx.reply('Select weekdays first.');
+      await renderCronWizardMessage(ctx, state, 'Select weekdays first.', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
       return;
     }
     state.temp.schedule = buildWeeklySchedule(selected, time, timezone);
-    state.step = 'confirm';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'confirm', 'confirm');
     state.temp.previousStep = 'choose-pattern';
     await renderCronWizardConfirm(ctx, state);
     return;
@@ -1492,54 +1804,46 @@ async function handleCronWizardInput(ctx, state) {
     };
     const range = ranges[field];
     if (!range) {
-      await ctx.reply('Invalid field.');
+      await renderCronWizardMessage(ctx, state, 'Invalid field.', {
+        reply_markup: buildCronWizardCancelKeyboard(),
+      });
       return;
     }
     const values = parseNumberList(text, range);
     if (!values) {
-      await ctx.reply('Invalid list. Please send comma-separated numbers.');
+      await renderCronWizardMessage(
+        ctx,
+        state,
+        'Invalid list. Please send comma-separated numbers.',
+        { reply_markup: buildCronWizardCancelKeyboard() },
+      );
       return;
     }
     state.temp.schedule[field] = values;
-    state.step = 'advanced-menu';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+    }
+    setCronWizardStep(state, 'schedule', 'advanced-menu');
     await renderCronWizardAdvancedMenu(ctx, state);
     return;
   }
 
   if (inputType === 'timezone') {
     state.temp.schedule.timezone = text;
-    state.step = 'advanced-menu';
+    if (state.draft) {
+      state.draft.schedule = state.temp.schedule;
+      state.draft.timezone = text;
+    }
+    setCronWizardStep(state, 'schedule', 'advanced-menu');
     await renderCronWizardAdvancedMenu(ctx, state);
     return;
   }
 
   if (inputType === 'ask-name') {
     const name = text.toLowerCase() === 'skip' ? null : text;
-    const cronSettings = await getEffectiveCronSettings();
-    const jobName = name || `path-applier:custom:${Date.now()}`;
-    try {
-      const payload = buildCronJobPayload({
-        name: jobName,
-        url: state.temp.url,
-        schedule: state.temp.schedule,
-        timezone: cronSettings.defaultTimezone,
-        enabled: true,
-      });
-      const created = await createJob(payload);
-      clearCronJobsCache();
-      clearUserState(ctx.from.id);
-      await ctx.reply(`Cron job created (id: #${created.id}, title: ${jobName}).`);
-      await renderCronMenu(ctx);
-    } catch (error) {
-      if (await replyCronRateLimitIfNeeded(ctx, error)) {
-        return;
-      }
-      const message =
-        error?.status === 400
-          ? `Cron API rejected schedule: ${error.message}`
-          : `Failed to create cron job: ${error.message}`;
-      await ctx.reply(message);
-    }
+    state.draft.name = name || '';
+    setCronWizardStep(state, 'confirm', 'confirm');
+    await attemptCronWizardCreate(ctx, state);
   }
 }
 
@@ -1646,6 +1950,16 @@ function parseScheduleInput(input) {
     }
     const unit = match[2].startsWith('h') ? 'hour' : 'minute';
     if (unit === 'minute') {
+      if (amount > 60) {
+        if (amount % 60 !== 0) {
+          throw new Error('Minutes over 60 must be divisible by 60.');
+        }
+        const hours = amount / 60;
+        return {
+          cron: `0 */${hours} * * *`,
+          label: `Every ${hours} hour${hours === 1 ? '' : 's'}`,
+        };
+      }
       return {
         cron: `*/${amount} * * * *`,
         label: `Every ${amount} minute${amount === 1 ? '' : 's'}`,
@@ -1655,6 +1969,10 @@ function parseScheduleInput(input) {
       cron: `0 */${amount} * * *`,
       label: `Every ${amount} hour${amount === 1 ? '' : 's'}`,
     };
+  }
+  const validation = validateCronExpression(raw);
+  if (!validation.valid) {
+    throw new Error(validation.message);
   }
   return { cron: raw, label: raw };
 }
@@ -2060,16 +2378,31 @@ async function startCronCreateWizard(ctx, url, backCallback) {
   const state = {
     type: 'cron_wizard',
     mode: 'create',
-    step: 'choose-pattern',
+    step: url ? 'schedule' : 'url',
     backCallback,
+    draft: {
+      url: url || '',
+      schedule,
+      timezone: cronSettings.defaultTimezone,
+      name: '',
+    },
+    lastError: null,
     temp: {
       url,
       schedule,
       pattern: null,
       previousStep: null,
+      inputType: url ? null : 'url',
+      urlNextStep: url ? null : 'choose-pattern',
     },
   };
   setUserState(ctx.from.id, state);
+  if (!url) {
+    await renderCronWizardMessage(ctx, state, 'Send target URL (e.g. keep-alive or deploy hook).', {
+      reply_markup: buildCronWizardCancelKeyboard(),
+    });
+    return;
+  }
   await renderCronWizardPatternMenu(ctx, state);
 }
 
@@ -2078,16 +2411,26 @@ async function startCronEditScheduleWizard(ctx, jobId, backCallback) {
   try {
     job = await fetchCronJob(jobId);
   } catch (error) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'get',
+      error,
+      userId: ctx.from?.id,
+      projectId: null,
+      correlationId,
+    });
     if (
       await renderCronRateLimitIfNeeded(ctx, error, {
         reply_markup: buildBackKeyboard(backCallback || 'cron:list'),
-      })
+      }, correlationId)
     ) {
       return;
     }
-    await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
-      reply_markup: buildBackKeyboard(backCallback || 'cron:list'),
-    });
+    await renderOrEdit(
+      ctx,
+      formatCronApiErrorNotice('Failed to load cron job', error, correlationId),
+      { reply_markup: buildBackKeyboard(backCallback || 'cron:list') },
+    );
     return;
   }
   if (!job) {
@@ -2102,8 +2445,15 @@ async function startCronEditScheduleWizard(ctx, jobId, backCallback) {
   const state = {
     type: 'cron_wizard',
     mode: 'edit',
-    step: 'edit-entry',
+    step: 'schedule',
     backCallback: backCallback || `cron:job:${jobId}`,
+    draft: {
+      url: job.url || '',
+      schedule,
+      timezone: cronSettings.defaultTimezone,
+      name: getCronJobDisplayName(job),
+    },
+    lastError: null,
     temp: {
       schedule,
       jobId,
@@ -2123,9 +2473,12 @@ async function renderCronWizardEditEntry(ctx, state) {
     .text('⚙️ Advanced fields', 'cronwiz:entry:advanced')
     .row()
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, `Current schedule:\n${summary}\n\nChoose how you want to edit:`, {
-    reply_markup: inline,
-  });
+  await renderCronWizardMessage(
+    ctx,
+    state,
+    `Current schedule:\n${summary}\n\nChoose how you want to edit:`,
+    { reply_markup: inline },
+  );
 }
 
 async function renderCronWizardPatternMenu(ctx, state) {
@@ -2139,7 +2492,9 @@ async function renderCronWizardPatternMenu(ctx, state) {
     .text('⚙️ Advanced fields', 'cronwiz:pattern:advanced')
     .row()
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, 'Choose how often this job should run:', { reply_markup: inline });
+  await renderCronWizardMessage(ctx, state, 'Choose how often this job should run:', {
+    reply_markup: inline,
+  });
 }
 
 async function renderCronWizardMinutesMenu(ctx) {
@@ -2154,7 +2509,9 @@ async function renderCronWizardMinutesMenu(ctx) {
     .text('⬅️ Back', 'cronwiz:back:pattern')
     .row()
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, 'Every how many minutes?', { reply_markup: inline });
+  await renderCronWizardMessage(ctx, getUserState(ctx.from.id), 'Every how many minutes?', {
+    reply_markup: inline,
+  });
 }
 
 async function renderCronWizardHoursMenu(ctx) {
@@ -2170,7 +2527,9 @@ async function renderCronWizardHoursMenu(ctx) {
     .row()
     .text('⬅️ Back', 'cronwiz:back:pattern')
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, 'Every how many hours?', { reply_markup: inline });
+  await renderCronWizardMessage(ctx, getUserState(ctx.from.id), 'Every how many hours?', {
+    reply_markup: inline,
+  });
 }
 
 async function renderCronWizardDailyMenu(ctx) {
@@ -2189,7 +2548,9 @@ async function renderCronWizardDailyMenu(ctx) {
     .text('⬅️ Back', 'cronwiz:back:pattern')
     .row()
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, 'Choose a daily run time:', { reply_markup: inline });
+  await renderCronWizardMessage(ctx, getUserState(ctx.from.id), 'Choose a daily run time:', {
+    reply_markup: inline,
+  });
 }
 
 function buildWeeklyDayKeyboard(selectedDays) {
@@ -2209,8 +2570,9 @@ function buildWeeklyDayKeyboard(selectedDays) {
 
 async function renderCronWizardWeeklyDaysMenu(ctx, state) {
   const selectedDays = (state.temp.schedule.wdays || []).filter((day) => day !== -1);
-  await renderOrEdit(
+  await renderCronWizardMessage(
     ctx,
+    state,
     `Select weekdays (${selectedDays.length ? selectedDays.map(getWeekdayLabel).join(', ') : 'none'}):`,
     { reply_markup: buildWeeklyDayKeyboard(selectedDays) },
   );
@@ -2232,7 +2594,9 @@ async function renderCronWizardWeeklyTimeMenu(ctx) {
     .text('⬅️ Back', 'cronwiz:back:weekly_days')
     .row()
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, 'Choose a weekly run time:', { reply_markup: inline });
+  await renderCronWizardMessage(ctx, getUserState(ctx.from.id), 'Choose a weekly run time:', {
+    reply_markup: inline,
+  });
 }
 
 async function renderCronWizardAdvancedMenu(ctx, state) {
@@ -2254,7 +2618,9 @@ async function renderCronWizardAdvancedMenu(ctx, state) {
     .row()
     .text('⬅️ Back', 'cronwiz:advanced:back')
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, `Advanced schedule fields:\n${summary}`, { reply_markup: inline });
+  await renderCronWizardMessage(ctx, state, `Advanced schedule fields:\n${summary}`, {
+    reply_markup: inline,
+  });
 }
 
 function buildAdvancedFieldKeyboard(field) {
@@ -2300,7 +2666,9 @@ function buildAdvancedFieldKeyboard(field) {
 }
 
 async function renderCronWizardAdvancedFieldMenu(ctx, field) {
-  await renderOrEdit(ctx, `Edit ${field}.`, { reply_markup: buildAdvancedFieldKeyboard(field) });
+  await renderCronWizardMessage(ctx, getUserState(ctx.from.id), `Edit ${field}.`, {
+    reply_markup: buildAdvancedFieldKeyboard(field),
+  });
 }
 
 async function renderCronWizardConfirm(ctx, state) {
@@ -2310,7 +2678,92 @@ async function renderCronWizardConfirm(ctx, state) {
     .text('♻️ Adjust', 'cronwiz:confirm:adjust')
     .row()
     .text('❌ Cancel', 'cronwiz:cancel');
-  await renderOrEdit(ctx, `Proposed schedule:\n${summary}`, { reply_markup: inline });
+  const lines = [`Proposed schedule:\n${summary}`];
+  if (state.mode === 'create') {
+    if (state.draft?.url) {
+      lines.push('', `URL: ${state.draft.url}`);
+    }
+  }
+  await renderCronWizardMessage(ctx, state, lines.join('\n'), { reply_markup: inline });
+}
+
+function buildCronWizardDraftSummary(state) {
+  const summary = summarizeSchedule(state?.temp?.schedule);
+  const lines = [`Schedule: ${summary}`];
+  if (state?.draft?.url) {
+    lines.push(`URL: ${state.draft.url}`);
+  }
+  if (state?.draft?.name) {
+    lines.push(`Name: ${state.draft.name}`);
+  }
+  return lines.join('\n');
+}
+
+async function renderCronWizardError(ctx, state, { error, hint, operation }) {
+  const correlationId = buildCronCorrelationId();
+  const isUrlError = isCronUrlValidationError(error);
+  logCronApiError({
+    operation,
+    error,
+    userId: ctx.from?.id,
+    projectId: state?.projectId,
+    correlationId,
+  });
+  state.lastError = {
+    status: error?.status ?? null,
+    message: error?.message ?? 'Cron API error',
+    isUrlError,
+  };
+  const message = formatCronApiErrorMessage({ error, hint, correlationId });
+  const summary = buildCronWizardDraftSummary(state);
+  const text = summary ? `${message}\n\n${summary}` : message;
+  await renderCronWizardMessage(ctx, state, text, {
+    reply_markup: buildCronWizardErrorKeyboard(),
+  });
+}
+
+async function attemptCronWizardCreate(ctx, state) {
+  const cronSettings = await getEffectiveCronSettings();
+  const schedule = state.temp?.schedule;
+  const url = state.draft?.url;
+  if (!schedule || !url) {
+    await renderCronWizardMessage(ctx, state, 'Missing schedule or URL. Please re-enter the URL.', {
+      reply_markup: buildCronWizardCancelKeyboard(),
+    });
+    setCronWizardStep(state, 'url', 'url');
+    state.temp.inputType = 'url';
+    state.temp.urlNextStep = 'choose-pattern';
+    return;
+  }
+  const jobName =
+    state.draft?.name && state.draft.name.trim()
+      ? state.draft.name.trim()
+      : `path-applier:custom:${Date.now()}`;
+  state.draft.name = jobName;
+  try {
+    const payload = buildCronJobPayload({
+      name: jobName,
+      url,
+      schedule,
+      timezone: cronSettings.defaultTimezone,
+      enabled: true,
+    });
+    const created = await createJob(payload);
+    clearCronJobsCache();
+    clearUserState(ctx.from.id);
+    await ctx.reply(`Cron job created (id: #${created.id}, title: ${jobName}).`);
+    await renderCronMenu(ctx);
+  } catch (error) {
+    setCronWizardStep(state, 'confirm', 'confirm');
+    const hint = isCronUrlValidationError(error)
+      ? 'Please re-enter the URL.'
+      : 'Please re-enter the schedule.';
+    await renderCronWizardError(ctx, state, {
+      error,
+      hint,
+      operation: 'create',
+    });
+  }
 }
 
 async function renderCronMenu(ctx) {
@@ -2332,16 +2785,26 @@ async function renderCronMenu(ctx) {
     const response = await fetchCronJobs();
     jobs = response.jobs;
   } catch (error) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'list',
+      error,
+      userId: ctx.from?.id,
+      projectId: null,
+      correlationId,
+    });
     if (
       await renderCronRateLimitIfNeeded(ctx, error, {
         reply_markup: buildBackKeyboard('main:back'),
-      })
+      }, correlationId)
     ) {
       return;
     }
-    await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
-      reply_markup: buildBackKeyboard('main:back'),
-    });
+    await renderOrEdit(
+      ctx,
+      formatCronApiErrorNotice('Failed to list cron jobs', error, correlationId),
+      { reply_markup: buildBackKeyboard('main:back') },
+    );
     return;
   }
 
@@ -2370,16 +2833,26 @@ async function renderCronJobList(ctx) {
     jobs = response.jobs;
     someFailed = response.someFailed;
   } catch (error) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'list',
+      error,
+      userId: ctx.from?.id,
+      projectId: null,
+      correlationId,
+    });
     if (
       await renderCronRateLimitIfNeeded(ctx, error, {
         reply_markup: buildBackKeyboard('cron:menu'),
-      })
+      }, correlationId)
     ) {
       return;
     }
-    await renderOrEdit(ctx, `Failed to list cron jobs: ${error.message}`, {
-      reply_markup: buildBackKeyboard('cron:menu'),
-    });
+    await renderOrEdit(
+      ctx,
+      formatCronApiErrorNotice('Failed to list cron jobs', error, correlationId),
+      { reply_markup: buildBackKeyboard('cron:menu') },
+    );
     return;
   }
   const lines = ['Cron jobs:'];
@@ -2410,16 +2883,26 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
   try {
     job = await fetchCronJob(jobId);
   } catch (error) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'get',
+      error,
+      userId: ctx.from?.id,
+      projectId: null,
+      correlationId,
+    });
     if (
       await renderCronRateLimitIfNeeded(ctx, error, {
         reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu'),
-      })
+      }, correlationId)
     ) {
       return;
     }
-    await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
-      reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu'),
-    });
+    await renderOrEdit(
+      ctx,
+      formatCronApiErrorNotice('Failed to load cron job', error, correlationId),
+      { reply_markup: buildBackKeyboard(options.backCallback || 'cron:menu') },
+    );
     return;
   }
   if (!job) {
@@ -2474,16 +2957,26 @@ async function renderCronJobEditMenu(ctx, jobId) {
   try {
     job = await fetchCronJob(jobId);
   } catch (error) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'get',
+      error,
+      userId: ctx.from?.id,
+      projectId: null,
+      correlationId,
+    });
     if (
       await renderCronRateLimitIfNeeded(ctx, error, {
         reply_markup: buildBackKeyboard('cron:menu'),
-      })
+      }, correlationId)
     ) {
       return;
     }
-    await renderOrEdit(ctx, `Failed to load cron job: ${error.message}`, {
-      reply_markup: buildBackKeyboard('cron:menu'),
-    });
+    await renderOrEdit(
+      ctx,
+      formatCronApiErrorNotice('Failed to load cron job', error, correlationId),
+      { reply_markup: buildBackKeyboard('cron:menu') },
+    );
     return;
   }
 
@@ -2605,7 +3098,12 @@ async function handleCronCreateMessage(ctx, state) {
   }
 
   if (state.type === 'cron_create_url') {
-    await startCronCreateWizard(ctx, text, state.backCallback);
+    const validation = validateCronUrlInput(text);
+    if (!validation.valid) {
+      await ctx.reply(`Invalid URL: ${validation.message}`);
+      return;
+    }
+    await startCronCreateWizard(ctx, validation.url, state.backCallback);
   }
 }
 
@@ -2631,10 +3129,18 @@ async function handleCronEditScheduleMessage(ctx, state) {
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
-    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'update',
+      error,
+      userId: ctx.from?.id,
+      projectId: state.projectId,
+      correlationId,
+    });
+    if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
       return;
     }
-    await ctx.reply(`Failed to update cron job: ${error.message}`);
+    await ctx.reply(formatCronApiErrorNotice('Failed to update cron job', error, correlationId));
   }
 }
 
@@ -2644,19 +3150,32 @@ async function handleCronEditUrlMessage(ctx, state) {
     await ctx.reply('Please send a URL or press Cancel.');
     return;
   }
+  const validation = validateCronUrlInput(text);
+  if (!validation.valid) {
+    await ctx.reply(`Invalid URL: ${validation.message}`);
+    return;
+  }
   try {
     const job = await fetchCronJob(state.jobId);
-    const payload = buildCronJobUpdatePayload(job, { url: text });
+    const payload = buildCronJobUpdatePayload(job, { url: validation.url });
     await updateJob(state.jobId, payload);
     clearCronJobsCache();
     clearUserState(ctx.from.id);
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
-    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'update',
+      error,
+      userId: ctx.from?.id,
+      projectId: state.projectId,
+      correlationId,
+    });
+    if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
       return;
     }
-    await ctx.reply(`Failed to update cron job: ${error.message}`);
+    await ctx.reply(formatCronApiErrorNotice('Failed to update cron job', error, correlationId));
   }
 }
 
@@ -2676,10 +3195,18 @@ async function handleCronEditNameMessage(ctx, state) {
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
-    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'update',
+      error,
+      userId: ctx.from?.id,
+      projectId: state.projectId,
+      correlationId,
+    });
+    if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
       return;
     }
-    await ctx.reply(`Failed to update cron job: ${error.message}`);
+    await ctx.reply(formatCronApiErrorNotice('Failed to update cron job', error, correlationId));
   }
 }
 
@@ -2698,10 +3225,18 @@ async function handleCronEditTimezoneMessage(ctx, state) {
     await ctx.reply('Cron job updated.');
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
-    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'update',
+      error,
+      userId: ctx.from?.id,
+      projectId: state.projectId,
+      correlationId,
+    });
+    if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
       return;
     }
-    await ctx.reply(`Failed to update cron job: ${error.message}`);
+    await ctx.reply(formatCronApiErrorNotice('Failed to update cron job', error, correlationId));
   }
 }
 
@@ -2754,10 +3289,15 @@ async function handleProjectCronScheduleMessage(ctx, state) {
     }
     targetUrl = project.renderDeployHookUrl;
   }
+  const urlValidation = validateCronUrlInput(targetUrl);
+  if (!urlValidation.valid) {
+    await ctx.reply(`Invalid URL: ${urlValidation.message}`);
+    return;
+  }
 
   const payload = buildCronJobPayload({
     name: jobName,
-    url: targetUrl,
+    url: urlValidation.url,
     schedule: schedule.cron,
     timezone: cronSettings.defaultTimezone,
     enabled: true,
@@ -2771,10 +3311,20 @@ async function handleProjectCronScheduleMessage(ctx, state) {
           await deleteJob(oldJobId);
           clearCronJobsCache();
         } catch (error) {
-          if (await replyCronRateLimitIfNeeded(ctx, error)) {
+          const correlationId = buildCronCorrelationId();
+          logCronApiError({
+            operation: 'delete',
+            error,
+            userId: ctx.from?.id,
+            projectId: project.id,
+            correlationId,
+          });
+          if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
             return;
           }
-          console.error('[cron] Failed to delete existing job', error);
+          await ctx.reply(
+            formatCronApiErrorNotice('Failed to delete existing cron job', error, correlationId),
+          );
         }
       }
     }
@@ -2790,10 +3340,18 @@ async function handleProjectCronScheduleMessage(ctx, state) {
     await ctx.reply(`Cron job created. ID: ${created.id}`);
     await renderProjectCronBindings(ctx, project.id);
   } catch (error) {
-    if (await replyCronRateLimitIfNeeded(ctx, error)) {
+    const correlationId = buildCronCorrelationId();
+    logCronApiError({
+      operation: 'create',
+      error,
+      userId: ctx.from?.id,
+      projectId: project.id,
+      correlationId,
+    });
+    if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
       return;
     }
-    await ctx.reply(`Failed to create cron job: ${error.message}`);
+    await ctx.reply(formatCronApiErrorNotice('Failed to create cron job', error, correlationId));
   }
 }
 
@@ -4041,14 +4599,26 @@ async function unlinkProjectCronJob(ctx, projectId, type) {
       await deleteJob(jobId);
       clearCronJobsCache();
     } catch (error) {
+      const correlationId = buildCronCorrelationId();
+      logCronApiError({
+        operation: 'delete',
+        error,
+        userId: ctx.from?.id,
+        projectId,
+        correlationId,
+      });
       if (
         await renderCronRateLimitIfNeeded(ctx, error, {
           reply_markup: buildBackKeyboard(`projcron:menu:${projectId}`),
-        })
+        }, correlationId)
       ) {
         return;
       }
-      console.error('[cron] Failed to delete cron job during unlink', error);
+      await renderOrEdit(
+        ctx,
+        formatCronApiErrorNotice('Failed to delete cron job during unlink', error, correlationId),
+        { reply_markup: buildBackKeyboard(`projcron:menu:${projectId}`) },
+      );
     }
   }
   if (type === 'keepalive') {
@@ -4131,14 +4701,14 @@ async function toggleProjectCronAlertLevel(ctx, projectId, level) {
 }
 
 async function renderDataCenterMenu(ctx) {
-  const view = await buildDataCenterView();
+  const view = await buildDataCenterView(ctx);
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
-async function buildDataCenterView() {
+async function buildDataCenterView(ctx) {
   const connections = await loadSupabaseConnections();
   const cronSettings = await getEffectiveCronSettings();
-  const cronStatus = await getCronStatusLine(cronSettings);
+  const cronStatus = await getCronStatusLine(ctx, cronSettings);
   const lines = [
     '🏭 Data Center',
     `Config DB: ${
@@ -4177,7 +4747,7 @@ async function renderDataCenterMenuForMessage(messageContext) {
   if (!messageContext) {
     return;
   }
-  const view = await buildDataCenterView();
+  const view = await buildDataCenterView(null);
   try {
     await bot.api.editMessageText(
       messageContext.chatId,

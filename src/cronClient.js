@@ -100,11 +100,15 @@ async function callCronApi(method, path, body) {
 }
 
 async function listJobs() {
-  const data = await callCronApi('GET', '/jobs');
-  return {
-    jobs: Array.isArray(data?.jobs) ? data.jobs : [],
-    someFailed: data?.someFailed === true,
-  };
+  try {
+    const data = await callCronApi('GET', '/jobs');
+    return {
+      jobs: Array.isArray(data?.jobs) ? data.jobs : [],
+      someFailed: data?.someFailed === true,
+    };
+  } catch (error) {
+    throw error;
+  }
 }
 
 async function getJob(jobId) {
@@ -120,9 +124,13 @@ async function getJob(jobId) {
 }
 
 async function createJob(payload) {
-  const data = await callCronApi('PUT', '/jobs', payload);
-  const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
-  return { id: id != null ? String(id) : null };
+  try {
+    const data = await callCronApi('PUT', '/jobs', payload);
+    const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
+    return { id: id != null ? String(id) : null };
+  } catch (error) {
+    throw error;
+  }
 }
 
 async function updateJob(jobId, patch) {
