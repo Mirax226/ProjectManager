@@ -56,8 +56,19 @@ async function sendMessage(token, chatId, text) {
   });
 }
 
+function sanitizeTelegramText(text) {
+  if (!text) return '';
+  return String(text).replace(/[\u0000-\u001F\u007F]/g, ' ');
+}
+
+async function sendSafeMessage(token, chatId, text) {
+  return sendMessage(token, chatId, sanitizeTelegramText(text));
+}
+
 module.exports = {
   setWebhook,
   getWebhookInfo,
   sendMessage,
+  sendSafeMessage,
+  sanitizeTelegramText,
 };

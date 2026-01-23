@@ -24,7 +24,12 @@ const {
   updateTelegramWebhook,
   updateTelegramTestStatus,
 } = require('./telegramBotStore');
-const { setWebhook, getWebhookInfo, sendMessage } = require('./telegramApi');
+const {
+  setWebhook,
+  getWebhookInfo,
+  sendMessage,
+  sendSafeMessage,
+} = require('./telegramApi');
 const { listCronJobLinks, getCronJobLink, upsertCronJobLink } = require('./cronJobLinksStore');
 const { QUICK_KEYS, getProjectTypeTemplate, getProjectTypeOptions } = require('./envVaultTemplates');
 const {
@@ -55,6 +60,15 @@ const {
 const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
+const {
+  DEFAULT_SETTINGS: DEFAULT_LOG_ALERT_SETTINGS,
+  getProjectLogSettings,
+  upsertProjectLogSettings,
+  addRecentLog,
+  listRecentLogs,
+  getRecentLogById,
+} = require('./logIngestStore');
+const { createLogIngestService, formatContext } = require('./logIngestService');
 const {
   CRON_API_TOKEN,
   listJobs,
@@ -96,6 +110,18 @@ configureSelfLogger({
   loadSettings: loadGlobalSettings,
 });
 
+const logIngestService = createLogIngestService({
+  getProjectById: async (projectId) => {
+    const projects = await loadProjects();
+    return findProjectById(projects, projectId);
+  },
+  resolveProjectLogSettings: async (project) => getProjectLogSettingsWithDefaults(project.id),
+  addRecentLog,
+  sendTelegramMessage: async (chatId, text) =>
+    bot.api.sendMessage(chatId, text, { disable_web_page_preview: true }),
+  logger: console,
+});
+
 const runtimeStatus = {
   configDbOk: false,
   configDbError: null,
@@ -119,6 +145,24 @@ function getEffectiveProjectLogForwarding(project) {
     levels: levels.length ? levels : ['error'],
     targetChatId: forwarding.targetChatId,
   };
+}
+
+function normalizeProjectLogSettings(settings) {
+  const payload = settings || {};
+  const levels = normalizeLogLevels(payload.levels);
+  return {
+    enabled: typeof payload.enabled === 'boolean' ? payload.enabled : DEFAULT_LOG_ALERT_SETTINGS.enabled,
+    levels: levels.length ? levels : [...DEFAULT_LOG_ALERT_SETTINGS.levels],
+    destinationChatId: payload.destinationChatId ? String(payload.destinationChatId) : null,
+  };
+}
+
+async function getProjectLogSettingsWithDefaults(projectId) {
+  const settings = await getProjectLogSettings(projectId);
+  if (!settings) {
+    return { ...DEFAULT_LOG_ALERT_SETTINGS };
+  }
+  return normalizeProjectLogSettings(settings);
 }
 
 function getEffectiveSelfLogForwarding(settings) {
@@ -750,6 +794,9 @@ async function handleStatefulMessage(ctx, state) {
     case 'project_sql_input':
       await handleProjectSqlInput(ctx, state);
       break;
+    case 'proj_log_chat_input':
+      await handleProjectLogChatInput(ctx, state);
+      break;
     default:
       clearUserState(ctx.from.id);
       break;
@@ -996,6 +1043,8 @@ async function handleProjectLogCallback(ctx, data) {
   const action = parts[1];
   const level = action === 'level' ? parts[2] : null;
   const projectId = action === 'level' ? parts[3] : parts[2];
+  const page = action === 'logs' ? Number(parts[3] || 0) : Number(parts[4] || 0);
+  const logId = action === 'log' ? parts[3] : null;
 
   if (!projectId) {
     await renderOrEdit(ctx, 'Project not found.');
@@ -1008,21 +1057,15 @@ async function handleProjectLogCallback(ctx, data) {
   }
 
   const projects = await loadProjects();
-  const idx = projects.findIndex((project) => project.id === projectId);
-  if (idx === -1) {
+  const project = findProjectById(projects, projectId);
+  if (!project) {
     await renderOrEdit(ctx, 'Project not found.');
     return;
   }
 
-  const project = projects[idx];
-  const current = getEffectiveProjectLogForwarding(project);
+  const current = await getProjectLogSettingsWithDefaults(projectId);
   const updated = {
-    ...project,
-    logForwarding: {
-      enabled: current.enabled,
-      levels: [...current.levels],
-      targetChatId: current.targetChatId,
-    },
+    ...current,
   };
 
   if (action === 'menu') {
@@ -1032,32 +1075,64 @@ async function handleProjectLogCallback(ctx, data) {
 
   if (action === 'toggle') {
     const nextEnabled = !current.enabled;
-    updated.logForwarding.enabled = nextEnabled;
-    if (nextEnabled && !updated.logForwarding.levels.length) {
-      updated.logForwarding.levels = ['error'];
+    updated.enabled = nextEnabled;
+    if (nextEnabled && !updated.levels.length) {
+      updated.levels = ['error'];
     }
   }
 
   if (action === 'level') {
     const normalized = normalizeLogLevel(level);
     if (normalized) {
-      const levels = new Set(updated.logForwarding.levels);
+      const levels = new Set(updated.levels);
       if (levels.has(normalized)) {
         levels.delete(normalized);
       } else {
         levels.add(normalized);
       }
-      updated.logForwarding.levels = Array.from(levels).filter((entry) =>
-        LOG_LEVELS.includes(entry),
-      );
-      if (current.enabled && updated.logForwarding.levels.length === 0) {
-        updated.logForwarding.levels = ['error'];
+      updated.levels = Array.from(levels).filter((entry) => LOG_LEVELS.includes(entry));
+      if (current.enabled && updated.levels.length === 0) {
+        updated.levels = ['error'];
       }
     }
   }
 
-  projects[idx] = updated;
-  await saveProjects(projects);
+  if (action === 'set_chat') {
+    setUserState(ctx.from.id, {
+      type: 'proj_log_chat_input',
+      projectId,
+      messageContext: getMessageTargetFromCtx(ctx),
+    });
+    await ctx.reply('Send destination chat_id for log alerts.\n(Or press Cancel)', {
+      reply_markup: buildCancelKeyboard(),
+    });
+    return;
+  }
+
+  if (action === 'use_chat') {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      await ctx.reply('Unable to detect current chat id.');
+      return;
+    }
+    updated.destinationChatId = String(chatId);
+  }
+
+  if (action === 'clear_chat') {
+    updated.destinationChatId = null;
+  }
+
+  if (action === 'logs') {
+    await renderProjectLogList(ctx, projectId, Number.isNaN(page) ? 0 : page);
+    return;
+  }
+
+  if (action === 'log') {
+    await renderProjectLogDetail(ctx, projectId, logId, Number.isNaN(page) ? 0 : page);
+    return;
+  }
+
+  await upsertProjectLogSettings(projectId, updated);
   await renderProjectLogAlerts(ctx, projectId);
 }
 
@@ -5896,15 +5971,17 @@ async function updateProjectType(ctx, projectId, typeId) {
   await renderProjectSettings(ctx, projectId);
 }
 
-function buildProjectLogAlertsView(project) {
-  const forwarding = getEffectiveProjectLogForwarding(project);
+function buildProjectLogAlertsView(project, settings) {
+  const forwarding = normalizeProjectLogSettings(settings);
   const levelsLabel = forwarding.levels.length ? forwarding.levels.join(' / ') : 'error';
   const selected = new Set(forwarding.levels);
+  const destinationLabel = forwarding.destinationChatId || 'not set';
   const lines = [
     `📣 Log alerts — ${project.name || project.id}`,
     '',
     `Status: ${forwarding.enabled ? 'Enabled' : 'Disabled'}`,
     `Levels: ${levelsLabel}`,
+    `Destination chat: ${destinationLabel}`,
   ];
 
   const inline = new InlineKeyboard()
@@ -5914,6 +5991,13 @@ function buildProjectLogAlertsView(project) {
     .text(`⚠️ Warnings: ${selected.has('warn') ? 'ON' : 'OFF'}`, `projlog:level:warn:${project.id}`)
     .row()
     .text(`ℹ️ Info: ${selected.has('info') ? 'ON' : 'OFF'}`, `projlog:level:info:${project.id}`)
+    .row()
+    .text('✏️ Set chat_id', `projlog:set_chat:${project.id}`)
+    .text('📌 Use this chat', `projlog:use_chat:${project.id}`)
+    .row()
+    .text('🧹 Clear chat_id', `projlog:clear_chat:${project.id}`)
+    .row()
+    .text('🧾 Show last 50 logs', `projlog:logs:${project.id}:0`)
     .row()
     .text('⬅️ Back', `projlog:back:${project.id}`);
 
@@ -5927,8 +6011,134 @@ async function renderProjectLogAlerts(ctx, projectId) {
     await renderOrEdit(ctx, 'Project not found.');
     return;
   }
-  const view = buildProjectLogAlertsView(project);
+  const settings = await getProjectLogSettingsWithDefaults(projectId);
+  const view = buildProjectLogAlertsView(project, settings);
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+function formatLogTimestamp(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toISOString();
+}
+
+function buildProjectLogListView(project, logs, page, hasNext) {
+  const lines = [`🧾 Last logs — ${project.name || project.id}`, `Page: ${page + 1}`];
+  if (!logs.length) {
+    lines.push('', 'No logs stored yet.');
+  } else {
+    lines.push('');
+    logs.forEach((log) => {
+      const timestamp = formatLogTimestamp(log.timestamp || log.createdAt);
+      const levelLabel = log.level ? log.level.toUpperCase() : 'UNKNOWN';
+      const message = truncateText(log.message, 120);
+      lines.push(`• ${timestamp} — ${levelLabel} — ${log.service}: ${message}`);
+    });
+  }
+
+  const inline = new InlineKeyboard();
+  logs.forEach((log) => {
+    const label = `${(log.level || 'log').toUpperCase()} ${truncateText(log.message, 24)}`;
+    inline.text(label, `projlog:log:${project.id}:${log.id}:${page}`).row();
+  });
+
+  if (page > 0) {
+    inline.text('⬅️ Prev', `projlog:logs:${project.id}:${page - 1}`);
+  }
+  if (hasNext) {
+    inline.text('➡️ Next', `projlog:logs:${project.id}:${page + 1}`);
+  }
+  if (page > 0 || hasNext) {
+    inline.row();
+  }
+  inline.text('⬅️ Back', `projlog:menu:${project.id}`);
+
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectLogList(ctx, projectId, page) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const safePage = Math.max(0, Number.isFinite(page) ? page : 0);
+  const offset = safePage * 10;
+  const logs = await listRecentLogs(projectId, 11, offset);
+  const pageLogs = logs.slice(0, 10);
+  const hasNext = logs.length > 10;
+  const view = buildProjectLogListView(project, pageLogs, safePage, hasNext);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+function buildProjectLogDetailView(project, logEntry, page) {
+  const timestamp = formatLogTimestamp(logEntry.timestamp || logEntry.createdAt);
+  const lines = [
+    `🧾 Log details — ${project.name || project.id}`,
+    '',
+    `Level: ${(logEntry.level || 'unknown').toUpperCase()}`,
+    `Service: ${logEntry.service || '-'}`,
+    `Env: ${logEntry.env || '-'}`,
+    `Time: ${timestamp}`,
+    `Message: ${truncateText(logEntry.message, 1000) || '(no message)'}`,
+  ];
+
+  if (logEntry.stack) {
+    lines.push(`Stack: ${truncateText(logEntry.stack, 3000)}`);
+  }
+
+  const contextText = formatContext(logEntry.context, 1500);
+  if (contextText) {
+    lines.push(`Context: ${contextText}`);
+  }
+
+  const inline = new InlineKeyboard()
+    .text('⬅️ Back to logs', `projlog:logs:${project.id}:${page}`)
+    .row()
+    .text('⬅️ Back to alerts', `projlog:menu:${project.id}`);
+
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectLogDetail(ctx, projectId, logId, page) {
+  if (!logId) {
+    await renderProjectLogList(ctx, projectId, page);
+    return;
+  }
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const logEntry = await getRecentLogById(projectId, logId);
+  if (!logEntry) {
+    await renderProjectLogList(ctx, projectId, page);
+    return;
+  }
+  const view = buildProjectLogDetailView(project, logEntry, page);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function handleProjectLogChatInput(ctx, state) {
+  const value = ctx.message?.text?.trim();
+  if (!value) {
+    await ctx.reply('Please provide a chat_id value.', { reply_markup: buildCancelKeyboard() });
+    return;
+  }
+  if (!/^-?\\d+$/.test(value)) {
+    await ctx.reply('Invalid chat_id format. Please send a numeric chat_id.', {
+      reply_markup: buildCancelKeyboard(),
+    });
+    return;
+  }
+  const settings = await getProjectLogSettingsWithDefaults(state.projectId);
+  settings.destinationChatId = value;
+  await upsertProjectLogSettings(state.projectId, settings);
+  clearUserState(ctx.from.id);
+  await renderProjectLogAlerts(ctx, state.projectId);
 }
 
 async function renderProjectSettingsForMessage(messageContext, projectId) {
@@ -6994,6 +7204,49 @@ function startHttpServer() {
           return;
         }
 
+        if (req.method === 'POST' && url.pathname === '/ingest/logs') {
+          const expectedKey =
+            process.env.LOG_INGEST_KEY || process.env.PATH_APPLIER_LOG_INGEST_KEY;
+          if (!expectedKey) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'LOG_INGEST_KEY is not configured.' }));
+            return;
+          }
+
+          const providedKey = url.searchParams.get('key');
+          if (!providedKey || providedKey !== expectedKey) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Invalid key.' }));
+            return;
+          }
+
+          let payload;
+          try {
+            const rawBody = await readRequestBody(req);
+            payload = rawBody ? JSON.parse(rawBody) : null;
+          } catch (error) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+            return;
+          }
+
+          try {
+            const result = await logIngestService.ingestLog(payload);
+            if (!result.ok) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: result.error || 'Invalid payload.' }));
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+          } catch (error) {
+            console.error('[log-ingest] failed to handle request', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'internal error' }));
+          }
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname.startsWith('/project-log/')) {
           try {
             const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
@@ -7007,7 +7260,7 @@ function startHttpServer() {
 
             const rawBody = await readRequestBody(req);
             const event = parseProjectLogPayload(rawBody);
-            const forwarding = getEffectiveProjectLogForwarding(project);
+            const forwarding = await getProjectLogSettingsWithDefaults(projectId);
 
             if (forwarding.enabled !== true) {
               res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -7028,11 +7281,14 @@ function startHttpServer() {
               return;
             }
 
-            const targetChatId = forwarding.targetChatId || ADMIN_TELEGRAM_ID;
+            const targetChatId = forwarding.destinationChatId;
+            if (!targetChatId) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'no destination' }));
+              return;
+            }
             const message = formatProjectLogMessage(project, event);
-            await bot.api.sendMessage(targetChatId, message, {
-              disable_web_page_preview: true,
-            });
+            await sendSafeMessage(BOT_TOKEN, targetChatId, message);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, forwarded: true }));
           } catch (error) {
