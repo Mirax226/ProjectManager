@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const http = require('http');
 const https = require('https');
+const fs = require('fs/promises');
 const { Bot, InlineKeyboard, Keyboard } = require('grammy');
 const { Pool } = require('pg');
 
@@ -24,6 +25,7 @@ const {
   updateTelegramWebhook,
   updateTelegramTestStatus,
 } = require('./telegramBotStore');
+const { getMasterKeyStatus, MASTER_KEY_ERROR_MESSAGE } = require('./envVaultCrypto');
 const {
   setWebhook,
   getWebhookInfo,
@@ -46,7 +48,7 @@ const {
   makePatchBranchName,
   slugifyProjectId,
 } = require('./gitUtils');
-const { createPullRequest, measureGithubLatency } = require('./githubUtils');
+const { createPullRequest } = require('./githubUtils');
 const {
   loadGlobalSettings,
   saveGlobalSettings,
@@ -60,6 +62,7 @@ const {
 const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
+const { listSelfLogs, getSelfLogById } = require('./loggerStore');
 const {
   DEFAULT_SETTINGS: DEFAULT_LOG_ALERT_SETTINGS,
   getProjectLogSettings,
@@ -78,6 +81,7 @@ const {
   toggleJob,
   deleteJob,
 } = require('./src/cronClient');
+const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbackData');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
@@ -190,16 +194,66 @@ async function getEffectiveCronSettings() {
   return settings || { enabled: true, defaultTimezone: 'UTC' };
 }
 
+function normalizeTelegramExtra(extra) {
+  if (!extra) return extra;
+  const payload = { ...extra };
+  if (payload.reply_markup?.inline_keyboard) {
+    sanitizeReplyMarkup(payload.reply_markup);
+  }
+  return payload;
+}
+
+function isButtonDataInvalidError(error) {
+  const message = error?.description || error?.response?.description || error?.message || '';
+  return message.includes('BUTTON_DATA_INVALID');
+}
+
+async function handleTelegramUiError(ctx, error, fallbackText) {
+  if (!isButtonDataInvalidError(error)) {
+    throw error;
+  }
+  console.error('[UI] BUTTON_DATA_INVALID', {
+    message: error?.description || error?.message,
+  });
+  if (ctx?.reply) {
+    await ctx.reply(
+      fallbackText ||
+        'UI render error: invalid button payload. Please /start and try again.',
+    );
+  }
+}
+
 async function renderOrEdit(ctx, text, extra) {
+  const safeExtra = normalizeTelegramExtra(extra);
   if (ctx.callbackQuery) {
     try {
-      return await ctx.editMessageText(text, extra);
+      return await ctx.editMessageText(text, safeExtra);
     } catch (err) {
+      if (isButtonDataInvalidError(err)) {
+        await handleTelegramUiError(ctx, err);
+        return;
+      }
       console.error('[UI] editMessageText failed, fallback to reply', err);
-      return ctx.reply(text, extra);
+      try {
+        return await ctx.reply(text, safeExtra);
+      } catch (replyError) {
+        if (isButtonDataInvalidError(replyError)) {
+          await handleTelegramUiError(ctx, replyError);
+          return;
+        }
+        throw replyError;
+      }
     }
   }
-  return ctx.reply(text, extra);
+  try {
+    return await ctx.reply(text, safeExtra);
+  } catch (err) {
+    if (isButtonDataInvalidError(err)) {
+      await handleTelegramUiError(ctx, err);
+      return;
+    }
+    throw err;
+  }
 }
 
 function buildCronCorrelationId() {
@@ -316,6 +370,119 @@ function normalizeEnvKeyInput(value) {
   return String(value || '').trim().toUpperCase().replace(/\s+/g, '_');
 }
 
+function detectProjectType(project) {
+  const tags = Array.isArray(project?.tags) ? project.tags.map((tag) => String(tag).toLowerCase()) : [];
+  const haystack = [
+    project?.repoSlug,
+    project?.repoUrl,
+    project?.name,
+    project?.id,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  const matchTag = (value) => tags.includes(value);
+  if (matchTag('node-bot') || matchTag('bot') || /bot/.test(haystack)) {
+    return 'node-bot';
+  }
+  if (matchTag('node-api') || matchTag('api') || /api/.test(haystack)) {
+    return 'node-api';
+  }
+  if (matchTag('python') || /python|py/.test(haystack)) {
+    return 'python';
+  }
+  if (matchTag('node') || /node/.test(haystack)) {
+    return 'node-api';
+  }
+  return 'generic';
+}
+
+function resolveProjectType(project) {
+  const explicit = project?.projectType || project?.project_type;
+  if (explicit && explicit !== 'other') {
+    return explicit;
+  }
+  return detectProjectType(project);
+}
+
+function parseEnvVaultImportText(text) {
+  const lines = text.split(/\r?\n/);
+  const entries = [];
+  const skipped = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const rawLine = lines[index];
+    const trimmed = rawLine.trim();
+    index += 1;
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+    const normalizedLine = trimmed.replace(/^export\s+/, '');
+    const eqIndex = normalizedLine.indexOf('=');
+    if (eqIndex === -1) {
+      skipped.push({ line: trimmed, reason: 'invalid_format' });
+      continue;
+    }
+    const rawKey = normalizedLine.slice(0, eqIndex).trim();
+    if (!rawKey) {
+      skipped.push({ line: trimmed, reason: 'missing_key' });
+      continue;
+    }
+    let value = normalizedLine.slice(eqIndex + 1);
+    if (value == null) {
+      skipped.push({ line: trimmed, reason: 'missing_value' });
+      continue;
+    }
+
+    const trimmedValue = value.trimStart();
+    const tripleQuote = trimmedValue.startsWith('"""')
+      ? '"""'
+      : trimmedValue.startsWith("'''")
+        ? "'''"
+        : null;
+
+    if (tripleQuote) {
+      let chunk = trimmedValue.slice(3);
+      const collected = [];
+      let closed = false;
+      while (true) {
+        const closeIndex = chunk.indexOf(tripleQuote);
+        if (closeIndex !== -1) {
+          collected.push(chunk.slice(0, closeIndex));
+          closed = true;
+          break;
+        }
+        collected.push(chunk);
+        if (index >= lines.length) {
+          break;
+        }
+        chunk = lines[index];
+        index += 1;
+      }
+      if (!closed) {
+        skipped.push({ line: trimmed, reason: 'unterminated_triple_quote' });
+        continue;
+      }
+      value = collected.join('\n');
+    } else {
+      value = value.trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+    }
+
+    value = value.replace(/\\n/g, '\n');
+    entries.push({ key: normalizeEnvKeyInput(rawKey), value });
+  }
+
+  return { entries, skipped };
+}
+
 function isSupabaseUrl(value) {
   return typeof value === 'string' && value.startsWith('https://') && value.includes('.supabase.co');
 }
@@ -339,7 +506,7 @@ function validateEnvValue(key, value) {
 }
 
 function getProjectTypeLabel(project) {
-  const type = project?.projectType || project?.project_type || 'other';
+  const type = resolveProjectType(project);
   const option = getProjectTypeOptions().find((entry) => entry.id === type);
   return option ? option.label : type;
 }
@@ -352,6 +519,7 @@ async function renderCronWizardMessage(ctx, state, text, extra) {
     };
   }
   const messageContext = state?.messageContext;
+  const safeExtra = normalizeTelegramExtra(extra);
   if (messageContext?.chatId && messageContext?.messageId) {
     try {
       await ctx.telegram.editMessageText(
@@ -359,17 +527,45 @@ async function renderCronWizardMessage(ctx, state, text, extra) {
         messageContext.messageId,
         undefined,
         text,
-        extra,
+        safeExtra,
       );
       return;
     } catch (error) {
+      if (isButtonDataInvalidError(error)) {
+        await handleTelegramUiError(ctx, error);
+        return;
+      }
       console.error('[UI] editMessageText failed, fallback to reply', error);
     }
   }
-  const message = await renderOrEdit(ctx, text, extra);
+  const message = await renderOrEdit(ctx, text, safeExtra);
   if (message?.chat?.id && message?.message_id && state) {
     state.messageContext = { chatId: message.chat.id, messageId: message.message_id };
   }
+}
+
+async function renderStateMessage(ctx, state, text, extra) {
+  const safeExtra = normalizeTelegramExtra(extra);
+  const messageContext = state?.messageContext;
+  if (messageContext?.chatId && messageContext?.messageId) {
+    try {
+      await ctx.telegram.editMessageText(
+        messageContext.chatId,
+        messageContext.messageId,
+        undefined,
+        text,
+        safeExtra,
+      );
+      return;
+    } catch (error) {
+      if (isButtonDataInvalidError(error)) {
+        await handleTelegramUiError(ctx, error);
+        return;
+      }
+      console.error('[UI] editMessageText failed, fallback to reply', error);
+    }
+  }
+  await renderOrEdit(ctx, text, safeExtra);
 }
 
 function setCronWizardStep(state, wizardStep, flowStep) {
@@ -672,7 +868,12 @@ bot.callbackQuery('patch:finish', async (ctx) => {
 });
 
 bot.on('callback_query:data', async (ctx) => {
-  const data = ctx.callbackQuery.data;
+  const resolved = await resolveCallbackData(ctx.callbackQuery.data);
+  if (resolved.expired || !resolved.data) {
+    await ctx.answerCallbackQuery({ text: 'Expired, please reopen the menu.', show_alert: true });
+    return;
+  }
+  const data = resolved.data;
   if (data.startsWith('main:')) {
     await handleMainCallback(ctx, data);
     return;
@@ -876,7 +1077,7 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'apply_patch':
       startPatchSession(ctx.from.id, projectId);
-      await ctx.reply(
+      await renderOrEdit(
         'Send the git patch as text (you can use multiple messages)\n' +
           'or attach a .patch / .diff file.\n' +
           'When you are done, press ‘✅ Patch completed’.\n' +
@@ -901,7 +1102,7 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the new project name.\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send the new project name.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -911,7 +1112,7 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply(
+      await renderOrEdit(
         'Send new GitHub repo as owner/repo (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
@@ -922,7 +1123,7 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply(
+      await renderOrEdit(
         'Send new working directory path. Or send "-" to reset to default based on repo.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
@@ -933,7 +1134,7 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply(
+      await renderOrEdit(
         'Send the env key that contains the GitHub token (for example: GITHUB_TOKEN_DS). Or send "-" to use the default GITHUB_TOKEN.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
@@ -944,7 +1145,7 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the new base branch.\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send the new base branch.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -964,7 +1165,7 @@ async function handleProjectCallback(ctx, data) {
         field: extra,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply(`Send new value for ${extra}.\n(Or press Cancel)`, {
+      await renderOrEdit(ctx, `Send new value for ${extra}.\n(Or press Cancel)`, {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -994,7 +1195,7 @@ async function handleProjectCallback(ctx, data) {
         field: extra,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply(`Send new value for ${extra}.\n(Or press Cancel)`, {
+      await renderOrEdit(ctx, `Send new value for ${extra}.\n(Or press Cancel)`, {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -1011,7 +1212,7 @@ async function handleProjectCallback(ctx, data) {
         projectId,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send new supabaseConnectionId.\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send new supabaseConnectionId.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -1103,7 +1304,7 @@ async function handleProjectLogCallback(ctx, data) {
       projectId,
       messageContext: getMessageTargetFromCtx(ctx),
     });
-    await ctx.reply('Send destination chat_id for log alerts.\n(Or press Cancel)', {
+    await renderOrEdit(ctx, 'Send destination chat_id for log alerts.\n(Or press Cancel)', {
       reply_markup: buildCancelKeyboard(),
     });
     return;
@@ -1192,9 +1393,23 @@ async function handleGlobalSettingsCallback(ctx, data) {
       await renderSelfLogAlerts(ctx);
       break;
     }
+    case 'bot_logs': {
+      const page = Number(parts[2]) || 0;
+      await renderSelfLogList(ctx, page);
+      break;
+    }
+    case 'bot_log': {
+      const logId = parts[2];
+      const page = Number(parts[3]) || 0;
+      await renderSelfLogDetail(ctx, logId, page);
+      break;
+    }
     case 'change_default_base':
-      setUserState(ctx.from.id, { type: 'global_change_base' });
-      await ctx.reply('Send new default base branch.\n(Or press Cancel)', {
+      setUserState(ctx.from.id, {
+        type: 'global_change_base',
+        messageContext: getMessageTargetFromCtx(ctx),
+      });
+      await renderOrEdit(ctx, 'Send new default base branch.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -1203,13 +1418,11 @@ async function handleGlobalSettingsCallback(ctx, data) {
       break;
     case 'clear_default_base':
       await clearDefaultBaseBranch();
-      await renderOrEdit(ctx, 'Default base branch cleared (using environment default).');
-      await renderGlobalSettings(ctx);
+      await renderGlobalSettings(ctx, '✅ Default base branch cleared (using environment default).');
       break;
     case 'clear_default_project':
       await clearDefaultProject();
-      await renderOrEdit(ctx, 'Default project cleared.');
-      await renderGlobalSettings(ctx);
+      await renderGlobalSettings(ctx, '✅ Default project cleared.');
       break;
     case 'menu':
       await renderGlobalSettings(ctx);
@@ -1232,7 +1445,7 @@ async function handleSupabaseCallback(ctx, data) {
         type: 'supabase_add',
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the connection as: id, name, envKey\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send the connection as: id, name, envKey\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -2116,8 +2329,9 @@ async function handleEnvVaultCallback(ctx, data) {
     return;
   }
 
-  if (!process.env.ENV_VAULT_MASTER_KEY) {
-    await renderOrEdit(ctx, 'Env Vault is unavailable (ENV_VAULT_MASTER_KEY missing).', {
+  const envStatus = getMasterKeyStatus();
+  if (!envStatus.ok) {
+    await renderOrEdit(ctx, buildEnvVaultUnavailableMessage(), {
       reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
     });
     return;
@@ -2144,8 +2358,9 @@ async function handleEnvVaultCallback(ctx, data) {
         type: 'env_vault_custom_key',
         projectId,
         backCallback: `envvault:menu:${projectId}`,
+        messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the ENV key name.\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send the ENV key name.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -2166,8 +2381,9 @@ async function handleEnvVaultCallback(ctx, data) {
         type: 'env_vault_import',
         projectId,
         backCallback: `envvault:menu:${projectId}`,
+        messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send KEY=VALUE lines (multi-line). Values will be encrypted.\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send KEY=VALUE lines (multi-line). Values will be encrypted.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -2221,21 +2437,22 @@ async function handleCronLinkCallback(ctx, data) {
       await renderCronLinkMenu(ctx);
       break;
     case 'select':
-      await renderCronLinkProjectPicker(ctx, jobId);
+      await renderCronLinkProjectPicker(ctx, jobId, getMessageTargetFromCtx(ctx));
       break;
     case 'set':
-      await updateCronJobLink(ctx, jobId, extra);
+      await updateCronJobLink(ctx, jobId, extra, getMessageTargetFromCtx(ctx));
       break;
     case 'set_other':
-      await updateCronJobLink(ctx, jobId, null);
+      await updateCronJobLink(ctx, jobId, null, getMessageTargetFromCtx(ctx));
       break;
     case 'label':
       setUserState(ctx.from.id, {
         type: 'cron_link_label',
         jobId,
         backCallback: `cronlink:select:${jobId}`,
+        messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send a custom label for this cron job.\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send a custom label for this cron job.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -2264,8 +2481,9 @@ async function handleTelegramBotCallback(ctx, data) {
     return;
   }
 
-  if (!process.env.ENV_VAULT_MASTER_KEY) {
-    await renderOrEdit(ctx, 'Telegram setup unavailable (ENV_VAULT_MASTER_KEY missing).', {
+  const envStatus = getMasterKeyStatus();
+  if (!envStatus.ok) {
+    await renderOrEdit(ctx, buildEnvVaultUnavailableMessage('Telegram setup unavailable.'), {
       reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
     });
     return;
@@ -2280,8 +2498,9 @@ async function handleTelegramBotCallback(ctx, data) {
         type: 'telegram_token_input',
         projectId,
         backCallback: `tgbot:menu:${projectId}`,
+        messageContext: getMessageTargetFromCtx(ctx),
       });
-      await ctx.reply('Send the Telegram bot token.\n(Or press Cancel)', {
+      await renderOrEdit(ctx, 'Send the Telegram bot token.\n(Or press Cancel)', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -2360,7 +2579,7 @@ async function renderEnvVaultKeyList(ctx, projectId) {
 }
 
 function findEnvKeyInfo(project, key) {
-  const template = getProjectTypeTemplate(project.projectType || project.project_type || 'other');
+  const template = getProjectTypeTemplate(resolveProjectType(project));
   const entries = [...(template?.required || []), ...(template?.optional || [])];
   return entries.find((entry) => entry.key === key) || null;
 }
@@ -2458,6 +2677,7 @@ async function renderEnvVaultQuickKeyMenu(ctx, projectId) {
 
 async function promptEnvVaultValue(ctx, projectId, key, options = {}) {
   const envSetId = await ensureProjectEnvSet(projectId);
+  const messageContext = options.messageContext || getMessageTargetFromCtx(ctx);
   const state = {
     type: 'env_vault_value',
     projectId,
@@ -2471,6 +2691,7 @@ async function promptEnvVaultValue(ctx, projectId, key, options = {}) {
     skipped: [],
     existing: [],
     backCallback: `envvault:menu:${projectId}`,
+    messageContext,
   };
   await promptNextEnvVaultKey(ctx, state);
 }
@@ -2490,7 +2711,7 @@ async function promptNextEnvVaultKey(ctx, state) {
     if (state.allowSkip) {
       inline.text('⏭ Skip this key', 'envvault:skip:' + state.projectId);
     }
-    await ctx.reply(`Send value for ${nextKey} (masked). Or Cancel.`, {
+    await renderStateMessage(ctx, state, `Send value for ${nextKey} (masked). Or Cancel.`, {
       reply_markup: inline,
     });
     return;
@@ -2502,6 +2723,7 @@ async function finishEnvVaultSequence(ctx, state) {
   const keys = await listEnvVarKeys(state.projectId, state.envSetId);
   const missingRequired = (state.requiredKeys || []).filter((key) => !keys.includes(key));
   const lines = [
+    '✅ Updated',
     'Env Vault update complete.',
     `Added: ${state.added.length}`,
     `Skipped: ${state.skipped.length}`,
@@ -2510,7 +2732,7 @@ async function finishEnvVaultSequence(ctx, state) {
     lines.push(`Missing required: ${missingRequired.join(', ')}`);
   }
   clearUserState(ctx.from.id);
-  await renderOrEdit(ctx, lines.join('\n'), {
+  await renderStateMessage(ctx, state, lines.join('\n'), {
     reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
   });
 }
@@ -2523,13 +2745,13 @@ async function handleEnvVaultCustomKeyInput(ctx, state) {
   }
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.', {
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
       reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
     });
     return;
   }
   const key = normalizeEnvKeyInput(text);
-  await promptEnvVaultValue(ctx, state.projectId, key);
+  await promptEnvVaultValue(ctx, state.projectId, key, { messageContext: state.messageContext });
 }
 
 async function handleEnvVaultValueInput(ctx, state) {
@@ -2540,7 +2762,7 @@ async function handleEnvVaultValueInput(ctx, state) {
   }
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.', {
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
       reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
     });
     return;
@@ -2586,39 +2808,45 @@ async function handleEnvVaultImportInput(ctx, state) {
   }
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.', {
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
       reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
     });
     return;
   }
   const envSetId = await ensureProjectEnvSet(state.projectId);
-  const lines = text.split('\n');
+  const { entries, skipped } = parseEnvVaultImportText(text);
   let added = 0;
-  let skipped = 0;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const [rawKey, ...rest] = trimmed.split('=');
-    if (!rawKey || !rest.length) {
-      skipped += 1;
-      continue;
-    }
-    const key = normalizeEnvKeyInput(rawKey);
-    const value = rest.join('=').trim();
-    const validation = validateEnvValue(key, value);
+  const skippedReasons = {};
+
+  for (const entry of skipped) {
+    skippedReasons[entry.reason] = (skippedReasons[entry.reason] || 0) + 1;
+  }
+
+  for (const entry of entries) {
+    const validation = validateEnvValue(entry.key, entry.value);
     if (!validation.valid) {
-      skipped += 1;
+      skippedReasons.invalid_value = (skippedReasons.invalid_value || 0) + 1;
       continue;
     }
     try {
-      await upsertEnvVar(state.projectId, key, value, envSetId);
+      await upsertEnvVar(state.projectId, entry.key, entry.value, envSetId);
       added += 1;
     } catch (error) {
-      skipped += 1;
+      skippedReasons.save_failed = (skippedReasons.save_failed || 0) + 1;
     }
   }
+  const skippedTotal = Object.values(skippedReasons).reduce((sum, count) => sum + count, 0);
+  const skippedDetails = Object.entries(skippedReasons)
+    .map(([reason, count]) => `${reason}: ${count}`)
+    .join(', ');
   clearUserState(ctx.from.id);
-  await renderOrEdit(ctx, `Import complete. Added: ${added}. Skipped: ${skipped}.`, {
+  const summaryLines = [
+    'Import complete.',
+    `Stored: ${added}`,
+    `Skipped: ${skippedTotal}`,
+    skippedDetails ? `Skipped details: ${skippedDetails}` : null,
+  ].filter(Boolean);
+  await renderStateMessage(ctx, state, summaryLines.join('\n'), {
     reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
   });
 }
@@ -2627,7 +2855,7 @@ async function renderEnvVaultProjectTypeMenu(ctx, projectId) {
   const project = await getProjectById(projectId, ctx);
   if (!project) return;
   const options = getProjectTypeOptions();
-  const current = project.projectType || project.project_type || 'other';
+  const current = resolveProjectType(project);
   const inline = new InlineKeyboard();
   options.forEach((option) => {
     const label = option.id === current ? `✅ ${option.label}` : option.label;
@@ -2639,6 +2867,12 @@ async function renderEnvVaultProjectTypeMenu(ctx, projectId) {
 
 async function renderEnvVaultRecommendedOptions(ctx, projectId, typeId) {
   const template = getProjectTypeTemplate(typeId);
+  if (!template || template.id === 'other') {
+    await renderOrEdit(ctx, 'No template for this project type. Set project type to enable recommended keys.', {
+      reply_markup: buildBackKeyboard(`envvault:recommend:${projectId}`),
+    });
+    return;
+  }
   const requiredCount = template?.required?.length || 0;
   const optionalCount = template?.optional?.length || 0;
   const inline = new InlineKeyboard()
@@ -2655,11 +2889,11 @@ async function renderEnvVaultRecommendedOptions(ctx, projectId, typeId) {
 async function startEnvVaultRecommendedSequence(ctx, projectId, typeId, mode) {
   const project = await getProjectById(projectId, ctx);
   if (!project) return;
-  const resolvedType = typeId || project.projectType || project.project_type || 'other';
+  const resolvedType = typeId || resolveProjectType(project);
   const template = getProjectTypeTemplate(resolvedType);
   const keys = mode === 'optional' ? template.optional || [] : template.required || [];
   if (!keys.length) {
-    await renderOrEdit(ctx, 'No recommended keys for this project type.', {
+    await renderOrEdit(ctx, 'No template for this project type. Set project type to enable recommended keys.', {
       reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
     });
     return;
@@ -2670,6 +2904,7 @@ async function startEnvVaultRecommendedSequence(ctx, projectId, typeId, mode) {
     allowSkip: true,
     skipExisting: true,
     requiredKeys: (template.required || []).map((entry) => entry.key),
+    messageContext: getMessageTargetFromCtx(ctx),
   });
 }
 
@@ -2744,36 +2979,60 @@ function buildProjectWebhookUrl(project, webhookPath) {
   return new URL(webhookPath, project.renderServiceUrl).toString();
 }
 
-async function renderTelegramSetupMenu(ctx, projectId) {
-  const project = await getProjectById(projectId, ctx);
-  if (!project) return;
-  const record = await getProjectTelegramBot(projectId);
+function buildTelegramSetupView(project, record, notice) {
   const tokenStatus = record?.botTokenEnc ? 'set' : 'not set';
   const lines = [
     `🤖 Telegram Setup — ${project.name || project.id}`,
+    notice || null,
     `Token: ${tokenStatus}`,
     `Webhook: ${record?.webhookUrl || '-'}`,
     `Last set: ${record?.lastSetAt || '-'}`,
     `Last test: ${record?.lastTestAt || '-'} ${record?.lastTestStatus ? `(${record.lastTestStatus})` : ''}`,
     `Enabled: ${record?.enabled ? 'yes' : 'no'}`,
-  ];
+  ].filter(Boolean);
 
   const inline = new InlineKeyboard()
-    .text(record?.botTokenEnc ? '🔑 Update bot token' : '🔑 Set bot token', `tgbot:set_token:${projectId}`)
+    .text(record?.botTokenEnc ? '🔑 Update bot token' : '🔑 Set bot token', `tgbot:set_token:${project.id}`)
     .row()
-    .text('🔗 Set webhook', `tgbot:set_webhook:${projectId}`)
+    .text('🔗 Set webhook', `tgbot:set_webhook:${project.id}`)
     .row()
-    .text('🧪 Run test', `tgbot:test:${projectId}`)
+    .text('🧪 Run test', `tgbot:test:${project.id}`)
     .row()
-    .text('🧾 Status', `tgbot:status:${projectId}`)
+    .text('🧾 Status', `tgbot:status:${project.id}`)
     .row();
 
   if (record?.botTokenEnc) {
-    inline.text('🧹 Clear token', `tgbot:clear_token:${projectId}`).row();
+    inline.text('🧹 Clear token', `tgbot:clear_token:${project.id}`).row();
   }
-  inline.text('⬅️ Back', `proj:open:${projectId}`);
+  inline.text('⬅️ Back', `proj:open:${project.id}`);
 
-  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderTelegramSetupMenu(ctx, projectId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const record = await getProjectTelegramBot(projectId);
+  const view = buildTelegramSetupView(project, record, notice);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function renderTelegramSetupMenuForMessage(messageContext, projectId, notice) {
+  if (!messageContext) return;
+  const project = await getProjectById(projectId);
+  if (!project) return;
+  const record = await getProjectTelegramBot(projectId);
+  const view = buildTelegramSetupView(project, record, notice);
+  try {
+    await bot.api.editMessageText(
+      messageContext.chatId,
+      messageContext.messageId,
+      view.text,
+      normalizeTelegramExtra({ reply_markup: view.keyboard }),
+    );
+  } catch (error) {
+    console.error('[UI] Failed to update telegram setup message', error);
+  }
 }
 
 async function handleTelegramTokenInput(ctx, state) {
@@ -2784,14 +3043,17 @@ async function handleTelegramTokenInput(ctx, state) {
   }
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.', {
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
       reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
     });
     return;
   }
   await upsertTelegramBotToken(state.projectId, text);
   clearUserState(ctx.from.id);
-  await renderTelegramSetupMenu(ctx, state.projectId);
+  await renderTelegramSetupMenuForMessage(state.messageContext, state.projectId, '✅ Updated');
+  if (!state.messageContext) {
+    await renderTelegramSetupMenu(ctx, state.projectId, '✅ Updated');
+  }
 }
 
 async function setProjectTelegramWebhook(ctx, projectId) {
@@ -2899,8 +3161,21 @@ async function renderTelegramStatus(ctx, projectId) {
   }
 }
 
+function buildEnvVaultUnavailableMessage(prefix) {
+  const headline = prefix || MASTER_KEY_ERROR_MESSAGE;
+  const lines = [
+    headline,
+    prefix ? MASTER_KEY_ERROR_MESSAGE : null,
+    '',
+    'Generate a key:',
+    'Linux/macOS: openssl rand -hex 32',
+    'Windows PowerShell: [Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Maximum 256 }))',
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
 function isEnvVaultAvailable() {
-  return Boolean(process.env.ENV_VAULT_MASTER_KEY);
+  return getMasterKeyStatus().ok;
 }
 
 async function ensureSupabaseEnvSet() {
@@ -2915,7 +3190,7 @@ async function resolveSupabaseConnectionDsn(connection) {
     return { dsn: null, source: null, error: 'missing envKey' };
   }
   if (!isEnvVaultAvailable()) {
-    return { dsn: null, source: connection.envKey, error: 'Env Vault unavailable' };
+    return { dsn: null, source: connection.envKey, error: MASTER_KEY_ERROR_MESSAGE };
   }
   const envSetId = await ensureSupabaseEnvSet();
   if (!envSetId) {
@@ -4215,7 +4490,7 @@ async function renderCronProjectFilterMenu(ctx) {
   await renderOrEdit(ctx, 'Filter cron jobs by project:', { reply_markup: inline });
 }
 
-async function renderCronLinkProjectPicker(ctx, jobId) {
+async function renderCronLinkProjectPicker(ctx, jobId, messageContext) {
   const projects = await loadProjects();
   const link = await getCronJobLink(jobId);
   const current = link?.projectId || null;
@@ -4228,14 +4503,18 @@ async function renderCronLinkProjectPicker(ctx, jobId) {
   inline.text(current ? '✅ Other' : 'Other', `cronlink:set_other:${jobId}`).row();
   inline.text('🏷 Set label', `cronlink:label:${jobId}`).row();
   inline.text('⬅️ Back', 'cronlink:menu');
+  if (messageContext) {
+    await renderStateMessage(ctx, { messageContext }, lines.join('\n'), { reply_markup: inline });
+    return;
+  }
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
-async function updateCronJobLink(ctx, jobId, projectId) {
+async function updateCronJobLink(ctx, jobId, projectId, messageContext) {
   const link = await getCronJobLink(jobId);
   const label = link?.label || null;
   await upsertCronJobLink(jobId, projectId, label);
-  await renderCronLinkProjectPicker(ctx, jobId);
+  await renderCronLinkProjectPicker(ctx, jobId, messageContext);
 }
 
 async function handleCronLinkLabelInput(ctx, state) {
@@ -4246,7 +4525,7 @@ async function handleCronLinkLabelInput(ctx, state) {
   }
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.', {
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
       reply_markup: buildBackKeyboard(state.backCallback || 'cron:menu'),
     });
     return;
@@ -4254,7 +4533,7 @@ async function handleCronLinkLabelInput(ctx, state) {
   const link = await getCronJobLink(state.jobId);
   await upsertCronJobLink(state.jobId, link?.projectId || null, text);
   clearUserState(ctx.from.id);
-  await renderCronLinkProjectPicker(ctx, state.jobId);
+  await renderCronLinkProjectPicker(ctx, state.jobId, state.messageContext);
 }
 
 async function renderCronJobDetails(ctx, jobId, options = {}) {
@@ -4396,7 +4675,7 @@ async function promptCronScheduleInput(ctx, jobId, backCallback) {
     jobId,
     backCallback,
   });
-  await ctx.reply(
+  await renderOrEdit(
     "Send new schedule (cron string or 'every 10m', 'every 1h'). Or press Cancel.",
     { reply_markup: buildCancelKeyboard() },
   );
@@ -4408,7 +4687,7 @@ async function promptCronUrlInput(ctx, jobId, backCallback) {
     jobId,
     backCallback,
   });
-  await ctx.reply('Send new URL for this job. Or press Cancel.', {
+  await renderOrEdit(ctx, 'Send new URL for this job. Or press Cancel.', {
     reply_markup: buildCancelKeyboard(),
   });
 }
@@ -4419,7 +4698,7 @@ async function promptCronNameInput(ctx, jobId, backCallback) {
     jobId,
     backCallback,
   });
-  await ctx.reply('Send new name for this job (or type "clear" to remove).', {
+  await renderOrEdit(ctx, 'Send new name for this job (or type "clear" to remove).', {
     reply_markup: buildCancelKeyboard(),
   });
 }
@@ -4430,7 +4709,7 @@ async function promptCronTimezoneInput(ctx, jobId, backCallback) {
     jobId,
     backCallback,
   });
-  await ctx.reply('Send timezone (e.g. Europe/Berlin). Or press Cancel.', {
+  await renderOrEdit(ctx, 'Send timezone (e.g. Europe/Berlin). Or press Cancel.', {
     reply_markup: buildCancelKeyboard(),
   });
 }
@@ -4444,7 +4723,7 @@ async function handleSupabaseAddMessage(ctx, state) {
 
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.', {
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
       reply_markup: buildBackKeyboard('supabase:back'),
     });
     return;
@@ -4767,7 +5046,7 @@ async function promptSupabaseSql(ctx, connectionId) {
     await ctx.reply('Supabase connection not found.');
     return;
   }
-  await ctx.reply(`Send the SQL query to execute on ${connection.name}.\n(Or press Cancel)`, {
+  await renderOrEdit(ctx, `Send the SQL query to execute on ${connection.name}.\n(Or press Cancel)`, {
     reply_markup: buildCancelKeyboard(),
   });
 }
@@ -5420,8 +5699,9 @@ async function handleRenameProjectStep(ctx, state) {
   }
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard('gsettings:menu'),
+    });
     return;
   }
 
@@ -5464,9 +5744,9 @@ async function handleRenameProjectStep(ctx, state) {
     }
 
     clearUserState(ctx.from.id);
-    await renderProjectSettingsForMessage(state.messageContext, newId);
+    await renderProjectSettingsForMessage(state.messageContext, newId, '✅ Updated');
     if (!state.messageContext) {
-      await renderProjectSettings(ctx, newId);
+      await renderProjectSettings(ctx, newId, '✅ Updated');
     }
   }
 }
@@ -5492,9 +5772,9 @@ async function handleChangeBaseBranchStep(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId);
+    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
 }
 
@@ -5549,9 +5829,9 @@ async function handleEditRepoStep(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId);
+    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
 }
 
@@ -5608,9 +5888,9 @@ async function handleEditWorkingDirStep(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId);
+    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
 }
 
@@ -5648,9 +5928,9 @@ async function handleEditGithubTokenStep(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId);
+    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
 }
 
@@ -5675,9 +5955,9 @@ async function handleEditCommandInput(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId);
+    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
 }
 
@@ -5702,9 +5982,9 @@ async function handleEditRenderUrl(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId);
+    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
 }
 
@@ -5729,9 +6009,9 @@ async function handleEditSupabase(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId);
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId);
+    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
 }
 
@@ -5752,8 +6032,10 @@ async function handleGlobalBaseChange(ctx, state) {
   settings.defaultBaseBranch = text;
   await saveGlobalSettings(settings);
   clearUserState(ctx.from.id);
-  await ctx.reply('Default base branch updated.');
-  await renderGlobalSettings(ctx);
+  await renderGlobalSettingsForMessage(state.messageContext, '✅ Updated');
+  if (!state.messageContext) {
+    await renderGlobalSettings(ctx, '✅ Updated');
+  }
 }
 
 async function runProjectDiagnostics(ctx, projectId) {
@@ -5864,7 +6146,7 @@ async function getProjectById(projectId, ctx) {
   return project;
 }
 
-async function renderProjectSettings(ctx, projectId) {
+async function renderProjectSettings(ctx, projectId, notice) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
@@ -5872,11 +6154,11 @@ async function renderProjectSettings(ctx, projectId) {
     return;
   }
   const globalSettings = await loadGlobalSettings();
-  const view = buildProjectSettingsView(project, globalSettings);
+  const view = buildProjectSettingsView(project, globalSettings, notice);
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
-function buildProjectSettingsView(project, globalSettings) {
+function buildProjectSettingsView(project, globalSettings, notice) {
   const effectiveBase = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
   const isDefault = globalSettings.defaultProjectId === project.id;
   const name = project.name || project.id;
@@ -5886,6 +6168,7 @@ function buildProjectSettingsView(project, globalSettings) {
 
   const lines = [
     `Project: ${isDefault ? '⭐ ' : ''}${name} (id: ${project.id})`,
+    notice || null,
     '',
     `Project type: ${projectTypeLabel}`,
     '',
@@ -5907,7 +6190,7 @@ function buildProjectSettingsView(project, globalSettings) {
     '',
     'Supabase:',
     `- connectionId: ${project.supabaseConnectionId || '-'}`,
-  ];
+  ].filter((line) => line !== null);
 
   const inline = new InlineKeyboard()
     .text('✏️ Edit project', `proj:project_menu:${project.id}`)
@@ -5997,7 +6280,7 @@ function buildProjectLogAlertsView(project, settings) {
     .row()
     .text('🧹 Clear chat_id', `projlog:clear_chat:${project.id}`)
     .row()
-    .text('🧾 Show last 50 logs', `projlog:logs:${project.id}:0`)
+    .text('🧾 Recent logs', `projlog:logs:${project.id}:0`)
     .row()
     .text('⬅️ Back', `projlog:back:${project.id}`);
 
@@ -6014,6 +6297,26 @@ async function renderProjectLogAlerts(ctx, projectId) {
   const settings = await getProjectLogSettingsWithDefaults(projectId);
   const view = buildProjectLogAlertsView(project, settings);
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function renderProjectLogAlertsForMessage(messageContext, projectId, notice) {
+  if (!messageContext) return;
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) return;
+  const settings = await getProjectLogSettingsWithDefaults(projectId);
+  const view = buildProjectLogAlertsView(project, settings);
+  const text = notice ? `${notice}\n\n${view.text}` : view.text;
+  try {
+    await bot.api.editMessageText(
+      messageContext.chatId,
+      messageContext.messageId,
+      text,
+      normalizeTelegramExtra({ reply_markup: view.keyboard }),
+    );
+  } catch (error) {
+    console.error('[UI] Failed to update log alerts message', error);
+  }
 }
 
 function formatLogTimestamp(value) {
@@ -6138,10 +6441,13 @@ async function handleProjectLogChatInput(ctx, state) {
   settings.destinationChatId = value;
   await upsertProjectLogSettings(state.projectId, settings);
   clearUserState(ctx.from.id);
-  await renderProjectLogAlerts(ctx, state.projectId);
+  await renderProjectLogAlertsForMessage(state.messageContext, state.projectId, '✅ Updated');
+  if (!state.messageContext) {
+    await renderProjectLogAlerts(ctx, state.projectId);
+  }
 }
 
-async function renderProjectSettingsForMessage(messageContext, projectId) {
+async function renderProjectSettingsForMessage(messageContext, projectId, notice) {
   if (!messageContext) {
     return;
   }
@@ -6151,15 +6457,19 @@ async function renderProjectSettingsForMessage(messageContext, projectId) {
     return;
   }
   const globalSettings = await loadGlobalSettings();
-  const view = buildProjectSettingsView(project, globalSettings);
+  const view = buildProjectSettingsView(project, globalSettings, notice);
   try {
     await bot.api.editMessageText(
       messageContext.chatId,
       messageContext.messageId,
       view.text,
-      { reply_markup: view.keyboard },
+      normalizeTelegramExtra({ reply_markup: view.keyboard }),
     );
   } catch (error) {
+    if (isButtonDataInvalidError(error)) {
+      await handleTelegramUiError({ reply: (...args) => bot.api.sendMessage(messageContext.chatId, ...args) }, error);
+      return;
+    }
     console.error('[UI] Failed to update project card message', error);
   }
 }
@@ -6344,8 +6654,9 @@ async function startProjectSqlInput(ctx, projectId, source) {
     envSetId,
     source,
     backCallback: `proj:sql_menu:${projectId}`,
+    messageContext: getMessageTargetFromCtx(ctx),
   });
-  await ctx.reply('Send the SQL query to execute.\n(Or press Cancel)', {
+  await renderOrEdit(ctx, 'Send the SQL query to execute.\n(Or press Cancel)', {
     reply_markup: buildCancelKeyboard(),
   });
 }
@@ -6358,7 +6669,7 @@ async function handleProjectSqlInput(ctx, state) {
   }
   if (sql.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.', {
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
       reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
     });
     return;
@@ -6493,7 +6804,7 @@ async function promptProjectCronSchedule(ctx, projectId, type, recreate) {
     projectId,
     backCallback: `projcron:menu:${projectId}`,
   });
-  await ctx.reply(
+  await renderOrEdit(
     'Send schedule (cron string or "every 10m", "every 1h"). Or press Cancel.',
     { reply_markup: buildCancelKeyboard() },
   );
@@ -6806,23 +7117,43 @@ async function renderSupabaseScreen(ctx, projectId) {
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
-async function renderGlobalSettings(ctx) {
-  const settings = await loadGlobalSettings();
-  const projects = await loadProjects();
+function buildGlobalSettingsView(settings, projects, notice) {
   const defaultProject = settings.defaultProjectId
     ? findProjectById(projects, settings.defaultProjectId)
     : undefined;
   const selfLogForwarding = getEffectiveSelfLogForwarding(settings);
   const lines = [
+    notice || null,
     `defaultBaseBranch: ${settings.defaultBaseBranch || DEFAULT_BASE_BRANCH}`,
     `defaultProjectId: ${settings.defaultProjectId || '-'}` +
       (defaultProject ? ` (${defaultProject.name || defaultProject.id})` : ''),
     `selfLogForwarding: ${selfLogForwarding.enabled ? 'enabled' : 'disabled'} (${selfLogForwarding.levels.join('/')})`,
-  ];
+  ].filter(Boolean);
+  return { text: lines.join('\n'), keyboard: buildSettingsKeyboard() };
+}
 
-  const inline = buildSettingsKeyboard();
+async function renderGlobalSettings(ctx, notice) {
+  const settings = await loadGlobalSettings();
+  const projects = await loadProjects();
+  const view = buildGlobalSettingsView(settings, projects, notice);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
 
-  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+async function renderGlobalSettingsForMessage(messageContext, notice) {
+  if (!messageContext) return;
+  const settings = await loadGlobalSettings();
+  const projects = await loadProjects();
+  const view = buildGlobalSettingsView(settings, projects, notice);
+  try {
+    await bot.api.editMessageText(
+      messageContext.chatId,
+      messageContext.messageId,
+      view.text,
+      normalizeTelegramExtra({ reply_markup: view.keyboard }),
+    );
+  } catch (error) {
+    console.error('[UI] Failed to update global settings message', error);
+  }
 }
 
 function buildSettingsKeyboard() {
@@ -6830,10 +7161,6 @@ function buildSettingsKeyboard() {
     .text('📣 Bot log alerts', 'gsettings:bot_log_alerts')
     .row()
     .text('📶 Ping test', 'gsettings:ping_test')
-    .row()
-    .text('✏️ Change default base branch', 'gsettings:change_default_base')
-    .row()
-    .text('🧹 Clear default base branch', 'gsettings:clear_default_base')
     .row()
     .text('🧹 Clear default project', 'gsettings:clear_default_project')
     .row()
@@ -6859,6 +7186,8 @@ function buildSelfLogAlertsView(settings) {
     .row()
     .text(`ℹ️ Info: ${selected.has('info') ? 'ON' : 'OFF'}`, 'gsettings:bot_log_level:info')
     .row()
+    .text('🧾 Recent logs', 'gsettings:bot_logs:0')
+    .row()
     .text('⬅️ Back', 'gsettings:menu');
 
   return { text: lines.join('\n'), keyboard: inline };
@@ -6870,33 +7199,418 @@ async function renderSelfLogAlerts(ctx) {
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
-async function runPingTest(ctx) {
-  const parts = [];
-  try {
-    const gh = await measureGithubLatency();
-    parts.push(`GitHub API: ~${gh} ms`);
-  } catch (error) {
-    console.error('GitHub ping failed', error);
-    parts.push('GitHub API: failed');
+function buildSelfLogListView(logs, page, hasNext) {
+  const lines = ['🧾 Recent bot logs', `Page: ${page + 1}`];
+  if (!logs.length) {
+    lines.push('', 'No logs stored yet.');
+  } else {
+    lines.push('');
+    logs.forEach((log) => {
+      const timestamp = formatLogTimestamp(log.createdAt);
+      const levelLabel = log.level ? log.level.toUpperCase() : 'UNKNOWN';
+      const message = truncateText(log.message, 120);
+      lines.push(`• ${timestamp} — ${levelLabel}: ${message}`);
+    });
   }
 
+  const inline = new InlineKeyboard();
+  logs.forEach((log) => {
+    const label = `${(log.level || 'log').toUpperCase()} ${truncateText(log.message, 24)}`;
+    inline.text(label, `gsettings:bot_log:${log.id}:${page}`).row();
+  });
+  if (page > 0) {
+    inline.text('⬅️ Prev', `gsettings:bot_logs:${page - 1}`);
+  }
+  if (hasNext) {
+    inline.text('➡️ Next', `gsettings:bot_logs:${page + 1}`);
+  }
+  if (page > 0 || hasNext) {
+    inline.row();
+  }
+  inline.text('⬅️ Back', 'gsettings:bot_log_alerts');
+
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderSelfLogList(ctx, page) {
+  const safePage = Math.max(0, Number.isFinite(page) ? page : 0);
+  const offset = safePage * 10;
+  const logs = await listSelfLogs(11, offset);
+  const pageLogs = logs.slice(0, 10);
+  const hasNext = logs.length > 10;
+  const view = buildSelfLogListView(pageLogs, safePage, hasNext);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+function buildSelfLogDetailView(logEntry, page) {
+  const timestamp = formatLogTimestamp(logEntry.createdAt);
+  const lines = [
+    '🧾 Bot log detail',
+    '',
+    `Level: ${(logEntry.level || 'unknown').toUpperCase()}`,
+    `Time: ${timestamp}`,
+    `Message: ${truncateText(logEntry.message, 1500) || '(no message)'}`,
+  ];
+
+  if (logEntry.stack) {
+    lines.push(`Stack: ${truncateText(logEntry.stack, 3000)}`);
+  }
+
+  const contextText = formatContext(logEntry.context, 1500);
+  if (contextText) {
+    lines.push(`Context: ${contextText}`);
+  }
+
+  const inline = new InlineKeyboard()
+    .text('⬅️ Back to logs', `gsettings:bot_logs:${page}`)
+    .row()
+    .text('⬅️ Back to alerts', 'gsettings:bot_log_alerts');
+
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderSelfLogDetail(ctx, logId, page) {
+  if (!logId) {
+    await renderSelfLogList(ctx, page);
+    return;
+  }
+  const logEntry = await getSelfLogById(logId);
+  if (!logEntry) {
+    await renderSelfLogList(ctx, page);
+    return;
+  }
+  const view = buildSelfLogDetailView(logEntry, page);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function runPingTest(ctx) {
+  const checks = [];
+  const projects = await loadProjects();
+  const globalSettings = await loadGlobalSettings();
+  const defaultProject =
+    (globalSettings.defaultProjectId && findProjectById(projects, globalSettings.defaultProjectId)) ||
+    projects[0];
+
+  const addCheck = (status, label, detail, hint) => {
+    checks.push({ status, label, detail, hint });
+  };
+
+  const formatCheck = (check) => {
+    const icon = check.status === 'ok' ? '✅' : check.status === 'warn' ? '⚠️' : '❌';
+    const detail = check.detail ? ` — ${check.detail}` : '';
+    const hint = check.hint ? `\n   ↳ ${check.hint}` : '';
+    return `${icon} ${check.label}${detail}${hint}`;
+  };
+
+  const gitVersion = await checkGitBinary();
+  if (gitVersion.ok) {
+    addCheck('ok', 'Git binary', gitVersion.detail);
+  } else {
+    addCheck('fail', 'Git binary', gitVersion.detail, 'Install git in the runtime environment.');
+  }
+
+  if (!defaultProject) {
+    addCheck('fail', 'Project', 'No project configured', 'Add a project and set repo slug.');
+  } else {
+    addCheck('ok', 'Project', `${defaultProject.name || defaultProject.id}`);
+  }
+
+  let repoInfo = null;
+  if (defaultProject) {
+    try {
+      repoInfo = getRepoInfo(defaultProject);
+      addCheck('ok', 'Repo configured', repoInfo.repoSlug);
+    } catch (error) {
+      addCheck('fail', 'Repo configured', error.message, 'Set owner/repo in project settings.');
+    }
+  }
+
+  const tokenInfo = defaultProject
+    ? await resolveGithubToken(defaultProject)
+    : { token: null, source: null, error: 'no project' };
+  if (!tokenInfo.token) {
+    addCheck('fail', 'GitHub token', tokenInfo.error || 'missing', 'Set GITHUB_TOKEN or configure env vault.');
+  } else {
+    addCheck('ok', 'GitHub token', `${tokenInfo.source} (${tokenInfo.key})`);
+  }
+
+  if (repoInfo) {
+    const apiCheck = await checkGithubApi(repoInfo, tokenInfo.token);
+    addCheck(apiCheck.status, 'GitHub API', apiCheck.detail, apiCheck.hint);
+
+    const workingDirCheck = await checkWorkingDir(repoInfo.workingDir);
+    addCheck(workingDirCheck.status, 'Working dir', workingDirCheck.detail, workingDirCheck.hint);
+
+    const baseBranch = defaultProject?.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+    const branchCheck = await checkRemoteBranch(repoInfo.repoUrl, tokenInfo.token, baseBranch);
+    addCheck(branchCheck.status, 'Base branch', branchCheck.detail, branchCheck.hint);
+
+    const fetchCheck = await checkGitFetch(repoInfo.repoUrl, tokenInfo.token, baseBranch);
+    addCheck(fetchCheck.status, 'Git fetch', fetchCheck.detail, fetchCheck.hint);
+  }
+
+  const configDb = await checkConfigDbStatus();
+  addCheck(configDb.ok ? 'ok' : 'fail', 'Config DB', configDb.message, configDb.ok ? null : 'Set PATH_APPLIER_CONFIG_DSN.');
+
+  const supabaseCheck = await checkSupabaseConnections();
+  supabaseCheck.forEach((entry) => addCheck(entry.status, entry.label, entry.detail, entry.hint));
+
+  const cronCheck = await checkCronApi();
+  addCheck(cronCheck.status, 'Cron API', cronCheck.detail, cronCheck.hint);
+
+  const telegramCheck = await checkTelegramSetup(defaultProject);
+  addCheck(telegramCheck.status, 'Telegram', telegramCheck.detail, telegramCheck.hint);
+
+  const lines = ['📶 Ping test', '', ...checks.map(formatCheck)];
+  const inline = new InlineKeyboard().text('🔁 Retry', 'gsettings:ping_test');
+  if (defaultProject?.id) {
+    inline
+      .row()
+      .text('📝 Fix repo', `proj:edit_repo:${defaultProject.id}`)
+      .text('🔑 Fix token', `proj:edit_github_token:${defaultProject.id}`);
+  }
+  inline.row().text('⬅️ Back', 'gsettings:menu');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function checkGitBinary() {
   try {
-    const projects = await loadProjects();
-    const globalSettings = await loadGlobalSettings();
-    if (projects.length) {
-      const effectiveBaseBranch = projects[0].baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
-      const start = Date.now();
-      await fetchDryRun(projects[0], effectiveBaseBranch);
-      parts.push(`git fetch (first project): ~${Date.now() - start} ms`);
-    } else {
-      parts.push('git fetch: no projects yet');
+    const { stdout } = await execShell('git --version');
+    const detail = stdout.trim() || 'available';
+    return { ok: true, detail };
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return { ok: false, detail: 'git not installed' };
+    }
+    return { ok: false, detail: error.message || 'git check failed' };
+  }
+}
+
+async function execShell(command, options = {}) {
+  const { exec } = require('child_process');
+  const { promisify } = require('util');
+  const execAsync = promisify(exec);
+  return execAsync(command, options);
+}
+
+function applyGitTokenToUrl(repoUrl, token) {
+  if (!token) return repoUrl;
+  const url = new URL(repoUrl);
+  url.username = token;
+  return url.toString();
+}
+
+async function resolveGithubToken(project) {
+  const key = project?.githubTokenEnvKey || 'GITHUB_TOKEN';
+  const envToken = process.env[key] || process.env.GITHUB_TOKEN;
+  if (envToken) {
+    return { token: envToken, source: 'env', key };
+  }
+  if (!isEnvVaultAvailable()) {
+    return { token: null, source: null, key, error: MASTER_KEY_ERROR_MESSAGE };
+  }
+  try {
+    const envSetId = await ensureProjectEnvSet(project.id);
+    const vaultToken = await getEnvVarValue(project.id, key, envSetId);
+    if (vaultToken) {
+      return { token: vaultToken, source: 'env vault', key };
     }
   } catch (error) {
-    console.error('Git fetch ping failed', error);
-    parts.push('git fetch: failed');
+    return { token: null, source: null, key, error: error.message };
   }
+  return { token: null, source: null, key, error: 'missing' };
+}
 
-  await renderOrEdit(ctx, parts.join('\n'), { reply_markup: buildSettingsKeyboard() });
+async function checkGithubApi(repoInfo, token) {
+  const url = `https://api.github.com/repos/${repoInfo.repoSlug}`;
+  try {
+    const response = await requestUrlWithHeaders('GET', url, {
+      'User-Agent': 'path-applier-bot',
+      Authorization: token ? `Bearer ${token}` : undefined,
+    });
+    if (response.status === 401) {
+      return { status: 'fail', detail: '401 unauthorized', hint: 'Check the GitHub token.' };
+    }
+    if (response.status === 403) {
+      return { status: 'fail', detail: '403 forbidden', hint: 'Token lacks access or rate-limited.' };
+    }
+    if (response.status === 404) {
+      return { status: 'fail', detail: '404 repo not found', hint: 'Verify owner/repo.' };
+    }
+    if (response.status >= 400) {
+      return { status: 'fail', detail: `HTTP ${response.status}`, hint: 'Check GitHub API access.' };
+    }
+    const latency = response.durationMs ? `~${response.durationMs} ms` : null;
+    const detail = response.body?.default_branch
+      ? `ok (${latency || 'fast'}) default: ${response.body.default_branch}`
+      : `ok (${latency || 'fast'})`;
+    return { status: 'ok', detail };
+  } catch (error) {
+    return { status: 'fail', detail: 'unreachable', hint: truncateText(error.message, 80) };
+  }
+}
+
+async function checkWorkingDir(workingDir) {
+  if (!workingDir) {
+    return { status: 'fail', detail: 'missing', hint: 'Set a working directory in project settings.' };
+  }
+  try {
+    await fs.mkdir(workingDir, { recursive: true });
+    return { status: 'ok', detail: workingDir };
+  } catch (error) {
+    return { status: 'fail', detail: 'invalid', hint: truncateText(error.message, 80) };
+  }
+}
+
+async function checkRemoteBranch(repoUrl, token, branch) {
+  if (!branch) {
+    return { status: 'fail', detail: 'missing', hint: 'Set base branch.' };
+  }
+  try {
+    const remoteUrl = applyGitTokenToUrl(repoUrl, token);
+    const { stdout } = await execShell(`git ls-remote --heads ${remoteUrl} ${branch}`);
+    if (!stdout.trim()) {
+      return { status: 'fail', detail: 'not found', hint: `Branch ${branch} missing on remote.` };
+    }
+    return { status: 'ok', detail: branch };
+  } catch (error) {
+    const reason = classifyGitError(error);
+    return { status: 'fail', detail: reason.detail, hint: reason.hint };
+  }
+}
+
+async function checkGitFetch(repoUrl, token, branch) {
+  try {
+    const remoteUrl = applyGitTokenToUrl(repoUrl, token);
+    const { stdout } = await execShell(`git ls-remote --heads ${remoteUrl} ${branch}`);
+    if (!stdout.trim()) {
+      return { status: 'fail', detail: 'branch missing', hint: 'Check base branch name.' };
+    }
+    return { status: 'ok', detail: 'ok' };
+  } catch (error) {
+    const reason = classifyGitError(error);
+    return { status: 'fail', detail: reason.detail, hint: reason.hint };
+  }
+}
+
+function classifyGitError(error) {
+  const message = String(error.stderr || error.stdout || error.message || '').toLowerCase();
+  if (message.includes('could not read username')) {
+    return { detail: 'missing credentials', hint: 'Token not applied to remote URL.' };
+  }
+  if (message.includes('not found') || message.includes('repository not found') || message.includes('404')) {
+    return { detail: 'repo not found', hint: 'Verify owner/repo and access.' };
+  }
+  if (message.includes('403') || message.includes('forbidden')) {
+    return { detail: 'forbidden', hint: 'Token lacks access or is rate-limited.' };
+  }
+  if (message.includes('enotfound') || message.includes('could not resolve host')) {
+    return { detail: 'dns/network error', hint: 'Check network/DNS connectivity.' };
+  }
+  return { detail: truncateText(message || 'git error', 80), hint: 'Check git remote and token.' };
+}
+
+async function checkSupabaseConnections() {
+  const connections = await loadSupabaseConnections();
+  if (!connections.length) {
+    return [{ status: 'warn', label: 'Supabase', detail: 'no connections configured' }];
+  }
+  const results = [];
+  for (const connection of connections) {
+    const dsnInfo = await resolveSupabaseConnectionDsn(connection);
+    if (!dsnInfo.dsn) {
+      results.push({
+        status: 'fail',
+        label: `Supabase (${connection.name})`,
+        detail: dsnInfo.error || 'missing DSN',
+        hint: `Set ${connection.envKey} in Env Vault.`,
+      });
+      continue;
+    }
+    try {
+      const pool = await getSupabasePool(connection.id, dsnInfo.dsn);
+      await pool.query({ text: 'SELECT 1', query_timeout: SUPABASE_QUERY_TIMEOUT_MS });
+      results.push({ status: 'ok', label: `Supabase (${connection.name})`, detail: 'ok' });
+    } catch (error) {
+      results.push({
+        status: 'fail',
+        label: `Supabase (${connection.name})`,
+        detail: truncateText(error.message || 'connect failed', 60),
+        hint: 'Verify DSN/SSL settings.',
+      });
+    }
+  }
+  return results;
+}
+
+async function checkCronApi() {
+  if (!CRON_API_TOKEN) {
+    return { status: 'warn', detail: 'token missing', hint: 'Set CRON_API_TOKEN.' };
+  }
+  try {
+    await listJobs();
+    return { status: 'ok', detail: 'ok' };
+  } catch (error) {
+    if (error?.status === 429) {
+      return { status: 'warn', detail: 'rate limited', hint: 'Try again later.' };
+    }
+    return {
+      status: 'fail',
+      detail: truncateText(error.message || 'error', 80),
+      hint: 'Check CRON_API_TOKEN and endpoint.',
+    };
+  }
+}
+
+async function checkTelegramSetup(project) {
+  if (!project) {
+    return { status: 'warn', detail: 'no project selected' };
+  }
+  if (!isEnvVaultAvailable()) {
+    return { status: 'fail', detail: 'env vault unavailable', hint: MASTER_KEY_ERROR_MESSAGE };
+  }
+  const record = await getProjectTelegramBot(project.id);
+  if (!record?.botTokenEnc) {
+    return { status: 'fail', detail: 'token missing', hint: 'Set Telegram bot token in project settings.' };
+  }
+  return { status: 'ok', detail: record.webhookUrl ? 'token set + webhook set' : 'token set' };
+}
+
+async function requestUrlWithHeaders(method, targetUrl, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(targetUrl);
+    const isHttps = url.protocol === 'https:';
+    const lib = isHttps ? https : http;
+    const options = {
+      method,
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      headers: Object.fromEntries(Object.entries(headers).filter(([, value]) => value)),
+    };
+    const start = Date.now();
+    const req = lib.request(options, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      res.on('end', () => {
+        let parsed = data;
+        try {
+          parsed = JSON.parse(data);
+        } catch (error) {
+          // leave as string
+        }
+        resolve({ status: res.statusCode, body: parsed, durationMs: Date.now() - start });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => {
+      req.destroy(new Error('Request timed out'));
+    });
+    req.end();
+  });
 }
 
 async function setDefaultProject(projectId) {

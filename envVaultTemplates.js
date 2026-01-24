@@ -1,5 +1,49 @@
 const PROJECT_TYPES = [
   {
+    id: 'node-bot',
+    label: 'Node Bot',
+    required: [
+      { key: 'PATH_APPLIER_LOG_INGEST_URL', label: 'Log ingest URL', notes: 'Path Applier log ingest endpoint.' },
+      { key: 'PATH_APPLIER_LOG_INGEST_KEY', label: 'Log ingest key', notes: 'Shared secret for log ingest.' },
+      { key: 'PROJECT_ID', label: 'Project ID', notes: 'Path Applier project identifier.' },
+      { key: 'APP_ENV', label: 'App env', notes: 'Environment name (production/staging).' },
+      { key: 'LOG_REPORTER_ENABLED', label: 'Log reporter enabled', notes: 'true/false.' },
+      { key: 'LOG_LEVELS', label: 'Log levels', notes: 'Comma-separated levels.' },
+    ],
+    optional: [
+      { key: 'GITHUB_TOKEN', label: 'GitHub token', notes: 'Optional GitHub access token.' },
+      { key: 'CRON_API_TOKEN', label: 'Cron API token', notes: 'Optional Cron API token.' },
+    ],
+  },
+  {
+    id: 'node-api',
+    label: 'Node API',
+    required: [
+      { key: 'APP_ENV', label: 'App env', notes: 'Environment name (production/staging).' },
+      { key: 'LOG_LEVELS', label: 'Log levels', notes: 'Comma-separated levels.' },
+    ],
+    optional: [
+      { key: 'GITHUB_TOKEN', label: 'GitHub token', notes: 'Optional GitHub access token.' },
+      { key: 'CRON_API_TOKEN', label: 'Cron API token', notes: 'Optional Cron API token.' },
+    ],
+  },
+  {
+    id: 'python',
+    label: 'Python',
+    required: [
+      { key: 'APP_ENV', label: 'App env', notes: 'Environment name (production/staging).' },
+    ],
+    optional: [
+      { key: 'LOG_LEVELS', label: 'Log levels', notes: 'Comma-separated levels.' },
+    ],
+  },
+  {
+    id: 'generic',
+    label: 'Generic',
+    required: [],
+    optional: [],
+  },
+  {
     id: 'daily_system',
     label: 'Daily System',
     required: [

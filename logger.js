@@ -1,4 +1,5 @@
 const { normalizeLogLevel } = require('./logLevels');
+const { addSelfLog } = require('./loggerStore');
 
 let botInstance = null;
 let adminTelegramId = null;
@@ -33,6 +34,12 @@ function formatContext(context, limit) {
 
 async function forwardSelfLog(level, message, options = {}) {
   try {
+    await addSelfLog({
+      level,
+      message,
+      stack: options.stack,
+      context: options.context,
+    });
     if (!botInstance || !loadGlobalSettings) return;
     const settings = await loadGlobalSettings();
     const forwarding = settings?.selfLogForwarding || {};
