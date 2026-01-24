@@ -1,11 +1,15 @@
 const crypto = require('crypto');
 
 let cachedKey = null;
+let cachedError = null;
+
+const MASTER_KEY_ERROR_MESSAGE =
+  'Env Vault unavailable: invalid master key. Provide 64-char hex or 32-byte base64.';
 
 function parseMasterKey() {
   const raw = process.env.ENV_VAULT_MASTER_KEY;
   if (!raw) {
-    throw new Error('ENV_VAULT_MASTER_KEY is required for Env Vault');
+    return { key: null, error: 'missing' };
   }
 
   let buffer = null;
@@ -21,21 +25,35 @@ function parseMasterKey() {
   }
 
   if (!buffer || buffer.length !== 32) {
-    throw new Error('ENV_VAULT_MASTER_KEY must decode to 32 bytes (base64 or hex).');
+    return { key: null, error: 'invalid' };
   }
 
-  return buffer;
+  return { key: buffer, error: null };
+}
+
+function getMasterKeyStatus() {
+  if (cachedKey || cachedError) {
+    return { ok: Boolean(cachedKey), error: cachedError };
+  }
+  const { key, error } = parseMasterKey();
+  cachedKey = key;
+  cachedError = error;
+  return { ok: Boolean(key), error };
 }
 
 function getMasterKey() {
-  if (!cachedKey) {
-    cachedKey = parseMasterKey();
+  const status = getMasterKeyStatus();
+  if (!status.ok) {
+    return null;
   }
   return cachedKey;
 }
 
 function encryptSecret(plainText) {
   const key = getMasterKey();
+  if (!key) {
+    throw new Error(MASTER_KEY_ERROR_MESSAGE);
+  }
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([cipher.update(String(plainText), 'utf8'), cipher.final()]);
@@ -51,6 +69,9 @@ function encryptSecret(plainText) {
 function decryptSecret(payload) {
   if (!payload) return '';
   const key = getMasterKey();
+  if (!key) {
+    throw new Error(MASTER_KEY_ERROR_MESSAGE);
+  }
   const parsed = typeof payload === 'string' ? JSON.parse(payload) : payload;
   if (!parsed?.iv || !parsed?.tag || !parsed?.data) {
     throw new Error('Encrypted payload is invalid.');
@@ -67,4 +88,6 @@ function decryptSecret(payload) {
 module.exports = {
   encryptSecret,
   decryptSecret,
+  getMasterKeyStatus,
+  MASTER_KEY_ERROR_MESSAGE,
 };
