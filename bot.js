@@ -785,18 +785,23 @@ async function testConfigDbConnection() {
     runtimeStatus.configDbOk = true;
     runtimeStatus.configDbError = null;
     console.log('Config DB: OK');
-    return;
+    return status;
   }
   runtimeStatus.configDbOk = false;
   runtimeStatus.configDbError = status.message || 'see logs';
   if (status.message === 'not configured') {
-    console.warn('Config DB: PATH_APPLIER_CONFIG_DSN not set.');
-    return;
+    const errorMessage = 'Startup aborted: PATH_APPLIER_CONFIG_DSN not set.';
+    console.error(errorMessage);
+    await forwardSelfLog('error', 'Config DB missing PATH_APPLIER_CONFIG_DSN', {
+      context: { error: status.message },
+    });
+    throw new Error(errorMessage);
   }
   console.error('Config DB connection failed', status.message);
   await forwardSelfLog('error', 'Config DB connection failed', {
     context: { error: status.message },
   });
+  throw new Error(`Startup aborted: Config DB connection failed (${status.message})`);
 }
 
 const mainKeyboard = new Keyboard()
@@ -8200,11 +8205,33 @@ async function initializeConfig() {
     await loadCronSettings();
   } catch (error) {
     console.error('Failed to load initial configuration', error);
+    throw new Error('Startup aborted: failed to load initial configuration.');
   }
 }
 
+async function loadConfig() {
+  await initializeConfig();
+}
+
+async function initDb() {
+  await testConfigDbConnection();
+}
+
+async function initEnvVault() {
+  const status = getMasterKeyStatus();
+  if (status.ok) {
+    console.log('Env Vault: OK');
+    return true;
+  }
+  const reason =
+    status.error === 'missing'
+      ? 'ENV_VAULT_MASTER_KEY not set.'
+      : MASTER_KEY_ERROR_MESSAGE;
+  throw new Error(`Startup aborted: ${reason}`);
+}
+
 function startHttpServer() {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
       if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
@@ -8462,12 +8489,12 @@ function startHttpServer() {
 
     server
       .listen(PORT, () => {
-        console.log(`[http] listening on ${PORT}`);
+        console.error(`[boot] http listening on ${PORT}`);
         resolve();
       })
       .on('error', (err) => {
         console.error('[http] server error', err);
-        resolve();
+        reject(err);
       });
   });
 }
@@ -8529,6 +8556,9 @@ async function startBot() {
 
 module.exports = {
   startBot,
+  loadConfig,
+  initDb,
+  initEnvVault,
   respond,
   ensureAnswerCallback,
   validateWorkingDir,
