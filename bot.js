@@ -5998,7 +5998,13 @@ async function handleEditWorkingDirStep(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  const validation = await validateWorkingDir({ ...project, workingDir: nextWorkingDir });
+  const refreshedProjects = await loadProjects();
+  const updatedProject = findProjectById(refreshedProjects, state.projectId);
+  if (!updatedProject) {
+    await respond(ctx, 'Project not found.');
+    return;
+  }
+  const validation = await validateWorkingDir(updatedProject);
   const notice = formatWorkingDirValidationNotice(validation);
   if (!validation.ok) {
     console.warn('[workingDir] Validation failed after save', {
@@ -6592,6 +6598,13 @@ async function renderProjectSettingsForMessage(messageContext, projectId, notice
   if (!messageContext) {
     return;
   }
+  if (!messageContext.chatId) {
+    console.warn('[UI] Missing chat_id for project card update', {
+      projectId,
+      messageContext,
+    });
+    return;
+  }
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
@@ -6599,6 +6612,14 @@ async function renderProjectSettingsForMessage(messageContext, projectId, notice
   }
   const globalSettings = await loadGlobalSettings();
   const view = buildProjectSettingsView(project, globalSettings, notice);
+  if (!messageContext.messageId) {
+    await bot.api.sendMessage(
+      messageContext.chatId,
+      view.text,
+      normalizeTelegramExtra({ reply_markup: view.keyboard }),
+    );
+    return;
+  }
   try {
     await bot.api.editMessageText(
       messageContext.chatId,
@@ -6609,6 +6630,18 @@ async function renderProjectSettingsForMessage(messageContext, projectId, notice
   } catch (error) {
     if (isButtonDataInvalidError(error)) {
       await handleTelegramUiError({ reply: (...args) => bot.api.sendMessage(messageContext.chatId, ...args) }, error);
+      return;
+    }
+    if (isMessageNotModifiedError(error)) {
+      try {
+        await bot.api.sendMessage(
+          messageContext.chatId,
+          view.text,
+          normalizeTelegramExtra({ reply_markup: view.keyboard }),
+        );
+      } catch (sendError) {
+        console.error('[UI] Failed to send project card fallback', sendError);
+      }
       return;
     }
     console.error('[UI] Failed to update project card message', error);
