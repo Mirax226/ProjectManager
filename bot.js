@@ -1,5 +1,28 @@
 require('dotenv').config();
 
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection', reason);
+  process.exit(1);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[FATAL] Uncaught exception', error?.stack || error);
+  process.exit(1);
+});
+
+console.error('[boot] starting');
+console.error('[env]', {
+  BOT_TOKEN: !!process.env.BOT_TOKEN || !!process.env.TELEGRAM_BOT_TOKEN,
+  DATABASE_URL: !!process.env.DATABASE_URL,
+  ENV_VAULT_MASTER_KEY: !!process.env.ENV_VAULT_MASTER_KEY,
+  PORT: process.env.PORT,
+});
+
+const keepaliveTimer = setInterval(() => console.error('[keepalive] alive'), 60_000);
+if (typeof keepaliveTimer.unref === 'function') {
+  keepaliveTimer.unref();
+}
+
 const http = require('http');
 const https = require('https');
 const fs = require('fs/promises');
@@ -84,7 +107,7 @@ const {
 } = require('./src/cronClient');
 const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbackData');
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
 const PORT = Number(process.env.PORT || 3000);
 const SUPABASE_ENV_VAULT_PROJECT_ID = 'supabase_connections';
@@ -94,11 +117,11 @@ const SUPABASE_CELL_TRUNCATE_LIMIT = 120;
 const SUPABASE_QUERY_TIMEOUT_MS = 5000;
 
 if (!BOT_TOKEN) {
-  throw new Error('BOT_TOKEN is required');
+  throw new Error('Startup aborted: BOT_TOKEN is required');
 }
 
 if (!ADMIN_TELEGRAM_ID) {
-  throw new Error('ADMIN_TELEGRAM_ID is required');
+  throw new Error('Startup aborted: ADMIN_TELEGRAM_ID is required');
 }
 
 const bot = new Bot(BOT_TOKEN);
@@ -8234,6 +8257,11 @@ function startHttpServer() {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
+      if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/healthz')) {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('ok');
+        return;
+      }
       if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
         const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
         const project = projectId ? await getProjectById(projectId) : null;
@@ -8542,8 +8570,10 @@ async function startBotPolling() {
 }
 
 async function startBot() {
+  console.error('[boot] starting bot init');
   await startHttpServer();
   await testConfigDbConnection();
+  console.error('[boot] db init ok');
   await initializeConfig();
   try {
     await bot.api.deleteWebhook({ drop_pending_updates: false });
@@ -8552,6 +8582,7 @@ async function startBot() {
     console.error('[Path Applier] Failed to delete webhook:', error?.stack || error);
   }
   await startBotPolling();
+  console.error('[boot] bot started');
 }
 
 module.exports = {
@@ -8564,3 +8595,16 @@ module.exports = {
   validateWorkingDir,
   classifyDiagnosticsError,
 };
+
+async function main() {
+  try {
+    await startBot();
+  } catch (error) {
+    console.error('[FATAL] startup failed', error?.stack || error);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}
