@@ -123,8 +123,17 @@ const SUPABASE_CELL_TRUNCATE_LIMIT = 120;
 const SUPABASE_QUERY_TIMEOUT_MS = 5000;
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
 const LOG_API_ADMIN_CHAT_ID =
-  process.env.TELEGRAM_ADMIN_CHAT_ID || process.env.ADMIN_CHAT_ID || process.env.ADMIN_TELEGRAM_ID;
+  process.env.TELEGRAM_ADMIN_CHAT_ID ||
+  process.env.ADMIN_CHAT_ID ||
+  process.env.ADMIN_TELEGRAM_ID;
 const LOG_API_ALLOWED_PROJECTS = parseAllowedProjects(process.env.ALLOWED_PROJECTS);
+const LOG_API_ALLOWED_PROJECTS_MODE = LOG_API_ALLOWED_PROJECTS.size ? 'whitelist' : 'allow-all';
+
+console.error('[log_api]', {
+  tokenConfigured: Boolean(LOG_API_TOKEN),
+  adminChatIdResolved: Boolean(LOG_API_ADMIN_CHAT_ID),
+  allowedProjectsMode: LOG_API_ALLOWED_PROJECTS_MODE,
+});
 
 if (!BOT_TOKEN) {
   throw new Error('Startup aborted: BOT_TOKEN is required');
