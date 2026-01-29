@@ -133,7 +133,7 @@ async function applyPatchToRepo(git, repoDir, patchText) {
 
 async function configureGitIdentity(git) {
   try {
-    await git.raw(['config', 'user.name', 'Path Applier Bot']);
+    await git.raw(['config', 'user.name', 'Project Manager Bot']);
   } catch (error) {
     return { ok: false, error, step: 'user.name' };
   }

@@ -204,9 +204,20 @@ function buildTelegramMessage(entry, nowProvider) {
   const safeMessage = escapeHtml(sanitizeTelegramText(entry.message));
   const safeMeta = escapeHtml(sanitizeTelegramText(metaSummary));
   const safeTimestamp = escapeHtml(sanitizeTelegramText(timestamp));
+  const envTag = entry.meta?.env || entry.meta?.environment;
+  const tags = [
+    `#${String(entry.project).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_')}`,
+    `#${entry.level}`,
+  ];
+  if (envTag) {
+    tags.push(`#${String(envTag).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_')}`);
+  }
+  const tagLine = tags.join(' ');
 
   const lines = [
-    `📦 <b>${safeProject}</b> • ${icon} ${entry.level.toUpperCase()} • ${safeTimestamp}`,
+    `${icon} [${entry.level.toUpperCase()}] ${tagLine}`,
+    `🕒 ${safeTimestamp}`,
+    `📦 <b>${safeProject}</b>`,
     '',
     '📝 Message:',
     `<pre>${safeMessage}</pre>`,

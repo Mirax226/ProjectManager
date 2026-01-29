@@ -41,7 +41,7 @@ node src/bot.js
 7. Use **Ping test** to check GitHub API and git fetch latency.
 
 ## Project log forwarding
-External services can forward logs to Path Applier for per-project alerting:
+External services can forward logs to Project Manager for per-project alerting:
 
 ```
 POST https://<path-applier-host>/project-log/<projectId>
