@@ -1,5 +1,9 @@
 require('dotenv').config();
 
+if (!require.extensions['.ts']) {
+  require.extensions['.ts'] = require.extensions['.js'];
+}
+
 process.on('unhandledRejection', (reason) => {
   console.error('[FATAL] Unhandled promise rejection', reason);
   process.exit(1);
@@ -96,6 +100,7 @@ const {
   getRecentLogById,
 } = require('./logIngestStore');
 const { createLogIngestService, formatContext } = require('./logIngestService');
+const { createLogForwarder, validateLogPayload } = require('./src/logForwarder.ts');
 const {
   CRON_API_TOKEN,
   listJobs,
@@ -108,13 +113,23 @@ const {
 const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbackData');
 
 const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const ADMIN_TELEGRAM_ID = ADMIN_CHAT_ID || process.env.ADMIN_TELEGRAM_ID;
 const PORT = Number(process.env.PORT || 3000);
 const SUPABASE_ENV_VAULT_PROJECT_ID = 'supabase_connections';
 const SUPABASE_MESSAGE_LIMIT = 3500;
 const SUPABASE_ROWS_PAGE_SIZE = 20;
 const SUPABASE_CELL_TRUNCATE_LIMIT = 120;
 const SUPABASE_QUERY_TIMEOUT_MS = 5000;
+const LOG_API_ENABLED = true;
+const LOG_API_TOKEN = process.env.PATH_APPLIER_INGEST_TOKEN;
+const LOG_API_ADMIN_CHAT_ID = ADMIN_CHAT_ID || ADMIN_TELEGRAM_ID;
+const LOG_API_PROJECT_FILTER = process.env.LOG_PROJECT_FILTER;
+const LOG_API_PAYLOAD_LIMIT_BYTES = 10 * 1024;
+const LOG_API_SEND_TIMEOUT_MS = 5000;
+const LOG_API_RATE_LIMIT = 10;
+const LOG_API_RATE_WINDOW_MS = 5000;
+const LOG_API_ALLOWED_PROJECTS = getAllowedLogProjects(LOG_API_PROJECT_FILTER);
 
 if (!BOT_TOKEN) {
   throw new Error('Startup aborted: BOT_TOKEN is required');
@@ -149,6 +164,19 @@ const logIngestService = createLogIngestService({
   sendTelegramMessage: async (chatId, text) =>
     bot.api.sendMessage(chatId, text, { disable_web_page_preview: true }),
   logger: console,
+});
+
+const logForwarder = createLogForwarder({
+  adminChatId: LOG_API_ADMIN_CHAT_ID,
+  logger: console,
+  now: () => Date.now(),
+  rateLimit: {
+    maxPerWindow: LOG_API_RATE_LIMIT,
+    windowMs: LOG_API_RATE_WINDOW_MS,
+  },
+  sendTelegramMessage: async (chatId, text) =>
+    bot.api.sendMessage(chatId, text, { disable_web_page_preview: true }),
+  timeoutMs: LOG_API_SEND_TIMEOUT_MS,
 });
 
 const runtimeStatus = {
@@ -8120,6 +8148,49 @@ function readRequestBody(req) {
   });
 }
 
+function readRequestBodyWithLimit(req, limitBytes) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let resolved = false;
+    const finish = (result) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(result);
+    };
+
+    req.on('data', (chunk) => {
+      if (resolved) return;
+      data += chunk;
+      if (data.length > limitBytes) {
+        finish({ ok: false, error: 'payload_too_large' });
+        req.destroy();
+      }
+    });
+    req.on('end', () => finish({ ok: true, data }));
+    req.on('error', (error) => {
+      if (resolved) return;
+      reject(error);
+    });
+  });
+}
+
+function getBearerToken(req) {
+  const header = req.headers.authorization;
+  if (!header || typeof header !== 'string') return null;
+  const [type, token] = header.split(' ');
+  if (type !== 'Bearer' || !token) return null;
+  return token;
+}
+
+function getAllowedLogProjects(filterValue) {
+  if (!filterValue) return null;
+  const items = filterValue
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return items.length ? new Set(items) : null;
+}
+
 function truncateText(value, limit) {
   if (!value) return '';
   const text = String(value);
@@ -8295,6 +8366,11 @@ function startHttpServer() {
         res.end('ok');
         return;
       }
+      if (req.method === 'GET' && url.pathname === '/api/logs/ping') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, service: 'Path-Applier Log API' }));
+        return;
+      }
       if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
         const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
         const project = projectId ? await getProjectById(projectId) : null;
@@ -8337,6 +8413,94 @@ function startHttpServer() {
         await bot.api.sendMessage(ADMIN_TELEGRAM_ID, text);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/logs') {
+        if (!LOG_API_ENABLED) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Not found' }));
+          return;
+        }
+        if (!LOG_API_TOKEN) {
+          console.error('[LOG_API] rejected: missing token configuration');
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Token not configured' }));
+          return;
+        }
+
+        const providedToken = getBearerToken(req);
+        if (!providedToken) {
+          console.error('[LOG_API] rejected: token missing');
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Token missing' }));
+          return;
+        }
+        if (providedToken !== LOG_API_TOKEN) {
+          console.error('[LOG_API] rejected: invalid token');
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid token' }));
+          return;
+        }
+
+        let rawBody = '';
+        try {
+          const bodyResult = await readRequestBodyWithLimit(req, LOG_API_PAYLOAD_LIMIT_BYTES);
+          if (!bodyResult.ok && bodyResult.error === 'payload_too_large') {
+            console.error('[LOG_API] rejected: payload too large');
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Payload too large' }));
+            return;
+          }
+          rawBody = bodyResult.data || '';
+        } catch (error) {
+          console.error('[LOG_API] rejected: failed to read body', error);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid payload' }));
+          return;
+        }
+
+        let payload;
+        try {
+          payload = rawBody ? JSON.parse(rawBody) : null;
+        } catch (error) {
+          console.error('[LOG_API] rejected: invalid json');
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body' }));
+          return;
+        }
+
+        const validation = validateLogPayload(payload);
+        if (!validation.ok) {
+          console.error('[LOG_API] rejected: invalid payload', { error: validation.error });
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: validation.error }));
+          return;
+        }
+
+        const projectId = validation.value.project;
+        if (
+          LOG_API_ALLOWED_PROJECTS &&
+          !LOG_API_ALLOWED_PROJECTS.has(String(projectId).toLowerCase())
+        ) {
+          console.error('[LOG_API] rejected: project not allowed', { project: projectId });
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Project not allowed' }));
+          return;
+        }
+
+        console.error('[LOG_API] received log from', projectId);
+        const forwardResult = await logForwarder.forwardLog(payload);
+        if (!forwardResult.ok) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: forwardResult.error || 'Invalid payload' }));
+          return;
+        }
+        if (forwardResult.status === 'forwarded' || forwardResult.status === 'batched') {
+          console.error('[LOG_API] forwarded to telegram');
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, status: forwardResult.status }));
         return;
       }
 
