@@ -965,6 +965,40 @@ bot.callbackQuery('cancel_input', wrapCallbackHandler(async (ctx) => {
   }
 }, 'cancel_input'));
 
+bot.callbackQuery('KEEP_DEFAULT_WORKDIR', async (ctx) => {
+  try {
+    await ctx.answerCallbackQuery();
+    const session = userState.get(ctx.from.id);
+    if (!session?.repo) {
+      await ctx.reply('⚠️ Session expired. Please send repo again.');
+      return;
+    }
+
+    const currentRepo = session.repo;
+    const repoRoot = getDefaultWorkingDir(currentRepo);
+    const currentWorkingDir = session.draft?.workingDir || repoRoot;
+    console.log('[WORKDIR] Keep default selected', {
+      user: ctx.from?.id,
+      repo: currentRepo,
+      workingDir: currentWorkingDir,
+    });
+
+    if (!repoRoot || !currentWorkingDir || !currentWorkingDir.startsWith(repoRoot)) {
+      await ctx.reply('❌ Working directory is invalid (outside repo). Please choose again.');
+      return;
+    }
+
+    session.draft = session.draft || {};
+    session.draft.workingDir = currentWorkingDir;
+    session.draft.isWorkingDirCustom = false;
+    session.step = 'githubTokenEnvKey';
+    await promptNextProjectField(ctx, session);
+  } catch (error) {
+    console.error(error);
+    await ctx.reply('❌ Internal error while setting working directory');
+  }
+});
+
 bot.callbackQuery('patch:cancel', wrapCallbackHandler(async (ctx) => {
   clearPatchSession(ctx.from.id);
   await ensureAnswerCallback(ctx);
@@ -5475,7 +5509,7 @@ function getWizardKeyboard(step) {
 
 function getWorkingDirChoiceKeyboard() {
   return new InlineKeyboard()
-    .text('✅ Keep default', 'projwiz:keep_workdir')
+    .text('✅ Keep default', 'KEEP_DEFAULT_WORKDIR')
     .text('✏️ Change working dir', 'projwiz:change_workdir')
     .row()
     .text('❌ Cancel', 'cancel_input');
@@ -5568,6 +5602,7 @@ async function handleProjectWizardInput(ctx, state) {
       return;
     }
     state.draft.repoSlug = repoSlug;
+    state.repo = repoSlug;
     state.draft.repoUrl = `https://github.com/${repoSlug}`;
     const defaultWorkingDir = getDefaultWorkingDir(repoSlug);
     if (defaultWorkingDir) {
