@@ -193,9 +193,14 @@ function createLogsRouter(options) {
   const allowedSet = allowedProjects ?? parseAllowedProjects('');
   const isAllowed = createRateLimiter({ maxPerMinute: rateLimitPerMinute });
 
-  async function handle(req, res) {
+async function handle(req, res) {
     if (!token || !adminChatId) {
-      logger.error('[LOG_API] rejected: missing configuration');
+      const missing = [];
+      if (!token) missing.push('PATH_APPLIER_TOKEN');
+      if (!adminChatId) {
+        missing.push('TELEGRAM_ADMIN_CHAT_ID or ADMIN_CHAT_ID or ADMIN_TELEGRAM_ID');
+      }
+      logger.error(`[LOG_API] rejected: missing configuration (${missing.join(', ')})`);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Server not configured' }));
       return;
@@ -246,7 +251,15 @@ function createLogsRouter(options) {
 
     const entry = validation.value;
     const projectKey = entry.project.toLowerCase();
-    if (!allowedSet.has(projectKey)) {
+    const allowAllProjects =
+      allowedSet.size === 0 && process.env.NODE_ENV !== 'production';
+    if (allowedSet.size === 0 && !allowAllProjects) {
+      logger.error('[LOG_API] rejected: ALLOWED_PROJECTS is not configured');
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'ALLOWED_PROJECTS is not configured' }));
+      return;
+    }
+    if (!allowAllProjects && !allowedSet.has(projectKey)) {
       logger.error('[LOG_API] rejected: project not allowed', { project: entry.project });
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Project not allowed' }));

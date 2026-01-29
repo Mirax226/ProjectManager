@@ -19,11 +19,17 @@ async function main() {
     VAULT: Boolean(process.env.ENV_VAULT_MASTER_KEY),
   });
 
-  const { startBot, loadConfig, initDb, initEnvVault } = require('../bot.js');
+  const { startBot, loadConfig, initDb, initEnvVault, startHttpServer } = require('../bot.js');
 
-  await loadConfig();
-  await initDb();
-  await initEnvVault();
+  await startHttpServer();
+  try {
+    await loadConfig();
+    await initDb();
+    await initEnvVault();
+  } catch (error) {
+    console.error('[FATAL] startup failed', error?.stack || error);
+    return;
+  }
 
   await startBot();
 
