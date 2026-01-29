@@ -122,7 +122,8 @@ const SUPABASE_ROWS_PAGE_SIZE = 20;
 const SUPABASE_CELL_TRUNCATE_LIMIT = 120;
 const SUPABASE_QUERY_TIMEOUT_MS = 5000;
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
-const LOG_API_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID;
+const LOG_API_ADMIN_CHAT_ID =
+  process.env.TELEGRAM_ADMIN_CHAT_ID || process.env.ADMIN_CHAT_ID || process.env.ADMIN_TELEGRAM_ID;
 const LOG_API_ALLOWED_PROJECTS = parseAllowedProjects(process.env.ALLOWED_PROJECTS);
 
 if (!BOT_TOKEN) {
@@ -141,6 +142,7 @@ let botRetryTimeout = null;
 const userState = new Map();
 let configStatusPool = null;
 const patchSessions = new Map();
+let httpServerPromise = null;
 
 configureSelfLogger({
   bot,
@@ -173,6 +175,8 @@ const logsRouter = createLogsRouter({
 const runtimeStatus = {
   configDbOk: false,
   configDbError: null,
+  vaultOk: null,
+  vaultError: null,
 };
 const CRON_RATE_LIMIT_MESSAGE = 'Cron API rate limit reached. Please wait a bit and try again.';
 const CRON_JOBS_CACHE_TTL_MS = 30_000;
@@ -965,26 +969,54 @@ bot.callbackQuery('cancel_input', wrapCallbackHandler(async (ctx) => {
   }
 }, 'cancel_input'));
 
-bot.callbackQuery('KEEP_DEFAULT_WORKDIR', async (ctx) => {
-  try {
-    await ctx.answerCallbackQuery();
+bot.callbackQuery(
+  'KEEP_DEFAULT_WORKDIR',
+  wrapCallbackHandler(async (ctx) => {
     const session = userState.get(ctx.from.id);
-    if (!session?.repo) {
-      await ctx.reply('⚠️ Session expired. Please send repo again.');
+    const chatId = getChatIdFromCtx(ctx);
+    const callbackData = ctx.callbackQuery?.data;
+    const hasMessage = Boolean(ctx.callbackQuery?.message);
+    console.log('[WORKDIR] Keep default selected', {
+      userId: ctx.from?.id,
+      callbackData,
+      hasMessage,
+      chatId,
+      step: session?.step,
+      repo: session?.repo,
+      workingDir: session?.draft?.workingDir,
+    });
+
+    await ensureAnswerCallback(ctx);
+
+    if (!session || !session.repo) {
+      const nextSession =
+        session && session.mode === 'create-project'
+          ? session
+          : { mode: 'create-project', step: 'repoSlug', draft: {}, backCallback: 'proj:list' };
+      nextSession.step = 'repoSlug';
+      userState.set(ctx.from.id, nextSession);
+      await respond(ctx, '⚠️ Session expired. Please send repo again.');
       return;
     }
 
     const currentRepo = session.repo;
     const repoRoot = getDefaultWorkingDir(currentRepo);
     const currentWorkingDir = session.draft?.workingDir || repoRoot;
-    console.log('[WORKDIR] Keep default selected', {
-      user: ctx.from?.id,
-      repo: currentRepo,
-      workingDir: currentWorkingDir,
-    });
+    const resolvedRepoRoot = repoRoot ? path.resolve(repoRoot) : null;
+    const resolvedWorkingDir = currentWorkingDir ? path.resolve(currentWorkingDir) : null;
+    const isWithinRepo =
+      resolvedRepoRoot &&
+      resolvedWorkingDir &&
+      (resolvedWorkingDir === resolvedRepoRoot ||
+        resolvedWorkingDir.startsWith(`${resolvedRepoRoot}${path.sep}`));
 
-    if (!repoRoot || !currentWorkingDir || !currentWorkingDir.startsWith(repoRoot)) {
-      await ctx.reply('❌ Working directory is invalid (outside repo). Please choose again.');
+    if (!isWithinRepo) {
+      session.step = 'workingDirConfirm';
+      await replySafely(
+        ctx,
+        '❌ Working directory is invalid (outside repo). Please choose again.',
+      );
+      await promptNextProjectField(ctx, session);
       return;
     }
 
@@ -993,11 +1025,8 @@ bot.callbackQuery('KEEP_DEFAULT_WORKDIR', async (ctx) => {
     session.draft.isWorkingDirCustom = false;
     session.step = 'githubTokenEnvKey';
     await promptNextProjectField(ctx, session);
-  } catch (error) {
-    console.error(error);
-    await ctx.reply('❌ Internal error while setting working directory');
-  }
-});
+  }, 'keep_default_workdir'),
+);
 
 bot.callbackQuery('patch:cancel', wrapCallbackHandler(async (ctx) => {
   clearPatchSession(ctx.from.id);
@@ -7713,7 +7742,11 @@ async function validateWorkingDir(project) {
   }
 
   const resolvedWorkingDir = path.resolve(workingDir);
-  if (expectedCheckoutDir && !resolvedWorkingDir.startsWith(expectedCheckoutDir)) {
+  const isWithinRepo =
+    expectedCheckoutDir &&
+    (resolvedWorkingDir === expectedCheckoutDir ||
+      resolvedWorkingDir.startsWith(`${expectedCheckoutDir}${path.sep}`));
+  if (expectedCheckoutDir && !isWithinRepo) {
     return {
       ok: false,
       code: 'OUTSIDE_REPO',
@@ -8330,6 +8363,8 @@ async function initDb() {
 async function initEnvVault() {
   const status = getMasterKeyStatus();
   if (status.ok) {
+    runtimeStatus.vaultOk = true;
+    runtimeStatus.vaultError = null;
     console.log('Env Vault: OK');
     return true;
   }
@@ -8337,15 +8372,24 @@ async function initEnvVault() {
     status.error === 'missing'
       ? 'ENV_VAULT_MASTER_KEY not set.'
       : MASTER_KEY_ERROR_MESSAGE;
+  runtimeStatus.vaultOk = false;
+  runtimeStatus.vaultError = reason;
   throw new Error(`Startup aborted: ${reason}`);
 }
 
 function startHttpServer() {
-  return new Promise((resolve, reject) => {
+  if (httpServerPromise) {
+    return httpServerPromise;
+  }
+  httpServerPromise = new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/healthz')) {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        if (runtimeStatus.vaultOk === false) {
+          res.end('vault misconfigured');
+          return;
+        }
         res.end('ok');
         return;
       }
@@ -8622,6 +8666,7 @@ function startHttpServer() {
         reject(err);
       });
   });
+  return httpServerPromise;
 }
 
 async function startBotPolling() {
@@ -8684,6 +8729,7 @@ async function startBot() {
 
 module.exports = {
   startBot,
+  startHttpServer,
   loadConfig,
   initDb,
   initEnvVault,
