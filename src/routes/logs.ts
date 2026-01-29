@@ -2,6 +2,7 @@ const { sanitizeTelegramText } = require('../../telegramApi');
 
 const DEFAULT_RATE_LIMIT_PER_MINUTE = 20;
 const DEFAULT_PAYLOAD_LIMIT_BYTES = 10 * 1024;
+const META_TRUNCATE_LIMIT = 1500;
 
 const LEVEL_ICONS = {
   info: 'ℹ️',
@@ -43,23 +44,62 @@ function formatTimestamp(value, nowProvider) {
   return `${iso.slice(0, 10)} ${iso.slice(11, 19)}`;
 }
 
-function formatMetaLines(meta) {
+function formatMetaSummary(meta) {
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
-    return [];
+    return '';
   }
-  return Object.entries(meta).map(([key, value]) => {
-    let rendered = '';
-    if (typeof value === 'string') {
-      rendered = value;
-    } else {
-      try {
-        rendered = JSON.stringify(value);
-      } catch (error) {
-        rendered = String(value);
-      }
+
+  const lines = [];
+  const correlationId = meta.correlationId || meta.correlationID;
+  const requestId = meta.requestId || meta.requestID;
+  if (correlationId) {
+    lines.push(`correlationId: ${correlationId}`);
+  }
+  if (requestId && requestId !== correlationId) {
+    lines.push(`requestId: ${requestId}`);
+  }
+
+  const service = meta.service;
+  const env = meta.env;
+  const version = meta.version;
+  if (service || env || version) {
+    lines.push(
+      `service: ${service ?? '-'} | env: ${env ?? '-'} | version: ${version ?? '-'}`,
+    );
+  }
+
+  const request = meta.request || {};
+  if (request && typeof request === 'object' && !Array.isArray(request)) {
+    const method = request.method ? String(request.method).toUpperCase() : null;
+    const url = request.url;
+    const status = request.status ?? null;
+    if (method || url || status != null) {
+      lines.push(
+        `request: ${method || '-'} ${url || '-'}${
+          status != null ? ` (${status})` : ''
+        }`,
+      );
     }
-    return `- ${key}: ${rendered}`;
-  });
+  }
+
+  const error = meta.error || {};
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    const name = error.name;
+    const code = error.code;
+    if (name || code) {
+      lines.push(`error: ${name || '-'}${code ? ` (${code})` : ''}`);
+    }
+  }
+
+  if (!lines.length) {
+    return '';
+  }
+
+  const summary = lines.join('\n');
+  if (summary.length <= META_TRUNCATE_LIMIT) {
+    return summary;
+  }
+  return `${summary.slice(0, Math.max(0, META_TRUNCATE_LIMIT - 1))}…`;
 }
 
 function validatePayload(payload, nowProvider) {
@@ -157,25 +197,26 @@ async function readRequestBodyWithLimit(req, limitBytes) {
 
 function buildTelegramMessage(entry, nowProvider) {
   const icon = LEVEL_ICONS[entry.level];
-  const metaLines = formatMetaLines(entry.meta);
+  const metaSummary = formatMetaSummary(entry.meta);
   const timestamp = formatTimestamp(entry.timestamp, nowProvider);
 
+  const safeProject = escapeHtml(sanitizeTelegramText(entry.project));
+  const safeMessage = escapeHtml(sanitizeTelegramText(entry.message));
+  const safeMeta = escapeHtml(sanitizeTelegramText(metaSummary));
+  const safeTimestamp = escapeHtml(sanitizeTelegramText(timestamp));
+
   const lines = [
-    `📦 Project: ${entry.project}`,
-    `🧭 Level: ${icon} ${entry.level.toUpperCase()}`,
+    `📦 <b>${safeProject}</b> • ${icon} ${entry.level.toUpperCase()} • ${safeTimestamp}`,
     '',
     '📝 Message:',
-    entry.message,
+    `<pre>${safeMessage}</pre>`,
   ];
 
-  if (metaLines.length) {
-    lines.push('', '📎 Meta:', ...metaLines);
+  if (metaSummary) {
+    lines.push('', '📎 Meta:', `<pre>${safeMeta}</pre>`);
   }
 
-  lines.push('', `🕒 Time: ${timestamp}`);
-
-  const sanitized = sanitizeTelegramText(lines.join('\n'));
-  return escapeHtml(sanitized);
+  return lines.join('\n');
 }
 
 function createLogsRouter(options) {
@@ -193,12 +234,20 @@ function createLogsRouter(options) {
   const allowedSet = allowedProjects ?? parseAllowedProjects('');
   const isAllowed = createRateLimiter({ maxPerMinute: rateLimitPerMinute });
 
-async function handle(req, res) {
+  async function handle(req, res) {
     if (!token || !adminChatId) {
       const missing = [];
       if (!token) missing.push('PATH_APPLIER_TOKEN');
       if (!adminChatId) {
-        missing.push('TELEGRAM_ADMIN_CHAT_ID or ADMIN_CHAT_ID or ADMIN_TELEGRAM_ID');
+        if (!process.env.TELEGRAM_ADMIN_CHAT_ID) {
+          missing.push('TELEGRAM_ADMIN_CHAT_ID');
+        }
+        if (!process.env.ADMIN_CHAT_ID) {
+          missing.push('ADMIN_CHAT_ID');
+        }
+        if (!process.env.ADMIN_TELEGRAM_ID) {
+          missing.push('ADMIN_TELEGRAM_ID');
+        }
       }
       logger.error(`[LOG_API] rejected: missing configuration (${missing.join(', ')})`);
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -251,14 +300,7 @@ async function handle(req, res) {
 
     const entry = validation.value;
     const projectKey = entry.project.toLowerCase();
-    const allowAllProjects =
-      allowedSet.size === 0 && process.env.NODE_ENV !== 'production';
-    if (allowedSet.size === 0 && !allowAllProjects) {
-      logger.error('[LOG_API] rejected: ALLOWED_PROJECTS is not configured');
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'ALLOWED_PROJECTS is not configured' }));
-      return;
-    }
+    const allowAllProjects = allowedSet.size === 0;
     if (!allowAllProjects && !allowedSet.has(projectKey)) {
       logger.error('[LOG_API] rejected: project not allowed', { project: entry.project });
       res.writeHead(403, { 'Content-Type': 'application/json' });
