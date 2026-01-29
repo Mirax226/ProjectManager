@@ -309,7 +309,12 @@ function normalizeTelegramExtraForRespond(extra) {
 }
 
 function getChatIdFromCtx(ctx) {
-  return ctx?.chat?.id || ctx?.callbackQuery?.message?.chat?.id || null;
+  return (
+    ctx?.chat?.id ||
+    ctx?.callbackQuery?.message?.chat?.id ||
+    ctx?.from?.id ||
+    null
+  );
 }
 
 async function replySafely(ctx, text, extra) {
@@ -751,7 +756,7 @@ function appendPatchChunk(session, chunk) {
 }
 
 async function renderMainMenu(ctx) {
-  await renderOrEdit(ctx, 'Main menu:', { reply_markup: mainKeyboard });
+  await renderOrEdit(ctx, '🧭 Main menu:', { reply_markup: mainKeyboard });
 }
 
 function buildCancelKeyboard() {
@@ -778,6 +783,12 @@ function getMessageTargetFromCtx(ctx) {
 function wrapCallbackHandler(handler, label) {
   return async (ctx) => {
     try {
+      console.log('[callback] click', {
+        label: label || 'handler',
+        fromId: ctx?.from?.id,
+        chatId: ctx?.callbackQuery?.message?.chat?.id,
+        data: ctx?.callbackQuery?.data,
+      });
       await handler(ctx);
     } catch (error) {
       console.error(`[callback] ${label || 'handler'} failed`, error);
@@ -860,12 +871,51 @@ async function testConfigDbConnection() {
 }
 
 const mainKeyboard = new Keyboard()
-  .text('📁 Projects')
-  .row()
-  .text('🏭 Data Center')
-  .row()
+  .text('🧭 Main menu')
   .text('⚙️ Settings')
+  .row()
+  .text('📦 Projects')
+  .text('🗄️ Database')
+  .row()
+  .text('⏱️ Cronjobs')
+  .text('📣 Logs')
   .resized();
+
+const GLOBAL_COMMAND_ALIASES = {
+  '/setting': '/settings',
+  '/settings': '/settings',
+  '/project': '/projects',
+  '/projects': '/projects',
+  '/database': '/database',
+  '/cronjob': '/cronjob',
+  '/cronjobs': '/cronjob',
+  '/cronjob': '/cronjob',
+  '/start': '/start',
+};
+
+async function handleGlobalCommand(ctx, command) {
+  resetUserState(ctx);
+  clearPatchSession(ctx.from.id);
+  switch (command) {
+    case '/start':
+      await renderMainMenu(ctx);
+      return true;
+    case '/settings':
+      await renderGlobalSettings(ctx);
+      return true;
+    case '/projects':
+      await renderProjectsList(ctx);
+      return true;
+    case '/database':
+      await renderDataCenterMenu(ctx);
+      return true;
+    case '/cronjob':
+      await renderCronMenu(ctx);
+      return true;
+    default:
+      return false;
+  }
+}
 
 bot.use(async (ctx, next) => {
   if (!ctx.from) return;
@@ -874,6 +924,21 @@ bot.use(async (ctx, next) => {
       await ctx.reply('Unauthorized');
     }
     return;
+  }
+  return next();
+});
+
+bot.on('message:text', async (ctx, next) => {
+  const text = ctx.message?.text?.trim();
+  if (text && text.startsWith('/')) {
+    const command = text.split(/\s+/)[0].toLowerCase();
+    const mapped = GLOBAL_COMMAND_ALIASES[command];
+    if (mapped) {
+      const handled = await handleGlobalCommand(ctx, mapped);
+      if (handled) {
+        return;
+      }
+    }
   }
   return next();
 });
@@ -932,12 +997,17 @@ bot.command('start', async (ctx) => {
   await renderMainMenu(ctx);
 });
 
-bot.hears('📁 Projects', async (ctx) => {
+bot.hears('🧭 Main menu', async (ctx) => {
+  resetUserState(ctx);
+  await renderMainMenu(ctx);
+});
+
+bot.hears('📦 Projects', async (ctx) => {
   resetUserState(ctx);
   await renderProjectsList(ctx);
 });
 
-bot.hears('🏭 Data Center', async (ctx) => {
+bot.hears('🗄️ Database', async (ctx) => {
   resetUserState(ctx);
   await renderDataCenterMenu(ctx);
 });
@@ -945,6 +1015,16 @@ bot.hears('🏭 Data Center', async (ctx) => {
 bot.hears('⚙️ Settings', async (ctx) => {
   resetUserState(ctx);
   await renderGlobalSettings(ctx);
+});
+
+bot.hears('⏱️ Cronjobs', async (ctx) => {
+  resetUserState(ctx);
+  await renderCronMenu(ctx);
+});
+
+bot.hears('📣 Logs', async (ctx) => {
+  resetUserState(ctx);
+  await renderGlobalSettings(ctx, '📣 Logs');
 });
 
 bot.callbackQuery('cancel_input', wrapCallbackHandler(async (ctx) => {
@@ -6406,36 +6486,36 @@ function buildProjectSettingsView(project, globalSettings, notice) {
   const projectTypeLabel = getProjectTypeLabel(project);
 
   const lines = [
-    `Project: ${isDefault ? '⭐ ' : ''}${name} (id: ${project.id})`,
+    `📦 Project: ${isDefault ? '⭐ ' : ''}${name} (🆔 ${project.id})`,
     notice || null,
     '',
-    `Project type: ${projectTypeLabel}`,
+    `🧭 Project type: ${projectTypeLabel}`,
     '',
-    'Repo:',
-    `- slug: ${project.repoSlug || 'not set'}`,
-    `- url: ${project.repoUrl || 'not set'}`,
-    `Working dir: ${project.workingDir || '-'}`,
-    `GitHub token env: ${tokenLabel}`,
-    `Base branch: ${effectiveBase}`,
+    '📦 Repo:',
+    `- 🆔 slug: ${project.repoSlug || 'not set'}`,
+    `- 🔗 url: ${project.repoUrl || 'not set'}`,
+    `📁 workingDir: ${project.workingDir || '-'}`,
+    `🔐 GitHub token env: ${tokenLabel}`,
+    `🌿 defaultBaseBranch: ${effectiveBase}`,
     '',
-    'Commands:',
-    `- start: ${project.startCommand || '-'}`,
-    `- test: ${project.testCommand || '-'}`,
-    `- diag: ${project.diagnosticCommand || '-'}`,
+    '🧰 Commands:',
+    `- 🚀 startCommand: ${project.startCommand || '-'}`,
+    `- 🧪 testCommand: ${project.testCommand || '-'}`,
+    `- 🩺 diagnosticCommand: ${project.diagnosticCommand || '-'}`,
     '',
-    'Render:',
-    `- service: ${project.renderServiceUrl || '-'}`,
-    `- deploy hook: ${project.renderDeployHookUrl || '-'}`,
+    '🛰️ Render:',
+    `- 📡 service: ${project.renderServiceUrl || '-'}`,
+    `- 🪝 deploy hook: ${project.renderDeployHookUrl || '-'}`,
     '',
-    'Supabase:',
-    `- connectionId: ${project.supabaseConnectionId || '-'}`,
+    '🗄️ Supabase:',
+    `- 🔗 connectionId: ${project.supabaseConnectionId || '-'}`,
   ].filter((line) => line !== null);
 
   const inline = new InlineKeyboard()
     .text('✏️ Edit project', `proj:project_menu:${project.id}`)
     .text('🌱 Change base branch', `proj:change_base:${project.id}`)
     .row()
-    .text('🏷 Project type', `proj:project_type:${project.id}`)
+    .text('🏷️ Project type', `proj:project_type:${project.id}`)
     .row()
     .text('📝 Edit repo', `proj:edit_repo:${project.id}`)
     .text('📁 Edit working dir', `proj:edit_workdir:${project.id}`)
@@ -6445,7 +6525,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     .text('🧰 Edit commands', `proj:commands:${project.id}`)
     .row()
     .text('📡 Server', `proj:server_menu:${project.id}`)
-    .text('🗄 Supabase binding', `proj:supabase:${project.id}`)
+    .text('🗄️ Supabase binding', `proj:supabase:${project.id}`)
     .row()
     .text('🔐 Env Vault', `envvault:menu:${project.id}`)
     .text('🤖 Telegram Setup', `tgbot:menu:${project.id}`)
@@ -7227,19 +7307,19 @@ async function buildDataCenterView(ctx) {
   const cronSettings = await getEffectiveCronSettings();
   const cronStatus = await getCronStatusLine(ctx, cronSettings);
   const lines = [
-    '🏭 Data Center',
-    `Config DB: ${
+    '🗄️ Database',
+    `🧩 Config DB: ${
       runtimeStatus.configDbOk
         ? '✅ OK'
         : `❌ ERROR – ${runtimeStatus.configDbError || 'see logs'}`
     }`,
-    cronStatus,
+    `⏱️ ${cronStatus}`,
   ];
 
   if (!connections.length) {
-    lines.push('Supabase connections: none configured.');
+    lines.push('🗄️ Supabase connections: none configured.');
   } else {
-    lines.push('Supabase connections:');
+    lines.push('🗄️ Supabase connections:');
     connections.forEach((connection) => {
       lines.push(`• ${connection.id} – env: ${connection.envKey}`);
     });
@@ -8394,17 +8474,22 @@ function startHttpServer() {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/healthz')) {
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        if (runtimeStatus.vaultOk === false) {
-          res.end('vault misconfigured');
-          return;
-        }
-        res.end('ok');
+        const payload = {
+          ok: true,
+          service: 'Project Manager',
+          timestamp: new Date().toISOString(),
+          configDbOk: runtimeStatus.configDbOk,
+          configDbError: runtimeStatus.configDbError,
+          vaultOk: runtimeStatus.vaultOk,
+          vaultError: runtimeStatus.vaultError,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(payload));
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/logs/ping') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, service: 'Path-Applier Log API' }));
+        res.end(JSON.stringify({ ok: true, service: 'Project Manager Log API' }));
         return;
       }
       if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
@@ -8452,7 +8537,7 @@ function startHttpServer() {
         return;
       }
 
-      if (req.method === 'POST' && url.pathname === '/api/logs') {
+      if (req.method === 'POST' && (url.pathname === '/api/logs' || url.pathname === '/api/pm/logs')) {
         await logsRouter.handle(req, res);
         return;
       }
@@ -8680,7 +8765,7 @@ function startHttpServer() {
 
 async function startBotPolling() {
   if (botStarted) {
-    console.log('[Path Applier] bot.start() already called, skipping.');
+    console.log('[Project Manager] bot.start() already called, skipping.');
     return;
   }
   botStarted = true;
@@ -8691,7 +8776,7 @@ async function startBotPolling() {
 
   try {
     await bot.start();
-    console.log('[Path Applier] Bot polling started.');
+    console.log('[Project Manager] Bot polling started.');
   } catch (error) {
     botStarted = false;
     if (
@@ -8700,14 +8785,14 @@ async function startBotPolling() {
       error.description.includes('terminated by other getUpdates request')
     ) {
       console.error(
-        '[Path Applier] Telegram returned 409 (another getUpdates in progress). Will retry in 15 seconds.',
+        '[Project Manager] Telegram returned 409 (another getUpdates in progress). Will retry in 15 seconds.',
       );
       if (!botRetryTimeout) {
         botRetryTimeout = setTimeout(() => {
           botRetryTimeout = null;
           startBotPolling().catch((retryError) => {
             console.error(
-              '[Path Applier] Retry failed:',
+              '[Project Manager] Retry failed:',
               retryError?.stack || retryError,
             );
           });
@@ -8715,7 +8800,7 @@ async function startBotPolling() {
       }
       return;
     }
-    console.error('[Path Applier] Failed to start bot polling:', error?.stack || error);
+    console.error('[Project Manager] Failed to start bot polling:', error?.stack || error);
     throw error;
   }
 }
@@ -8728,9 +8813,9 @@ async function startBot() {
   await initializeConfig();
   try {
     await bot.api.deleteWebhook({ drop_pending_updates: false });
-    console.log('[Path Applier] Webhook deleted (if any). Using long polling.');
+    console.log('[Project Manager] Webhook deleted (if any). Using long polling.');
   } catch (error) {
-    console.error('[Path Applier] Failed to delete webhook:', error?.stack || error);
+    console.error('[Project Manager] Failed to delete webhook:', error?.stack || error);
   }
   await startBotPolling();
   console.error('[boot] bot started');

@@ -57,7 +57,7 @@ async function forwardSelfLog(level, message, options = {}) {
 
     const timestamp = new Date().toISOString();
     const lines = [
-      `⚠️ [${normalizedLevel.toUpperCase()}] Path Applier`,
+      `⚠️ [${normalizedLevel.toUpperCase()}] Project Manager`,
       `Time: ${timestamp}`,
       `Message: ${truncateText(message, 1200) || '(no message)'}`,
     ];
