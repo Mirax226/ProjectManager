@@ -31,6 +31,11 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs/promises');
 const path = require('path');
+const os = require('os');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+
+const execFileAsync = promisify(execFile);
 const { Bot, InlineKeyboard, Keyboard } = require('grammy');
 const { Pool } = require('pg');
 
@@ -151,6 +156,7 @@ let botRetryTimeout = null;
 const userState = new Map();
 let configStatusPool = null;
 const patchSessions = new Map();
+const changePreviewSessions = new Map();
 let httpServerPromise = null;
 
 configureSelfLogger({
@@ -367,6 +373,22 @@ async function respond(ctx, text, extra) {
     }
   }
   return replySafely(ctx, text, safeExtra);
+}
+
+async function safeRespond(ctx, text, extra, context) {
+  try {
+    return await respond(ctx, text, extra);
+  } catch (error) {
+    console.error('[UI] safeRespond failed', {
+      error: error?.message,
+      context,
+    });
+    try {
+      return await replySafely(ctx, text);
+    } catch (replyError) {
+      console.error('[UI] safeRespond fallback failed', replyError);
+    }
+  }
 }
 
 async function renderOrEdit(ctx, text, extra) {
@@ -735,14 +757,14 @@ function getPatchSession(userId) {
 }
 
 function startPatchSession(userId, projectId) {
-  patchSessions.set(userId, { projectId, buffer: '' });
+  patchSessions.set(userId, { projectId, buffer: '', inputTypes: new Set() });
 }
 
 function clearPatchSession(userId) {
   patchSessions.delete(userId);
 }
 
-function appendPatchChunk(session, chunk) {
+function appendChangeChunk(session, chunk, inputType) {
   const text = chunk || '';
   if (!text) return 0;
   if (session.buffer && !session.buffer.endsWith('\n')) {
@@ -751,6 +773,9 @@ function appendPatchChunk(session, chunk) {
   session.buffer += text;
   if (!text.endsWith('\n')) {
     session.buffer += '\n';
+  }
+  if (inputType) {
+    session.inputTypes?.add(inputType);
   }
   return text.length;
 }
@@ -948,9 +973,9 @@ bot.on('message:text', async (ctx, next) => {
   if (!session) {
     return next();
   }
-  const chunkLength = appendPatchChunk(session, ctx.message.text);
+  const chunkLength = appendChangeChunk(session, ctx.message.text, 'text');
   await ctx.reply(
-    `Patch chunk received (${chunkLength} chars).\nSend more, or press ‘✅ Patch completed’.`,
+    `Change chunk received (${chunkLength} chars).\nSend more, or press ‘✅ Patch completed’.`,
     { reply_markup: buildPatchSessionKeyboard() },
   );
 });
@@ -962,14 +987,27 @@ bot.on('message:document', async (ctx, next) => {
   }
   const doc = ctx.message.document;
   const fileName = doc?.file_name || '';
-  if (!fileName.endsWith('.patch') && !fileName.endsWith('.diff')) {
-    await ctx.reply('Unsupported file type; only .patch/.diff are accepted in patch mode.');
+  const lowerName = fileName.toLowerCase();
+  if (
+    !lowerName.endsWith('.patch') &&
+    !lowerName.endsWith('.diff') &&
+    !lowerName.endsWith('.txt') &&
+    !lowerName.endsWith('.docx')
+  ) {
+    await ctx.reply('Unsupported file type; only .patch/.diff/.txt/.docx are accepted in patch mode.');
     return;
   }
-  const fileContents = await downloadTelegramFile(ctx, doc.file_id);
-  const chunkLength = appendPatchChunk(session, fileContents);
+  const extension = lowerName.split('.').pop()?.toLowerCase();
+  let fileContents = '';
+  if (extension === 'docx') {
+    const fileBuffer = await downloadTelegramFileBuffer(ctx, doc.file_id);
+    fileContents = await extractDocxText(fileBuffer);
+  } else {
+    fileContents = await downloadTelegramFile(ctx, doc.file_id);
+  }
+  const chunkLength = appendChangeChunk(session, fileContents, extension || 'document');
   await ctx.reply(
-    `Patch file received (${chunkLength} chars).\nPress ‘✅ Patch completed’ when ready.`,
+    `Change file received (${chunkLength} chars).\nPress ‘✅ Patch completed’ when ready.`,
     { reply_markup: buildPatchSessionKeyboard() },
   );
 });
@@ -1136,8 +1174,26 @@ bot.callbackQuery('patch:finish', wrapCallbackHandler(async (ctx) => {
   }
   clearPatchSession(ctx.from.id);
   await ensureAnswerCallback(ctx);
-  await handlePatchApplication(ctx, session.projectId, session.buffer);
+  const inputTypes = Array.from(session.inputTypes || []);
+  await handlePatchApplication(ctx, session.projectId, session.buffer, inputTypes);
 }, 'patch_finish'));
+
+bot.callbackQuery('change:cancel', wrapCallbackHandler(async (ctx) => {
+  changePreviewSessions.delete(ctx.from.id);
+  await ensureAnswerCallback(ctx);
+  await safeRespond(ctx, 'Change request cancelled.');
+}, 'change_cancel'));
+
+bot.callbackQuery('change:apply', wrapCallbackHandler(async (ctx) => {
+  const session = changePreviewSessions.get(ctx.from.id);
+  if (!session) {
+    await ctx.answerCallbackQuery({ text: 'No pending change request.', show_alert: true });
+    return;
+  }
+  changePreviewSessions.delete(ctx.from.id);
+  await ensureAnswerCallback(ctx);
+  await applyChangesInRepo(ctx, session.projectId, { mode: 'unstructured', plan: session.plan });
+}, 'change_apply'));
 
 bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
   const resolved = await resolveCallbackData(ctx.callbackQuery.data);
@@ -1318,7 +1374,8 @@ async function handleMainCallback(ctx, data) {
 
 async function handleProjectCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
-  const [, action, projectId, extra] = data.split(':');
+  const [, action, projectId, extra, ...rest] = data.split(':');
+  const source = rest.join(':') || null;
 
   if (action === 'add') {
     await startProjectWizard(ctx);
@@ -1347,12 +1404,16 @@ async function handleProjectCallback(ctx, data) {
     case 'server_menu':
       await renderServerMenu(ctx, projectId);
       break;
+    case 'missing_setup':
+      await renderProjectMissingSetup(ctx, projectId);
+      break;
     case 'apply_patch':
       startPatchSession(ctx.from.id, projectId);
       await renderOrEdit(
         ctx,
-        'Send the git patch as text (you can use multiple messages)\n' +
-          'or attach a .patch / .diff file.\n' +
+        'Send the change request as text (you can use multiple messages),\n' +
+          'or attach a .patch/.diff/.txt/.docx file.\n' +
+          'Structured changes use "PM Change Spec v1" blocks.\n' +
           'When you are done, press ‘✅ Patch completed’.\n' +
           'Or press ‘❌ Cancel’.',
         { reply_markup: buildPatchSessionKeyboard() },
@@ -1383,6 +1444,7 @@ async function handleProjectCallback(ctx, data) {
       setUserState(ctx.from.id, {
         type: 'edit_repo',
         projectId,
+        backCallback: source === 'missing_setup' ? `proj:missing_setup:${projectId}` : null,
         messageContext: getMessageTargetFromCtx(ctx),
       });
       await renderOrEdit(
@@ -1423,7 +1485,7 @@ async function handleProjectCallback(ctx, data) {
       });
       break;
     case 'commands':
-      await renderCommandsScreen(ctx, projectId);
+      await renderCommandsScreen(ctx, projectId, { source });
       break;
     case 'project_type':
       await renderProjectTypeMenu(ctx, projectId);
@@ -1436,6 +1498,7 @@ async function handleProjectCallback(ctx, data) {
         type: 'edit_command_input',
         projectId,
         field: extra,
+        backCallback: source === 'missing_setup' ? `proj:missing_setup:${projectId}` : null,
         messageContext: getMessageTargetFromCtx(ctx),
       });
       await renderOrEdit(ctx, `Send new value for ${extra}.\n(Or press Cancel)`, {
@@ -5880,7 +5943,461 @@ async function finalizeProjectWizard(ctx, state) {
   await renderProjectsList(ctx);
 }
 
-async function handlePatchApplication(ctx, projectId, patchText) {
+function isPatchText(text) {
+  if (!text) return false;
+  return (
+    /diff --git /m.test(text) ||
+    (/^--- a\//m.test(text) && /^\+\+\+ b\//m.test(text)) ||
+    /^Index: /m.test(text)
+  );
+}
+
+function parseBooleanValue(value) {
+  if (typeof value !== 'string') return false;
+  return ['true', 'yes', '1'].includes(value.trim().toLowerCase());
+}
+
+function parseChangeSpecBlocks(text) {
+  const blocks = text
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  if (!blocks.length) {
+    return { ok: false, errors: ['No change blocks found.'] };
+  }
+  const parsed = [];
+  const errors = [];
+
+  blocks.forEach((block, index) => {
+    const data = {};
+    let currentKey = null;
+    block.split('\n').forEach((line) => {
+      const match = line.match(/^([A-Z_]+):\s*(.*)$/);
+      if (match) {
+        currentKey = match[1].toUpperCase();
+        data[currentKey] = match[2] || '';
+      } else if (currentKey) {
+        data[currentKey] += `\n${line}`;
+      }
+    });
+
+    const filePath = data.FILE?.trim();
+    const op = data.OP?.trim().toLowerCase();
+    if (!filePath || !op) {
+      errors.push(`Block ${index + 1}: Missing FILE or OP.`);
+      return;
+    }
+
+    const entry = {
+      filePath,
+      op,
+      find: data.FIND?.trim(),
+      replace: data.REPLACE?.trim(),
+      anchor: data.ANCHOR?.trim(),
+      insert: data.INSERT?.trim(),
+      append: data.APPEND?.trim(),
+      start: data.START?.trim(),
+      end: data.END?.trim(),
+      createIfMissing: parseBooleanValue(data.CREATE_IF_MISSING),
+      exactOneMatch: parseBooleanValue(data.EXACT_ONE_MATCH),
+      raw: block,
+    };
+
+    parsed.push(entry);
+  });
+
+  if (errors.length) {
+    return { ok: false, errors };
+  }
+  return { ok: true, blocks: parsed };
+}
+
+function validateStructuredSpec(blocks) {
+  const errors = [];
+  blocks.forEach((entry, index) => {
+    const label = `Block ${index + 1}`;
+    if (!entry.filePath) {
+      errors.push(`${label}: FILE is required.`);
+      return;
+    }
+    if (!entry.op) {
+      errors.push(`${label}: OP is required.`);
+      return;
+    }
+    switch (entry.op) {
+      case 'replace':
+        if (!entry.find || entry.replace == null) {
+          errors.push(`${label}: FIND and REPLACE are required for replace.`);
+        }
+        break;
+      case 'insert_after':
+      case 'insert_before':
+        if (!entry.anchor || (!entry.insert && !entry.append)) {
+          errors.push(`${label}: ANCHOR and INSERT are required for insert.`);
+        }
+        break;
+      case 'append':
+        if (!entry.append && !entry.insert) {
+          errors.push(`${label}: APPEND or INSERT is required for append.`);
+        }
+        break;
+      case 'delete_range':
+        if (!entry.start || !entry.end) {
+          errors.push(`${label}: START and END are required for delete_range.`);
+        }
+        break;
+      default:
+        errors.push(`${label}: Unsupported OP "${entry.op}".`);
+        break;
+    }
+  });
+  return errors;
+}
+
+function looksLikeFilePath(value) {
+  if (!value) return false;
+  if (value.includes(' ')) return false;
+  if (value.includes('\\')) return true;
+  return value.includes('/') || /\.[a-z0-9]+$/i.test(value);
+}
+
+function inferUnstructuredPlan(text) {
+  const plan = [];
+  const regex = /```([^`\n]*)\n([\s\S]*?)```/g;
+  let match;
+  while ((match = regex.exec(text))) {
+    const info = (match[1] || '').trim();
+    const body = match[2] || '';
+    if (looksLikeFilePath(info)) {
+      plan.push({
+        filePath: info,
+        op: 'replace_file',
+        content: body.trimEnd() + '\n',
+        createIfMissing: true,
+      });
+    }
+  }
+
+  const fileHeaderRegex = /FILE:\s*(\S+)/g;
+  let headerMatch;
+  while ((headerMatch = fileHeaderRegex.exec(text))) {
+    const pathValue = headerMatch[1];
+    if (!looksLikeFilePath(pathValue)) continue;
+    const startIndex = headerMatch.index + headerMatch[0].length;
+    const nextHeader = text.slice(startIndex).search(/FILE:\s*\S+/);
+    const endIndex = nextHeader === -1 ? text.length : startIndex + nextHeader;
+    const snippet = text.slice(startIndex, endIndex).trim();
+    if (snippet) {
+      plan.push({
+        filePath: pathValue,
+        op: 'replace_file',
+        content: snippet.trimEnd() + '\n',
+        createIfMissing: true,
+      });
+    }
+  }
+
+  const unique = new Map();
+  plan.forEach((entry) => {
+    if (!unique.has(entry.filePath)) {
+      unique.set(entry.filePath, entry);
+    }
+  });
+
+  return Array.from(unique.values());
+}
+
+function buildChangePreview(plan) {
+  const lines = ['Preview plan:', ''];
+  plan.forEach((entry, index) => {
+    const preview = (entry.content || '').split('\n').slice(0, 5).join('\n');
+    lines.push(
+      `${index + 1}. ${entry.filePath} (${entry.op})`,
+      preview ? `---\n${preview}\n---` : '(no content)',
+      '',
+    );
+  });
+  return lines.join('\n').trim();
+}
+
+function decodeXmlEntities(value) {
+  if (!value) return '';
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
+}
+
+function extractDocxTextFromXml(xml) {
+  const paragraphs = xml.match(/<w:p[\s\S]*?<\/w:p>/g) || [];
+  const lines = [];
+  let inCodeBlock = false;
+
+  paragraphs.forEach((paragraph) => {
+    const styleMatch = paragraph.match(/<w:pStyle[^>]*w:val="([^"]+)"/);
+    const runStyleMatch = paragraph.match(/<w:rStyle[^>]*w:val="([^"]+)"/);
+    const styleValue = `${styleMatch?.[1] || ''} ${runStyleMatch?.[1] || ''}`.toLowerCase();
+    const isCode = styleValue.includes('code') || styleValue.includes('pre');
+    const textParts = [];
+    const textRegex = /<w:t[^>]*>([\s\S]*?)<\/w:t>/g;
+    let textMatch;
+    while ((textMatch = textRegex.exec(paragraph))) {
+      textParts.push(decodeXmlEntities(textMatch[1]));
+    }
+    const paragraphText = textParts.join('');
+
+    if (isCode && !inCodeBlock) {
+      lines.push('```');
+      inCodeBlock = true;
+    }
+    if (!isCode && inCodeBlock) {
+      lines.push('```');
+      inCodeBlock = false;
+    }
+    lines.push(paragraphText);
+  });
+
+  if (inCodeBlock) {
+    lines.push('```');
+  }
+
+  return lines.join('\n').trim();
+}
+
+async function extractDocxText(buffer) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pm-docx-'));
+  const filePath = path.join(tempDir, 'document.docx');
+  try {
+    await fs.writeFile(filePath, buffer);
+    const { stdout } = await execFileAsync('unzip', ['-p', filePath, 'word/document.xml'], {
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return extractDocxTextFromXml(String(stdout || ''));
+  } catch (error) {
+    console.error('[docx] Failed to extract docx text', error);
+    return '';
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function downloadTelegramFileBuffer(ctx, fileId) {
+  const file = await ctx.api.getFile(fileId);
+  const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+  return new Promise((resolve, reject) => {
+    https
+      .get(fileUrl, (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`Failed to download file: ${res.statusCode}`));
+          return;
+        }
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      })
+      .on('error', reject);
+  });
+}
+
+function resolveRepoFilePath(repoDir, filePath) {
+  if (!filePath) return null;
+  const normalized = filePath.replace(/^\.?\//, '');
+  const fullPath = path.resolve(repoDir, normalized);
+  const root = path.resolve(repoDir);
+  if (fullPath === root || fullPath.startsWith(`${root}${path.sep}`)) {
+    return fullPath;
+  }
+  return null;
+}
+
+function findOccurrences(text, needle) {
+  if (!needle) return [];
+  const matches = [];
+  let index = 0;
+  while (index <= text.length) {
+    const found = text.indexOf(needle, index);
+    if (found === -1) break;
+    matches.push(found);
+    index = found + needle.length;
+  }
+  return matches;
+}
+
+function applyStructuredOperation(content, entry) {
+  const exactOneMatch = entry.exactOneMatch;
+  const warnings = [];
+  if (entry.op === 'replace') {
+    const matches = findOccurrences(content, entry.find);
+    if (!matches.length) {
+      return { ok: false, reason: 'find not found' };
+    }
+    if (matches.length > 1) {
+      if (exactOneMatch) {
+        return { ok: false, reason: 'multiple matches' };
+      }
+      warnings.push('multiple matches, used first');
+    }
+    const idx = matches[0];
+    const updated =
+      content.slice(0, idx) + entry.replace + content.slice(idx + entry.find.length);
+    return { ok: true, content: updated, warnings };
+  }
+
+  if (entry.op === 'insert_after' || entry.op === 'insert_before') {
+    const anchor = entry.anchor;
+    const insert = entry.insert || entry.append || '';
+    const matches = findOccurrences(content, anchor);
+    if (!matches.length) {
+      return { ok: false, reason: 'anchor not found' };
+    }
+    if (matches.length > 1) {
+      if (exactOneMatch) {
+        return { ok: false, reason: 'multiple matches' };
+      }
+      warnings.push('multiple matches, used first');
+    }
+    const idx = matches[0];
+    const insertAt = entry.op === 'insert_after' ? idx + anchor.length : idx;
+    const updated = content.slice(0, insertAt) + insert + content.slice(insertAt);
+    return { ok: true, content: updated, warnings };
+  }
+
+  if (entry.op === 'append') {
+    const append = entry.append || entry.insert || '';
+    const separator = content.endsWith('\n') || append.startsWith('\n') ? '' : '\n';
+    const updated = content + separator + append;
+    return { ok: true, content: updated, warnings };
+  }
+
+  if (entry.op === 'delete_range') {
+    const startMatches = findOccurrences(content, entry.start);
+    if (!startMatches.length) {
+      return { ok: false, reason: 'start not found' };
+    }
+    if (startMatches.length > 1 && exactOneMatch) {
+      return { ok: false, reason: 'multiple matches' };
+    }
+    const startIndex = startMatches[0];
+    const endIndex = content.indexOf(entry.end, startIndex + entry.start.length);
+    if (endIndex === -1) {
+      return { ok: false, reason: 'end not found' };
+    }
+    const updated = content.slice(0, startIndex) + content.slice(endIndex + entry.end.length);
+    return { ok: true, content: updated, warnings };
+  }
+
+  return { ok: false, reason: 'unsupported op' };
+}
+
+async function applyStructuredChangePlan(repoDir, plan) {
+  const results = [];
+
+  for (const entry of plan) {
+    const fullPath = resolveRepoFilePath(repoDir, entry.filePath);
+    if (!fullPath) {
+      results.push({ entry, status: 'failed', reason: 'invalid file path' });
+      continue;
+    }
+    let content = '';
+    let exists = true;
+    try {
+      content = await fs.readFile(fullPath, 'utf8');
+    } catch (error) {
+      exists = false;
+    }
+    if (!exists && !entry.createIfMissing) {
+      results.push({ entry, status: 'failed', reason: 'file not found' });
+      continue;
+    }
+
+    const operation = applyStructuredOperation(content, entry);
+    if (!operation.ok) {
+      results.push({ entry, status: 'failed', reason: operation.reason });
+      continue;
+    }
+    if (operation.content === content) {
+      results.push({ entry, status: 'skipped', reason: 'no changes' });
+      continue;
+    }
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, operation.content, 'utf8');
+    results.push({ entry, status: 'applied', warnings: operation.warnings });
+  }
+
+  return results;
+}
+
+async function applyUnstructuredPlan(repoDir, plan) {
+  const results = [];
+  for (const entry of plan) {
+    const fullPath = resolveRepoFilePath(repoDir, entry.filePath);
+    if (!fullPath) {
+      results.push({ entry, status: 'failed', reason: 'invalid file path' });
+      continue;
+    }
+    let exists = true;
+    try {
+      await fs.access(fullPath);
+    } catch (error) {
+      exists = false;
+    }
+    if (!exists && !entry.createIfMissing) {
+      results.push({ entry, status: 'failed', reason: 'file not found' });
+      continue;
+    }
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, entry.content || '', 'utf8');
+    results.push({ entry, status: 'applied' });
+  }
+  return results;
+}
+
+function summarizeChangeResults(results) {
+  const applied = results.filter((result) => result.status === 'applied').length;
+  const skipped = results.filter((result) => result.status === 'skipped').length;
+  const failed = results.filter((result) => result.status === 'failed').length;
+  return { applied, skipped, failed };
+}
+
+function formatChangeFailures(results) {
+  const lines = [];
+  results
+    .filter((result) => result.status === 'failed')
+    .forEach((result) => {
+      lines.push(`- ${result.entry.filePath}: ${result.reason}`);
+    });
+  return lines;
+}
+
+async function buildDiffPreview(git) {
+  try {
+    const diff = await git.diff();
+    if (!diff) return null;
+    return truncateMessage(diff, 3500);
+  } catch (error) {
+    console.error('[diff] Failed to build diff preview', error);
+    return null;
+  }
+}
+
+function buildChangeSummaryMessage(summary, failures, diffPreview) {
+  const lines = [
+    `Summary: applied=${summary.applied}, skipped=${summary.skipped}, failed=${summary.failed}`,
+  ];
+  if (failures.length) {
+    lines.push('', 'Failures:', ...failures);
+  }
+  if (diffPreview) {
+    lines.push('', 'Diff preview:', diffPreview);
+  }
+  return lines.join('\n');
+}
+
+async function applyChangesInRepo(ctx, projectId, change) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
@@ -5913,8 +6430,32 @@ async function handlePatchApplication(ctx, projectId, patchText) {
 
     await createWorkingBranch(git, effectiveBaseBranch, branchName);
 
-    await ctx.reply('Applying patch…');
-    await applyPatchToRepo(git, repoDir, patchText);
+    let results = [];
+    if (change.mode === 'patch') {
+      await ctx.reply('Applying patch…');
+      await applyPatchToRepo(git, repoDir, change.patchText);
+      results = [{ entry: { filePath: '(patch)' }, status: 'applied' }];
+    } else if (change.mode === 'structured') {
+      await ctx.reply('Applying structured changes…');
+      results = await applyStructuredChangePlan(repoDir, change.plan);
+    } else {
+      await ctx.reply('Applying inferred changes…');
+      results = await applyUnstructuredPlan(repoDir, change.plan);
+    }
+
+    console.info('[change-input] apply_results', {
+      mode: change.mode,
+      results: results.map((result) => ({
+        filePath: result.entry?.filePath,
+        status: result.status,
+        reason: result.reason,
+        warnings: result.warnings,
+      })),
+    });
+
+    const summary = summarizeChangeResults(results);
+    const failureLines = formatChangeFailures(results);
+    const diffPreview = await buildDiffPreview(git);
 
     await ctx.reply('Committing and pushing…');
     const identityResult = await configureGitIdentity(git);
@@ -5926,12 +6467,13 @@ async function handlePatchApplication(ctx, projectId, patchText) {
     }
     const hasChanges = await commitAndPush(git, branchName);
     if (!hasChanges) {
-      await ctx.reply('Patch applied but no changes detected.');
+      const message = buildChangeSummaryMessage(summary, failureLines, diffPreview);
+      await ctx.reply(`No changes detected.\n${message}`);
       return;
     }
 
     await ctx.reply('Creating Pull Request…');
-    const prBody = buildPrBody(patchText);
+    const prBody = buildPrBody(diffPreview || change.patchText || '');
     const [owner, repo] = repoInfo.repoSlug.split('/');
     const githubToken = getGithubToken(project);
     const pr = await createPullRequest({
@@ -5946,13 +6488,73 @@ async function handlePatchApplication(ctx, projectId, patchText) {
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
     const inline = new InlineKeyboard().url('View PR', pr.html_url);
-    await ctx.reply(`Patch applied successfully.\nElapsed: ~${elapsed}s`, { reply_markup: inline });
+    const message = buildChangeSummaryMessage(summary, failureLines, diffPreview);
+    await ctx.reply(`Changes applied successfully.\nElapsed: ~${elapsed}s\n\n${message}`, {
+      reply_markup: inline,
+    });
   } catch (error) {
-    console.error('Failed to apply patch', error);
-    await ctx.reply(`Failed to apply patch: ${error.message}`);
+    console.error('Failed to apply changes', error);
+    await ctx.reply(`Failed to apply changes: ${error.message}`);
   } finally {
     clearUserState(ctx.from.id);
   }
+}
+
+async function handlePatchApplication(ctx, projectId, patchText, inputTypes = []) {
+  const normalizedTypes = Array.isArray(inputTypes) ? inputTypes : Array.from(inputTypes || []);
+  console.info('[change-input] received', {
+    projectId,
+    inputTypes: normalizedTypes,
+  });
+
+  if (isPatchText(patchText)) {
+    await applyChangesInRepo(ctx, projectId, { mode: 'patch', patchText });
+    return;
+  }
+
+  if (/FILE:\s*/i.test(patchText)) {
+    const parsed = parseChangeSpecBlocks(patchText);
+    if (!parsed.ok) {
+      await ctx.reply(`Failed to parse structured change spec:\n${parsed.errors.join('\n')}`);
+      return;
+    }
+    const validationErrors = validateStructuredSpec(parsed.blocks);
+    if (validationErrors.length) {
+      await ctx.reply(`Structured change spec errors:\n${validationErrors.join('\n')}`);
+      return;
+    }
+    console.info('[change-input] structured_plan', {
+      projectId,
+      blocks: parsed.blocks.length,
+    });
+    await applyChangesInRepo(ctx, projectId, { mode: 'structured', plan: parsed.blocks });
+    return;
+  }
+
+  const plan = inferUnstructuredPlan(patchText);
+  if (!plan.length) {
+    await ctx.reply('No file changes could be inferred. Use PM Change Spec v1 or a patch file.');
+    return;
+  }
+
+  console.info('[change-input] preview_plan', {
+    projectId,
+    files: plan.map((entry) => entry.filePath),
+  });
+
+  const preview = buildChangePreview(plan);
+  const limitNote =
+    plan.length > 10 ? `\n⚠️ ${plan.length} files detected (limit 10; confirm to proceed).` : '';
+  const message = `Unstructured change request detected.${limitNote}\n\n${preview}\n\nApply these changes?`;
+  changePreviewSessions.set(ctx.from.id, {
+    projectId,
+    mode: 'unstructured',
+    plan,
+    inputTypes: normalizedTypes,
+    sourceText: patchText,
+  });
+  const inline = new InlineKeyboard().text('✅ Apply', 'change:apply').text('❌ Cancel', 'change:cancel');
+  await safeRespond(ctx, message, { reply_markup: inline }, { action: 'change_preview' });
 }
 
 async function saveProjectsWithFeedback(ctx, projects) {
@@ -5963,6 +6565,17 @@ async function saveProjectsWithFeedback(ctx, projects) {
     console.error('[configStore] Failed to save project settings', error);
     await ctx.reply('Failed to save project settings (DB error). Changes may not persist.');
     return false;
+  }
+}
+
+async function renderProjectAfterUpdate(ctx, state, notice) {
+  if (state?.backCallback && state.backCallback.startsWith('proj:missing_setup:')) {
+    await renderProjectMissingSetup(ctx, state.projectId, notice);
+    return;
+  }
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, notice);
+  if (!state.messageContext) {
+    await renderProjectSettings(ctx, state.projectId, notice);
   }
 }
 
@@ -6035,7 +6648,11 @@ async function handleChangeBaseBranchStep(ctx, state) {
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
     await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
+    if (state.backCallback) {
+      await renderProjectMissingSetup(ctx, state.projectId, 'Operation cancelled.');
+    } else {
+      await renderMainMenu(ctx);
+    }
     return;
   }
 
@@ -6062,7 +6679,11 @@ async function handleEditRepoStep(ctx, state) {
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
     await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
+    if (state.backCallback) {
+      await renderProjectMissingSetup(ctx, state.projectId, 'Operation cancelled.');
+    } else {
+      await renderMainMenu(ctx);
+    }
     return;
   }
 
@@ -6104,10 +6725,7 @@ async function handleEditRepoStep(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
-  if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
-  }
+  await renderProjectAfterUpdate(ctx, state, '✅ Updated');
 }
 
 async function handleEditWorkingDirStep(ctx, state) {
@@ -6253,10 +6871,7 @@ async function handleEditCommandInput(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
-  if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
-  }
+  await renderProjectAfterUpdate(ctx, state, '✅ Updated');
 }
 
 async function handleEditRenderUrl(ctx, state) {
@@ -6477,6 +7092,93 @@ async function renderProjectSettings(ctx, projectId, notice) {
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
+const DEFAULT_PROJECT_SETUP_RULES = {
+  requireRepoUrl: true,
+  runModeRequiringStartCommand: ['service', 'worker'],
+  logForwardingRequiredEnvKeys: ['PATH_APPLIER_URL', 'PATH_APPLIER_TOKEN', 'PROJECT_NAME'],
+  databaseModuleEnabledKey: 'dbEnabled',
+  databaseUrlKey: 'databaseUrl',
+  cronModuleEnabledKey: 'cronEnabled',
+  cronTimezoneKey: 'cronTimezone',
+  cronExpressionKey: 'cronExpression',
+  templateCommandFields: {
+    install: 'installCommand',
+    build: 'buildCommand',
+  },
+};
+
+function getProjectSetupRules(globalSettings) {
+  const overrides = globalSettings?.projectSetupRules || {};
+  return {
+    ...DEFAULT_PROJECT_SETUP_RULES,
+    ...overrides,
+    templateCommandFields: {
+      ...DEFAULT_PROJECT_SETUP_RULES.templateCommandFields,
+      ...(overrides.templateCommandFields || {}),
+    },
+  };
+}
+
+function getProjectMissingSetup(project, globalSettings) {
+  const rules = getProjectSetupRules(globalSettings);
+  const missing = [];
+  const addMissing = (id, label, emoji, action) => {
+    missing.push({ id, label, emoji, action });
+  };
+
+  if (rules.requireRepoUrl && !project.repoUrl) {
+    addMissing('repoUrl', 'Repo URL', '📦', `proj:edit_repo:${project.id}:missing_setup`);
+  }
+
+  const runMode = String(project.runMode || project.run_mode || '').toLowerCase();
+  if (rules.runModeRequiringStartCommand.includes(runMode) && !project.startCommand) {
+    addMissing(
+      'startCommand',
+      'Start command',
+      '🧰',
+      `proj:cmd_edit:${project.id}:startCommand:missing_setup`,
+    );
+  }
+
+  const template = project.template || project.projectTemplate || null;
+  const requiresInstall = template?.requiresInstallCommand === true;
+  const requiresBuild = template?.requiresBuildCommand === true;
+  if (requiresInstall && !project[rules.templateCommandFields.install]) {
+    addMissing('installCommand', 'Install command', '📦', `proj:commands:${project.id}:missing_setup`);
+  }
+  if (requiresBuild && !project[rules.templateCommandFields.build]) {
+    addMissing('buildCommand', 'Build command', '🛠️', `proj:commands:${project.id}:missing_setup`);
+  }
+
+  const forwarding = getEffectiveProjectLogForwarding(project);
+  if (forwarding.enabled) {
+    const missingEnv = rules.logForwardingRequiredEnvKeys.filter((key) => !process.env[key]);
+    if (missingEnv.length) {
+      addMissing('logEnvs', `Log envs (${missingEnv.join(', ')})`, '📣', `envvault:menu:${project.id}`);
+    }
+  }
+
+  if (project[rules.databaseModuleEnabledKey] === true && !project[rules.databaseUrlKey]) {
+    addMissing('databaseUrl', 'Database URL', '🗄️', `envvault:menu:${project.id}`);
+  }
+
+  if (project[rules.cronModuleEnabledKey] === true) {
+    if (!project[rules.cronTimezoneKey]) {
+      addMissing('cronTimezone', 'Cron timezone', '⏱️', `projcron:menu:${project.id}`);
+    }
+    if (project[rules.cronExpressionKey]) {
+      const validation = validateCronExpression(project[rules.cronExpressionKey]);
+      if (!validation.valid) {
+        addMissing('cronExpression', 'Cron expression', '⏱️', `projcron:menu:${project.id}`);
+      }
+    } else {
+      addMissing('cronExpression', 'Cron expression', '⏱️', `projcron:menu:${project.id}`);
+    }
+  }
+
+  return missing;
+}
+
 function buildProjectSettingsView(project, globalSettings, notice) {
   const effectiveBase = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
   const isDefault = globalSettings.defaultProjectId === project.id;
@@ -6484,6 +7186,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
   const tokenKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';
   const tokenLabel = tokenKey === 'GITHUB_TOKEN' ? 'GITHUB_TOKEN (default)' : tokenKey;
   const projectTypeLabel = getProjectTypeLabel(project);
+  const missingSetup = getProjectMissingSetup(project, globalSettings);
 
   const lines = [
     `📦 Project: ${isDefault ? '⭐ ' : ''}${name} (🆔 ${project.id})`,
@@ -6535,6 +7238,10 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     .text('📣 Log alerts', `projlog:menu:${project.id}`)
     .row();
 
+  if (missingSetup.length) {
+    inline.text('🧩 Complete Missing Setup', `proj:missing_setup:${project.id}`).row();
+  }
+
   if (!isDefault) {
     inline.text('⭐ Set as default project', `proj:set_default:${project.id}`).row();
   }
@@ -6542,6 +7249,48 @@ function buildProjectSettingsView(project, globalSettings, notice) {
   inline.text('🗑 Delete project', `proj:delete:${project.id}`).text('⬅️ Back', 'proj:list');
 
   return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildProjectMissingSetupView(project, globalSettings, notice) {
+  const missing = getProjectMissingSetup(project, globalSettings);
+  const lines = [
+    `🧩 Missing setup — ${project.name || project.id}`,
+    notice || null,
+    '',
+  ].filter((line) => line !== null);
+
+  const inline = new InlineKeyboard();
+
+  if (!missing.length) {
+    lines.push('✅ Setup Complete');
+    inline
+      .text('🧪 Run tests', `proj:diagnostics:${project.id}`)
+      .row()
+      .text('⬅️ Back', `proj:open:${project.id}`);
+    return { text: lines.join('\n'), keyboard: inline };
+  }
+
+  lines.push('Missing items:');
+  missing.forEach((item) => {
+    lines.push(`- ${item.emoji} ${item.label}`);
+    inline.text(`${item.emoji} ${item.label}`, item.action).row();
+  });
+
+  inline.text('⬅️ Back', `proj:open:${project.id}`);
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectMissingSetup(ctx, projectId, notice) {
+  resetUserState(ctx);
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await safeRespond(ctx, 'Project not found.', null, { action: 'missing_setup' });
+    return;
+  }
+  const globalSettings = await loadGlobalSettings();
+  const view = buildProjectMissingSetupView(project, globalSettings, notice);
+  await safeRespond(ctx, view.text, { reply_markup: view.keyboard }, { action: 'missing_setup' });
 }
 
 async function renderProjectTypeMenu(ctx, projectId) {
@@ -7383,13 +8132,16 @@ async function deleteProject(ctx, projectId) {
   await renderProjectsList(ctx);
 }
 
-async function renderCommandsScreen(ctx, projectId) {
+async function renderCommandsScreen(ctx, projectId, options = {}) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
     await ctx.reply('Project not found.');
     return;
   }
+  const source = options?.source === 'missing_setup' ? 'missing_setup' : null;
+  const suffix = source ? `:${source}` : '';
+  const backTarget = source ? `proj:missing_setup:${project.id}` : `proj:project_menu:${project.id}`;
 
   const lines = [
     `startCommand: ${project.startCommand || '-'}`,
@@ -7398,17 +8150,17 @@ async function renderCommandsScreen(ctx, projectId) {
   ];
 
   const inline = new InlineKeyboard()
-    .text('✏️ Edit startCommand', `proj:cmd_edit:${project.id}:startCommand`)
+    .text('✏️ Edit startCommand', `proj:cmd_edit:${project.id}:startCommand${suffix}`)
     .row()
-    .text('✏️ Edit testCommand', `proj:cmd_edit:${project.id}:testCommand`)
+    .text('✏️ Edit testCommand', `proj:cmd_edit:${project.id}:testCommand${suffix}`)
     .row()
-    .text('✏️ Edit diagnosticCommand', `proj:cmd_edit:${project.id}:diagnosticCommand`);
+    .text('✏️ Edit diagnosticCommand', `proj:cmd_edit:${project.id}:diagnosticCommand${suffix}`);
 
   if (project.startCommand || project.testCommand || project.diagnosticCommand) {
     inline.row().text('🧹 Clear all commands', `proj:cmd_clearall:${project.id}`);
   }
 
-  inline.row().text('⬅️ Back', `proj:project_menu:${project.id}`);
+  inline.row().text('⬅️ Back', backTarget);
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
@@ -8417,9 +9169,9 @@ function downloadTelegramFile(ctx, fileId) {
   });
 }
 
-function buildPrBody(patchText) {
-  const preview = patchText.split('\n').slice(0, 20).join('\n');
-  return `Automated patch at ${new Date().toISOString()}\n\nPreview:\n\n${preview}`;
+function buildPrBody(previewText) {
+  const preview = String(previewText || '').split('\n').slice(0, 20).join('\n');
+  return `Automated change at ${new Date().toISOString()}\n\nPreview:\n\n${preview}`;
 }
 
 bot.catch(async (err) => {
