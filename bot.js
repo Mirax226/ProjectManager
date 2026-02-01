@@ -980,8 +980,18 @@ bot.use(async (ctx, next) => {
 bot.on('message:text', async (ctx, next) => {
   const text = ctx.message?.text?.trim();
   if (text && text.startsWith('/')) {
+    const state = getUserState(ctx.from?.id);
+    if (state) {
+      console.log('[state] slash command received during input; clearing state', {
+        userId: ctx.from?.id,
+        stateType: state.type || state.mode,
+        command: text.split(/\s+/)[0],
+      });
+      resetUserState(ctx);
+    }
     const command = text.split(/\s+/)[0].toLowerCase();
-    const mapped = GLOBAL_COMMAND_ALIASES[command];
+    const normalizedCommand = command.split('@')[0];
+    const mapped = GLOBAL_COMMAND_ALIASES[normalizedCommand];
     if (mapped) {
       const handled = await handleGlobalCommand(ctx, mapped);
       if (handled) {
@@ -1504,6 +1514,7 @@ async function handleProjectCallback(ctx, data) {
         messageContext: getMessageTargetFromCtx(ctx),
       });
       await renderOrEdit(
+        ctx,
         'Send new GitHub repo as owner/repo (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
@@ -1515,6 +1526,7 @@ async function handleProjectCallback(ctx, data) {
         messageContext: getMessageTargetFromCtx(ctx),
       });
       await renderOrEdit(
+        ctx,
         'Send new working directory (absolute path). Or send "-" to reset to default based on repo.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
@@ -1526,6 +1538,7 @@ async function handleProjectCallback(ctx, data) {
         messageContext: getMessageTargetFromCtx(ctx),
       });
       await renderOrEdit(
+        ctx,
         'Send the env key that contains the GitHub token (for example: GITHUB_TOKEN_DS). Or send "-" to use the default GITHUB_TOKEN.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
@@ -2975,6 +2988,10 @@ async function renderEnvVaultMenu(ctx, projectId) {
     .text('🧩 Import from text', `envvault:import:${projectId}`)
     .row()
     .text('📤 Export keys', `envvault:export:${projectId}`)
+    .row()
+    .text('📤 Export env (masked + file)', `proj:env_export:${projectId}`)
+    .row()
+    .text('🔎 Scan env requirements', `proj:env_scan:${projectId}`)
     .row()
     .text('⬅️ Back', `proj:open:${projectId}`);
 
@@ -5098,6 +5115,7 @@ async function promptCronScheduleInput(ctx, jobId, backCallback) {
     backCallback,
   });
   await renderOrEdit(
+    ctx,
     "Send new schedule (cron string or 'every 10m', 'every 1h'). Or press Cancel.",
     { reply_markup: buildCancelKeyboard() },
   );
@@ -5822,9 +5840,16 @@ function getWorkingDirChoiceKeyboard() {
     .text('❌ Cancel', 'cancel_input');
 }
 
+function isSlashCommandLikeInput(value) {
+  if (value == null) return false;
+  const trimmed = String(value).trim();
+  return /^\/[a-z]+$/i.test(trimmed);
+}
+
 function parseRepoSlug(value) {
   if (!value) return undefined;
   const trimmed = value.trim();
+  if (isSlashCommandLikeInput(trimmed)) return undefined;
   const parts = trimmed.split('/');
   if (parts.length !== 2) return undefined;
   const [owner, repo] = parts;
@@ -9396,6 +9421,7 @@ async function promptProjectCronSchedule(ctx, projectId, type, recreate) {
     backCallback: `projcron:menu:${projectId}`,
   });
   await renderOrEdit(
+    ctx,
     'Send schedule (cron string or "every 10m", "every 1h"). Or press Cancel.',
     { reply_markup: buildCancelKeyboard() },
   );
@@ -10206,6 +10232,9 @@ function validateWorkingDirInput(rawValue) {
     return { ok: false, error: 'Working directory path cannot include trailing spaces.' };
   }
   const trimmed = value.trim();
+  if (isSlashCommandLikeInput(trimmed)) {
+    return { ok: false, error: 'Working directory cannot be a slash command. Use /start to return to the main menu.' };
+  }
   if (!path.isAbsolute(trimmed)) {
     return { ok: false, error: 'Working directory must be an absolute path.' };
   }
