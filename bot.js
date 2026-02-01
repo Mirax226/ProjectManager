@@ -6265,22 +6265,18 @@ function findOccurrences(text, needle) {
 
 function applyStructuredOperation(content, entry) {
   const exactOneMatch = entry.exactOneMatch;
-  const warnings = [];
   if (entry.op === 'replace') {
     const matches = findOccurrences(content, entry.find);
     if (!matches.length) {
       return { ok: false, reason: 'find not found' };
     }
     if (matches.length > 1) {
-      if (exactOneMatch) {
-        return { ok: false, reason: 'multiple matches' };
-      }
-      warnings.push('multiple matches, used first');
+      return { ok: false, reason: exactOneMatch ? 'multiple matches' : 'ambiguous matches' };
     }
     const idx = matches[0];
     const updated =
       content.slice(0, idx) + entry.replace + content.slice(idx + entry.find.length);
-    return { ok: true, content: updated, warnings };
+    return { ok: true, content: updated, warnings: [] };
   }
 
   if (entry.op === 'insert_after' || entry.op === 'insert_before') {
@@ -6291,22 +6287,19 @@ function applyStructuredOperation(content, entry) {
       return { ok: false, reason: 'anchor not found' };
     }
     if (matches.length > 1) {
-      if (exactOneMatch) {
-        return { ok: false, reason: 'multiple matches' };
-      }
-      warnings.push('multiple matches, used first');
+      return { ok: false, reason: exactOneMatch ? 'multiple matches' : 'ambiguous matches' };
     }
     const idx = matches[0];
     const insertAt = entry.op === 'insert_after' ? idx + anchor.length : idx;
     const updated = content.slice(0, insertAt) + insert + content.slice(insertAt);
-    return { ok: true, content: updated, warnings };
+    return { ok: true, content: updated, warnings: [] };
   }
 
   if (entry.op === 'append') {
     const append = entry.append || entry.insert || '';
     const separator = content.endsWith('\n') || append.startsWith('\n') ? '' : '\n';
     const updated = content + separator + append;
-    return { ok: true, content: updated, warnings };
+    return { ok: true, content: updated, warnings: [] };
   }
 
   if (entry.op === 'delete_range') {
@@ -6314,8 +6307,8 @@ function applyStructuredOperation(content, entry) {
     if (!startMatches.length) {
       return { ok: false, reason: 'start not found' };
     }
-    if (startMatches.length > 1 && exactOneMatch) {
-      return { ok: false, reason: 'multiple matches' };
+    if (startMatches.length > 1) {
+      return { ok: false, reason: exactOneMatch ? 'multiple matches' : 'ambiguous matches' };
     }
     const startIndex = startMatches[0];
     const endIndex = content.indexOf(entry.end, startIndex + entry.start.length);
@@ -6323,14 +6316,14 @@ function applyStructuredOperation(content, entry) {
       return { ok: false, reason: 'end not found' };
     }
     const updated = content.slice(0, startIndex) + content.slice(endIndex + entry.end.length);
-    return { ok: true, content: updated, warnings };
+    return { ok: true, content: updated, warnings: [] };
   }
 
   return { ok: false, reason: 'unsupported op' };
 }
 
 function formatInvalidChangeSpecMessage(error, blockIndex) {
-  return `Invalid PM Change Spec\nError: ${error}\nBlock index: ${blockIndex}`;
+  return `Patch rejected\nError: ${error}\nBlock index: ${blockIndex}`;
 }
 
 function validateStructuredFilePaths(repoDir, plan) {
@@ -6350,15 +6343,16 @@ function buildStructuredFailureMessage(failure) {
     `File: ${failure.entry?.filePath || ''}`,
     `Operation: ${failure.entry?.op || ''}`,
     `Reason: ${failure.reason || 'Unknown error'}`,
+    'Subsequent blocks were not executed.',
   ].join('\n');
 }
 
 function buildStructuredSuccessMessage(totalBlocks, modifiedFiles, diffPreview) {
   const lines = [
     'Applied successfully',
-    `Total blocks: ${totalBlocks}`,
+    `Blocks applied: ${totalBlocks}`,
     'Modified files:',
-    ...modifiedFiles.map((file) => `- ${file}`),
+    ...modifiedFiles,
   ];
   if (diffPreview) {
     lines.push('', 'Diff preview:', diffPreview);
