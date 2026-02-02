@@ -1396,9 +1396,7 @@ async function handleStatefulMessage(ctx, state) {
 function buildProjectsKeyboard(projects, globalSettings) {
   const defaultId = globalSettings?.defaultProjectId;
   const rows = projects.map((project) => {
-    const missingCount = getMissingRequirements(project).length;
-    const badge = missingCount ? ` INCOMPLETE (${missingCount} missing)` : '';
-    const label = `${project.id === defaultId ? '⭐ ' : ''}${project.name || project.id}${badge}`;
+    const label = `${project.id === defaultId ? '⭐ ' : ''}${project.name || project.id}`;
     return [
       {
         text: label,
@@ -1527,7 +1525,7 @@ async function handleProjectCallback(ctx, data) {
       });
       await renderOrEdit(
         ctx,
-        'Send new working directory (absolute path). Or send "-" to reset to default based on repo.\n(Or press Cancel)',
+        'Send new working directory (repo-relative recommended, or absolute). Or send "-" to reset to repo root.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
       break;
@@ -2701,6 +2699,14 @@ async function handleProjectCronCallback(ctx, data) {
   const projectId = parts[2];
   const extra = parts[3];
 
+  console.info('[projcron] callback received', {
+    action,
+    projectId,
+    extra,
+    data,
+    userId: ctx.from?.id,
+  });
+
   if (!projectId) {
     await renderOrEdit(ctx, 'Project not found.');
     return;
@@ -2747,6 +2753,12 @@ async function handleProjectCronCallback(ctx, data) {
       await toggleProjectCronAlertLevel(ctx, projectId, extra);
       break;
     default:
+      console.warn('[projcron] Unknown action', { action, projectId, extra, data });
+      await ctx.answerCallbackQuery({
+        text: 'Unknown cron action. Please reopen the menu.',
+        show_alert: true,
+      });
+      await renderProjectCronBindings(ctx, projectId);
       break;
   }
 }
@@ -5938,7 +5950,7 @@ async function handleProjectWizardInput(ctx, state) {
     state.draft.repoUrl = `https://github.com/${repoSlug}`;
     const defaultWorkingDir = getDefaultWorkingDir(repoSlug);
     if (defaultWorkingDir) {
-      state.draft.workingDir = defaultWorkingDir;
+      state.draft.workingDir = '.';
       state.draft.isWorkingDirCustom = false;
     }
     state.step = 'workingDirConfirm';
@@ -6022,7 +6034,7 @@ async function promptNextProjectField(ctx, state) {
     repoSlug:
       'Send GitHub repo as `owner/repo` (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
     workingDirConfirm: null,
-    workingDirCustom: 'Send working directory path (absolute).\n(Or press Cancel)',
+    workingDirCustom: 'Send working directory path (repo-relative recommended, or absolute).\n(Or press Cancel)',
     githubTokenEnvKey:
       'GitHub token env key:\nDefault: GITHUB_TOKEN\nSend a custom env key or type `-` to use the default.',
     startCommand: 'Send *startCommand* (or Skip).\n(Or press Cancel)',
@@ -6066,7 +6078,7 @@ async function finalizeProjectWizard(ctx, state) {
     name: draft.name || finalId,
     repoSlug,
     repoUrl: draft.repoUrl || (repoSlug ? `https://github.com/${repoSlug}` : undefined),
-    workingDir: draft.workingDir || (repoSlug ? getDefaultWorkingDir(repoSlug) : undefined),
+    workingDir: draft.workingDir || (repoSlug ? '.' : undefined),
     isWorkingDirCustom: draft.isWorkingDirCustom || false,
     githubTokenEnvKey: draft.githubTokenEnvKey,
     owner,
@@ -7091,7 +7103,7 @@ async function handleEditRepoStep(ctx, state) {
   };
 
   if (!updatedProject.isWorkingDirCustom) {
-    updatedProject.workingDir = defaultWorkingDir;
+    updatedProject.workingDir = defaultWorkingDir ? '.' : updatedProject.workingDir;
     updatedProject.isWorkingDirCustom = false;
   }
 
@@ -7131,6 +7143,7 @@ async function handleEditWorkingDirStep(ctx, state) {
   const project = projects[idx];
   let nextWorkingDir = trimmed;
   let isWorkingDirCustom = true;
+  let extraNotice = null;
 
   if (trimmed === '-') {
     if (!project.repoSlug) {
@@ -7142,7 +7155,7 @@ async function handleEditWorkingDirStep(ctx, state) {
       await respond(ctx, 'Cannot derive workingDir from repoSlug.');
       return;
     }
-    nextWorkingDir = defaultDir;
+    nextWorkingDir = '.';
     isWorkingDirCustom = false;
   } else {
     const validation = validateWorkingDirInput(rawText);
@@ -7151,6 +7164,23 @@ async function handleEditWorkingDirStep(ctx, state) {
       return;
     }
     nextWorkingDir = validation.value;
+    if (path.isAbsolute(nextWorkingDir) && project.repoSlug) {
+      const checkoutDir = getDefaultWorkingDir(project.repoSlug);
+      const expectedCheckoutDir = checkoutDir ? path.resolve(checkoutDir) : null;
+      if (expectedCheckoutDir) {
+        try {
+          await fs.stat(nextWorkingDir);
+          const resolved = path.resolve(nextWorkingDir);
+          if (resolved === expectedCheckoutDir || resolved.startsWith(`${expectedCheckoutDir}${path.sep}`)) {
+            const relative = path.relative(expectedCheckoutDir, resolved) || '.';
+            nextWorkingDir = relative === '.' ? '.' : relative;
+          }
+        } catch (error) {
+          extraNotice =
+            '⚠️ Absolute path does not exist in this runtime. Consider switching to a repo-relative path.';
+        }
+      }
+    }
   }
 
   projects[idx] = {
@@ -7173,7 +7203,8 @@ async function handleEditWorkingDirStep(ctx, state) {
     return;
   }
   const validation = await validateWorkingDir(updatedProject);
-  const notice = formatWorkingDirValidationNotice(validation);
+  const noticeBase = formatWorkingDirValidationNotice(validation);
+  const notice = extraNotice ? `${noticeBase}\n${extraNotice}` : noticeBase;
   if (!validation.ok) {
     console.warn('[workingDir] Validation failed after save', {
       projectId: state.projectId,
@@ -7605,7 +7636,7 @@ async function buildHeavyDiagnosticsReport(project) {
     }
   }
 
-  const workingDir = project.workingDir || repoInfo?.workingDir;
+  const workingDir = resolveProjectWorkingDir(project) || repoInfo?.workingDir;
   if (!workingDir) {
     blockedReason = blockedReason || 'workingDir missing';
   }
@@ -7981,7 +8012,7 @@ async function scanEnvRequirements(ctx, projectId) {
     return;
   }
 
-  const workingDir = project.workingDir || repoInfo?.workingDir;
+  const workingDir = resolveProjectWorkingDir(project) || repoInfo?.workingDir;
   if (!workingDir) {
     await safeRespond(ctx, 'workingDir missing. Set a working directory before scanning.', {
       reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`),
@@ -8521,6 +8552,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
   const tokenLabel = tokenKey === 'GITHUB_TOKEN' ? 'GITHUB_TOKEN (default)' : tokenKey;
   const projectTypeLabel = getProjectTypeLabel(project);
   const missingSetup = getMissingRequirements(project);
+  const workingDirLabel = formatWorkingDirDisplay(project);
 
   const lines = [
     `📦 Project: ${isDefault ? '⭐ ' : ''}${name} (🆔 ${project.id})`,
@@ -8531,7 +8563,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     '📦 Repo:',
     `- 🆔 slug: ${project.repoSlug || 'not set'}`,
     `- 🔗 url: ${project.repoUrl || 'not set'}`,
-    `📁 workingDir: ${project.workingDir || '-'}`,
+    `📁 workingDir: ${workingDirLabel}`,
     `🔐 GitHub token env: ${tokenLabel}`,
     `🌿 defaultBaseBranch: ${effectiveBase}`,
     '',
@@ -8544,7 +8576,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     `- 📡 service: ${project.renderServiceUrl || '-'}`,
     `- 🪝 deploy hook: ${project.renderDeployHookUrl || '-'}`,
     '',
-    '🗄️ Supabase:',
+    '🗄️ Database:',
     `- 🔗 connectionId: ${project.supabaseConnectionId || '-'}`,
   ].filter((line) => line !== null);
 
@@ -8564,7 +8596,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     .text('🧪 Diagnostics', `proj:diagnostics_menu:${project.id}`)
     .row()
     .text('📡 Server', `proj:server_menu:${project.id}`)
-    .text('🗄️ Supabase binding', `proj:supabase:${project.id}`)
+    .text('🗄️ Database binding', `proj:supabase:${project.id}`)
     .row()
     .text('🔐 Env Vault', `envvault:menu:${project.id}`)
     .text('🤖 Telegram Setup', `tgbot:menu:${project.id}`)
@@ -8575,7 +8607,9 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     .row();
 
   if (missingSetup.length) {
-    inline.text('🧩 Complete Missing Setup', `proj:missing_setup:${project.id}`).row();
+    inline
+      .text(`🧩 Complete Missing Setup (Missing: ${missingSetup.length})`, `proj:missing_setup:${project.id}`)
+      .row();
   }
 
   if (!isDefault) {
@@ -10094,17 +10128,25 @@ async function validateWorkingDir(project) {
     };
   }
 
-  if (!path.isAbsolute(workingDir)) {
-    return {
-      ok: false,
-      code: 'NOT_ABSOLUTE',
-      details: 'workingDir must be an absolute path',
-      expectedCheckoutDir,
-      suggestedWorkingDir: checkoutDir || null,
-    };
+  if (expectedCheckoutDir) {
+    try {
+      await fs.stat(expectedCheckoutDir);
+    } catch (error) {
+      return {
+        ok: true,
+        code: 'CHECKOUT_PENDING',
+        details: 'Repo checkout not available yet; validation deferred.',
+        expectedCheckoutDir,
+        suggestedWorkingDir: checkoutDir || null,
+      };
+    }
   }
 
-  const resolvedWorkingDir = path.resolve(workingDir);
+  const resolvedWorkingDir = path.isAbsolute(workingDir)
+    ? path.resolve(workingDir)
+    : expectedCheckoutDir
+      ? path.resolve(expectedCheckoutDir, workingDir)
+      : path.resolve(workingDir);
   const isWithinRepo =
     expectedCheckoutDir &&
     (resolvedWorkingDir === expectedCheckoutDir ||
@@ -10165,6 +10207,9 @@ async function validateWorkingDir(project) {
 
 function formatWorkingDirValidationNotice(result) {
   if (result.ok) {
+    if (result.code === 'CHECKOUT_PENDING') {
+      return '⏳ Working dir saved; repo checkout not available yet for validation.';
+    }
     return '✅ Working dir saved and validated.';
   }
   const lines = [`⚠️ Working dir saved but invalid (${result.code}).`];
@@ -10235,10 +10280,41 @@ function validateWorkingDirInput(rawValue) {
   if (isSlashCommandLikeInput(trimmed)) {
     return { ok: false, error: 'Working directory cannot be a slash command. Use /start to return to the main menu.' };
   }
-  if (!path.isAbsolute(trimmed)) {
-    return { ok: false, error: 'Working directory must be an absolute path.' };
-  }
   return { ok: true, value: trimmed };
+}
+
+function formatWorkingDirDisplay(project) {
+  const raw = project?.workingDir;
+  if (!raw) return '-';
+  const repoSlug = project?.repoSlug;
+  const checkoutDir = repoSlug ? getDefaultWorkingDir(repoSlug) : null;
+  const expectedCheckoutDir = checkoutDir ? path.resolve(checkoutDir) : null;
+  if (!path.isAbsolute(raw)) {
+    if (raw === '.') return '.';
+    return raw.startsWith('./') ? raw : `./${raw}`;
+  }
+  if (expectedCheckoutDir) {
+    const resolved = path.resolve(raw);
+    if (resolved === expectedCheckoutDir) {
+      return '.';
+    }
+    if (resolved.startsWith(`${expectedCheckoutDir}${path.sep}`)) {
+      return `./${path.relative(expectedCheckoutDir, resolved)}`;
+    }
+  }
+  return raw;
+}
+
+function resolveProjectWorkingDir(project) {
+  const workingDir = project?.workingDir;
+  if (!workingDir) return null;
+  if (path.isAbsolute(workingDir)) return path.resolve(workingDir);
+  const repoSlug = project?.repoSlug;
+  const checkoutDir = repoSlug ? getDefaultWorkingDir(repoSlug) : null;
+  if (checkoutDir) {
+    return path.resolve(checkoutDir, workingDir);
+  }
+  return path.resolve(workingDir);
 }
 
 function classifyDiagnosticsError({ result, project, workingDir, validation }) {

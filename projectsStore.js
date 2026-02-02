@@ -41,12 +41,17 @@ function normalizeProject(rawProject) {
   }
 
   if (!project.workingDir && project.repoSlug) {
-    project.workingDir = getDefaultWorkingDir(project.repoSlug);
+    project.workingDir = '.';
   }
 
   if (typeof project.isWorkingDirCustom !== 'boolean') {
     const defaultDir = project.repoSlug ? getDefaultWorkingDir(project.repoSlug) : undefined;
-    project.isWorkingDirCustom = Boolean(project.workingDir && defaultDir && project.workingDir !== defaultDir);
+    const workingDir = project.workingDir;
+    const isRelativeDefault = workingDir === '.' || workingDir === './' || workingDir === '';
+    const isAbsoluteDefault = Boolean(defaultDir && workingDir === defaultDir);
+    const isCustom =
+      Boolean(workingDir) && !isRelativeDefault && !isAbsoluteDefault;
+    project.isWorkingDirCustom = isCustom;
   }
 
   project.githubTokenEnvKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';

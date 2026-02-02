@@ -28,7 +28,7 @@ function getDefaultWorkingDir(repoSlug) {
   return path.join(WORKDIR, `${owner}__${repo}`);
 }
 
-function getRepoInfo(project) {
+function getRepoSlug(project) {
   let repoSlug = project?.repoSlug;
   if (!repoSlug && project?.repoOwner && project?.repoName) {
     repoSlug = `${project.repoOwner}/${project.repoName}`;
@@ -39,6 +39,22 @@ function getRepoInfo(project) {
   if (!repoSlug && typeof project?.repo === 'string' && project.repo.includes('/')) {
     repoSlug = project.repo;
   }
+  return repoSlug;
+}
+
+function resolveWorkingDir(project, repoSlug) {
+  const workingDir = project?.workingDir;
+  if (!workingDir) return undefined;
+  if (path.isAbsolute(workingDir)) return path.resolve(workingDir);
+  const checkoutDir = repoSlug ? getDefaultWorkingDir(repoSlug) : null;
+  if (checkoutDir) {
+    return path.resolve(checkoutDir, workingDir);
+  }
+  return path.resolve(workingDir);
+}
+
+function getRepoInfo(project) {
+  const repoSlug = getRepoSlug(project);
 
   if (!repoSlug) {
     throw new Error('Project is missing repoSlug');
@@ -52,6 +68,8 @@ function getRepoInfo(project) {
   let workingDir = project?.workingDir;
   if (!workingDir) {
     workingDir = getDefaultWorkingDir(repoSlug);
+  } else {
+    workingDir = resolveWorkingDir(project, repoSlug);
   }
 
   return { repoSlug, repoUrl, workingDir };
@@ -179,4 +197,6 @@ module.exports = {
   getDefaultWorkingDir,
   makePatchBranchName,
   slugifyProjectId,
+  resolveWorkingDir,
+  getRepoSlug,
 };

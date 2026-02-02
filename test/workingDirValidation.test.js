@@ -6,19 +6,27 @@ const path = require('node:path');
 const { validateWorkingDir } = require('../bot');
 const { getDefaultWorkingDir } = require('../gitUtils');
 
-test('validateWorkingDir rejects non-absolute paths', async () => {
+test('validateWorkingDir accepts relative paths inside checkout dir', async () => {
+  const repoSlug = 'test-owner/test-repo';
+  const checkoutDir = getDefaultWorkingDir(repoSlug);
+  await fs.rm(checkoutDir, { recursive: true, force: true });
+  await fs.mkdir(checkoutDir, { recursive: true });
+
   const result = await validateWorkingDir({
-    repoSlug: 'test-owner/test-repo',
-    workingDir: 'relative/path',
+    repoSlug,
+    workingDir: '.',
     projectType: 'node-api',
   });
 
   assert.equal(result.ok, false);
-  assert.equal(result.code, 'NOT_ABSOLUTE');
+  assert.equal(result.code, 'PACKAGE_JSON_MISSING');
 });
 
 test('validateWorkingDir rejects paths outside checkout dir', async () => {
   const repoSlug = 'test-owner/test-repo';
+  const checkoutDir = getDefaultWorkingDir(repoSlug);
+  await fs.rm(checkoutDir, { recursive: true, force: true });
+  await fs.mkdir(checkoutDir, { recursive: true });
   const outsideDir = path.join('/tmp', 'outside-workdir-test');
   await fs.mkdir(outsideDir, { recursive: true });
 
