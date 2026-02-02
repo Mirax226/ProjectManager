@@ -10884,6 +10884,8 @@ async function toggleProjectCronAlertLevel(ctx, projectId, level) {
 
 async function renderDataCenterMenu(ctx) {
   const view = await buildDataCenterView(ctx);
+  const keyboardRows = view.keyboard?.inline_keyboard?.length ?? 0;
+  console.debug('[UI] Data center keyboard rows', { rows: keyboardRows, hasButtons: keyboardRows > 0 });
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
@@ -11034,6 +11036,13 @@ async function buildDataCenterView(ctx) {
   const lines = ['🗄️ Database', ''];
   const inline = new InlineKeyboard();
   const cards = [];
+  const ensureCallbackData = (label, callbackData) => {
+    if (!callbackData || typeof callbackData !== 'string' || callbackData.trim() === '') {
+      console.error('[UI] Missing callback_data for data center button', { label, callbackData });
+      return 'noop';
+    }
+    return callbackData;
+  };
 
   for (const project of projects) {
     const info = await resolveProjectDbCardInfo(project);
@@ -11042,37 +11051,32 @@ async function buildDataCenterView(ctx) {
 
   if (!cards.length) {
     lines.push('No projects configured yet.');
-    inline.text('Configure per-project DB', 'proj:list').row();
+    inline.text('Configure per-project DB', ensureCallbackData('Configure per-project DB', 'proj:list')).row();
   } else {
     cards.forEach(({ project, info }, index) => {
       const name = project.name || project.id;
-      const databaseEnabled =
-        resolveProjectFeatureFlag(project, 'databaseEnabled') === true ||
-        project?.databaseEnabled === true ||
-        project?.dbEnabled === true;
       lines.push(
         `📦 ${name} (🆔 ${project.id})`,
         `DB type: ${info.dbType}`,
         `Source: ${info.source}`,
         `Key: ${info.keyName} (${info.status})`,
       );
-      inline.text(`📦 ${name} (🆔 ${project.id})`, `proj:open:${project.id}`).row();
-      if (databaseEnabled) {
-        inline
-          .text('🌐 Open mini-site', `proj:db_mini:${project.id}`)
-          .text('🛠️ Edit DB config', `proj:db_config:${project.id}`)
-          .row()
-          .text('📊 Run DB overview', `proj:db_insights:${project.id}:0:0`)
-          .text('🧾 SQL runner', `proj:sql_menu:${project.id}`)
-          .row();
-      }
+      inline
+        .text(`📦 ${name} (🆔 ${project.id})`, ensureCallbackData(`Project ${project.id}`, `proj:open:${project.id}`))
+        .row()
+        .text('🌐 Open mini-site', ensureCallbackData('🌐 Open mini-site', `proj:db_mini:${project.id}`))
+        .text('🛠️ Edit DB config', ensureCallbackData('🛠️ Edit DB config', `proj:db_config:${project.id}`))
+        .row()
+        .text('📊 Run DB overview', ensureCallbackData('📊 Run DB overview', `proj:db_insights:${project.id}:0:0`))
+        .text('🧾 SQL runner', ensureCallbackData('🧾 SQL runner', `proj:sql_menu:${project.id}`))
+        .row();
       if (index < cards.length - 1) {
         lines.push('');
       }
     });
   }
 
-  inline.text('⬅️ Back', 'main:back');
+  inline.text('⬅️ Back', ensureCallbackData('⬅️ Back', 'main:back'));
 
   return { text: lines.join('\n'), keyboard: inline };
 }
@@ -11082,6 +11086,8 @@ async function renderDataCenterMenuForMessage(messageContext) {
     return;
   }
   const view = await buildDataCenterView(null);
+  const keyboardRows = view.keyboard?.inline_keyboard?.length ?? 0;
+  console.debug('[UI] Data center keyboard rows', { rows: keyboardRows, hasButtons: keyboardRows > 0 });
   try {
     await bot.api.editMessageText(
       messageContext.chatId,
