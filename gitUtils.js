@@ -14,6 +14,11 @@ function slugifyProjectId(value) {
     .slice(0, 40);
 }
 
+function sanitizePathSegment(value) {
+  const slug = slugifyProjectId(value);
+  return slug || 'repo';
+}
+
 function makePatchBranchName(projectId) {
   const slug = slugifyProjectId(projectId || 'project');
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -25,7 +30,9 @@ function getDefaultWorkingDir(repoSlug) {
   if (!repoSlug || !repoSlug.includes('/')) return undefined;
   const [owner, repo] = repoSlug.split('/');
   if (!owner || !repo) return undefined;
-  return path.join(WORKDIR, `${owner}__${repo}`);
+  const safeOwner = sanitizePathSegment(owner);
+  const safeRepo = sanitizePathSegment(repo);
+  return path.join(WORKDIR, `${safeOwner}__${safeRepo}`);
 }
 
 function getRepoSlug(project) {

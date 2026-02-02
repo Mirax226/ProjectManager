@@ -126,6 +126,10 @@ const SUPABASE_MESSAGE_LIMIT = 3500;
 const SUPABASE_ROWS_PAGE_SIZE = 20;
 const SUPABASE_CELL_TRUNCATE_LIMIT = 120;
 const SUPABASE_QUERY_TIMEOUT_MS = 5000;
+const DB_INSIGHTS_TABLE_PAGE_SIZE = 6;
+const DB_INSIGHTS_SAMPLE_SIZE = 3;
+const DB_INSIGHTS_QUERY_TIMEOUT_MS = 4000;
+const SUPABASE_TABLE_ACCESS_TTL_MS = 60_000;
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
 const LOG_API_ADMIN_CHAT_ID =
   process.env.TELEGRAM_ADMIN_CHAT_ID ||
@@ -151,6 +155,7 @@ if (!ADMIN_TELEGRAM_ID) {
 const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
 const envVaultPools = new Map();
+const supabaseTableAccess = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
 const userState = new Map();
@@ -1330,6 +1335,9 @@ async function handleStatefulMessage(ctx, state) {
     case 'edit_supabase':
       await handleEditSupabase(ctx, state);
       break;
+    case 'db_import_url':
+      await handleDatabaseImportInput(ctx, state);
+      break;
     case 'edit_service_health':
       await handleEditServiceHealthInput(ctx, state);
       break;
@@ -1341,6 +1349,9 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'supabase_add':
       await handleSupabaseAddMessage(ctx, state);
+      break;
+    case 'supabase_table_auth':
+      await handleSupabaseTableAuthInput(ctx, state);
       break;
     case 'cron_wizard':
       await handleCronWizardInput(ctx, state);
@@ -1518,6 +1529,12 @@ async function handleProjectCallback(ctx, data) {
       );
       break;
     case 'edit_workdir':
+      resetUserState(ctx);
+      console.log('[ui] Edit working dir requested', {
+        userId: ctx.from?.id,
+        projectId,
+        messageId: ctx.callbackQuery?.message?.message_id,
+      });
       setUserState(ctx.from.id, {
         type: 'edit_working_dir',
         projectId,
@@ -1525,11 +1542,20 @@ async function handleProjectCallback(ctx, data) {
       });
       await renderOrEdit(
         ctx,
-        'Send new working directory (repo-relative recommended, or absolute). Or send "-" to reset to repo root.\n(Or press Cancel)',
+        'Send new working directory (repo-relative preferred, e.g. "." or "apps/api"). Absolute paths are allowed but discouraged. Or send "-" to reset to repo root.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
       break;
+    case 'workdir_revalidate':
+      await revalidateWorkingDir(ctx, projectId);
+      break;
     case 'edit_github_token':
+      resetUserState(ctx);
+      console.log('[ui] Edit GitHub token requested', {
+        userId: ctx.from?.id,
+        projectId,
+        messageId: ctx.callbackQuery?.message?.message_id,
+      });
       setUserState(ctx.from.id, {
         type: 'edit_github_token',
         projectId,
@@ -1593,6 +1619,22 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'diagnostics_full':
       await runProjectFullDiagnostics(ctx, projectId);
+      break;
+    case 'db_mini':
+      resetUserState(ctx);
+      await renderProjectDbMiniSite(ctx, projectId);
+      break;
+    case 'db_config':
+      resetUserState(ctx);
+      await renderDatabaseBindingMenu(ctx, projectId);
+      break;
+    case 'db_import':
+      resetUserState(ctx);
+      await startDatabaseImportFlow(ctx, projectId);
+      break;
+    case 'db_insights':
+      resetUserState(ctx);
+      await renderProjectDbInsights(ctx, projectId, Number(extra) || 0, Number(source) || 0);
       break;
     case 'env_export':
       await exportProjectEnv(ctx, projectId);
@@ -1902,20 +1944,38 @@ async function handleSupabaseCallback(ctx, data) {
       break;
     case 'table':
       resetUserState(ctx);
-      await renderSupabaseTableDetails(ctx, connectionId, decodeSupabaseTableName(tableToken));
+      if (
+        await ensureSupabaseTableAccess(ctx, connectionId, decodeSupabaseTableName(tableToken), 'table')
+      ) {
+        await renderSupabaseTableDetails(ctx, connectionId, decodeSupabaseTableName(tableToken));
+      }
       break;
     case 'rows':
       resetUserState(ctx);
-      await renderSupabaseTableRows(
-        ctx,
-        connectionId,
-        decodeSupabaseTableName(tableToken),
-        Number(extra) || 0,
-      );
+      if (
+        await ensureSupabaseTableAccess(
+          ctx,
+          connectionId,
+          decodeSupabaseTableName(tableToken),
+          'rows',
+          Number(extra) || 0,
+        )
+      ) {
+        await renderSupabaseTableRows(
+          ctx,
+          connectionId,
+          decodeSupabaseTableName(tableToken),
+          Number(extra) || 0,
+        );
+      }
       break;
     case 'count':
       resetUserState(ctx);
-      await renderSupabaseTableCount(ctx, connectionId, decodeSupabaseTableName(tableToken));
+      if (
+        await ensureSupabaseTableAccess(ctx, connectionId, decodeSupabaseTableName(tableToken), 'count')
+      ) {
+        await renderSupabaseTableCount(ctx, connectionId, decodeSupabaseTableName(tableToken));
+      }
       break;
     case 'sql':
       resetUserState(ctx);
@@ -3713,6 +3773,96 @@ function applyRowMasking(row) {
     masked[key] = isSensitiveColumnName(key) ? '***masked***' : value;
   });
   return masked;
+}
+
+function buildSupabaseTableAccessKey(userId, connectionId, tableName) {
+  return `${userId || 'anon'}:${connectionId || 'unknown'}:${tableName || 'table'}`;
+}
+
+function getSupabaseTableAccessSession(key) {
+  const session = supabaseTableAccess.get(key);
+  if (!session) return null;
+  if (session.expiresAt && session.expiresAt <= Date.now()) {
+    supabaseTableAccess.delete(key);
+    return null;
+  }
+  return session;
+}
+
+async function ensureSupabaseTableAccess(ctx, connectionId, tableName, action, page = 0) {
+  const userId = ctx.from?.id;
+  const accessKey = buildSupabaseTableAccessKey(userId, connectionId, tableName);
+  const session = getSupabaseTableAccessSession(accessKey);
+  if (session?.verifiedUntil && session.verifiedUntil > Date.now()) {
+    return true;
+  }
+
+  const token = Math.random().toString(36).slice(2, 8).toUpperCase();
+  supabaseTableAccess.set(accessKey, {
+    token,
+    expiresAt: Date.now() + SUPABASE_TABLE_ACCESS_TTL_MS,
+    verifiedUntil: null,
+  });
+
+  setUserState(ctx.from.id, {
+    type: 'supabase_table_auth',
+    connectionId,
+    tableName,
+    requestedAction: action,
+    page,
+    messageContext: getMessageTargetFromCtx(ctx),
+  });
+
+  await renderOrEdit(
+    ctx,
+    `🔐 Table access required for "${tableName}".\nRe-enter access token within 60s:\n${token}\n(Or press Cancel)`,
+    { reply_markup: buildCancelKeyboard() },
+  );
+  return false;
+}
+
+async function handleSupabaseTableAuthInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please enter the access token.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderOrEdit(ctx, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard(`supabase:tables:${state.connectionId}`),
+    });
+    return;
+  }
+
+  const accessKey = buildSupabaseTableAccessKey(ctx.from?.id, state.connectionId, state.tableName);
+  const session = getSupabaseTableAccessSession(accessKey);
+  if (!session) {
+    resetUserState(ctx);
+    await renderOrEdit(ctx, 'Access token expired. Please open the table again.', {
+      reply_markup: buildBackKeyboard(`supabase:tables:${state.connectionId}`),
+    });
+    return;
+  }
+  if (session.token !== text.trim().toUpperCase()) {
+    await ctx.reply('Invalid access token. Please try again.');
+    return;
+  }
+
+  session.verifiedUntil = Date.now() + SUPABASE_TABLE_ACCESS_TTL_MS;
+  session.expiresAt = Date.now() + SUPABASE_TABLE_ACCESS_TTL_MS;
+  supabaseTableAccess.set(accessKey, session);
+  clearUserState(ctx.from.id);
+
+  if (state.requestedAction === 'rows') {
+    await renderSupabaseTableRows(ctx, state.connectionId, state.tableName, Number(state.page) || 0);
+    return;
+  }
+  if (state.requestedAction === 'count') {
+    await renderSupabaseTableCount(ctx, state.connectionId, state.tableName);
+    return;
+  }
+  await renderSupabaseTableDetails(ctx, state.connectionId, state.tableName);
 }
 
 function quoteIdentifier(identifier) {
@@ -6034,7 +6184,8 @@ async function promptNextProjectField(ctx, state) {
     repoSlug:
       'Send GitHub repo as `owner/repo` (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
     workingDirConfirm: null,
-    workingDirCustom: 'Send working directory path (repo-relative recommended, or absolute).\n(Or press Cancel)',
+    workingDirCustom:
+      'Send working directory path (repo-relative preferred, e.g. "." or "apps/api"). Absolute paths are allowed but discouraged.\n(Or press Cancel)',
     githubTokenEnvKey:
       'GitHub token env key:\nDefault: GITHUB_TOKEN\nSend a custom env key or type `-` to use the default.',
     startCommand: 'Send *startCommand* (or Skip).\n(Or press Cancel)',
@@ -7086,6 +7237,10 @@ async function handleEditRepoStep(ctx, state) {
   const projects = await loadProjects();
   const idx = projects.findIndex((project) => project.id === state.projectId);
   if (idx === -1) {
+    console.warn('[githubToken] Project not found during edit', {
+      projectId: state.projectId,
+      userId: ctx.from?.id,
+    });
     await ctx.reply('Project not found.');
     clearUserState(ctx.from.id);
     return;
@@ -7110,6 +7265,10 @@ async function handleEditRepoStep(ctx, state) {
   projects[idx] = updatedProject;
   const saved = await saveProjectsWithFeedback(ctx, projects);
   if (!saved) {
+    console.warn('[githubToken] Failed to save project after edit', {
+      projectId: state.projectId,
+      userId: ctx.from?.id,
+    });
     clearUserState(ctx.from.id);
     return;
   }
@@ -7135,6 +7294,10 @@ async function handleEditWorkingDirStep(ctx, state) {
   const projects = await loadProjects();
   const idx = projects.findIndex((project) => project.id === state.projectId);
   if (idx === -1) {
+    console.warn('[workingDir] Project not found during edit', {
+      projectId: state.projectId,
+      userId: ctx.from?.id,
+    });
     await respond(ctx, 'Project not found.');
     clearUserState(ctx.from.id);
     return;
@@ -7191,6 +7354,10 @@ async function handleEditWorkingDirStep(ctx, state) {
 
   const saved = await saveProjectsWithFeedback(ctx, projects);
   if (!saved) {
+    console.warn('[workingDir] Failed to save project after edit', {
+      projectId: state.projectId,
+      userId: ctx.from?.id,
+    });
     clearUserState(ctx.from.id);
     return;
   }
@@ -7199,6 +7366,10 @@ async function handleEditWorkingDirStep(ctx, state) {
   const refreshedProjects = await loadProjects();
   const updatedProject = findProjectById(refreshedProjects, state.projectId);
   if (!updatedProject) {
+    console.warn('[workingDir] Project missing after save', {
+      projectId: state.projectId,
+      userId: ctx.from?.id,
+    });
     await respond(ctx, 'Project not found.');
     return;
   }
@@ -7217,6 +7388,72 @@ async function handleEditWorkingDirStep(ctx, state) {
   if (!state.messageContext) {
     await renderProjectSettings(ctx, state.projectId, notice);
   }
+}
+
+async function revalidateWorkingDir(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  const globalSettings = await loadGlobalSettings();
+  const baseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+  let checkoutDir = null;
+  let repoReady = false;
+  const lines = ['🔁 Re-checkout & Validate WorkingDir'];
+
+  try {
+    const prepared = await prepareRepository({ ...project, workingDir: undefined }, baseBranch);
+    checkoutDir = prepared?.repoDir || null;
+    repoReady = Boolean(checkoutDir);
+  } catch (error) {
+    lines.push(`Repo checkout: ❌ ${truncateText(error.message || 'failed', 120)}`);
+    await renderOrEdit(ctx, lines.join('\n'), {
+      reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
+    });
+    return;
+  }
+
+  lines.push(`Repo checkout: ${repoReady ? '✅ present' : '❌ missing'}`);
+  const resolvedWorkingDir = resolveWorkingDirAgainstCheckout(project.workingDir, checkoutDir);
+  lines.push(`Resolved workingDir: ${resolvedWorkingDir || '-'}`);
+
+  if (!resolvedWorkingDir) {
+    lines.push('❌ Validation failed: workingDir missing.');
+    await renderOrEdit(ctx, lines.join('\n'), {
+      reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
+    });
+    return;
+  }
+
+  let exists = true;
+  try {
+    await fs.stat(resolvedWorkingDir);
+  } catch (error) {
+    exists = false;
+    lines.push(`❌ Validation failed: ${error.code === 'ENOENT' ? 'path does not exist' : error.message}`);
+  }
+
+  const validation = await validateWorkingDir({ ...project, workingDir: project.workingDir || '.' });
+  if (!validation.ok) {
+    lines.push(`❌ Validation failed: ${validation.details}`);
+    if (validation.expectedCheckoutDir) {
+      lines.push(`Expected repo root: ${validation.expectedCheckoutDir}`);
+    }
+  }
+
+  if (exists && validation.ok && checkoutDir) {
+    const relative = path.relative(checkoutDir, resolvedWorkingDir) || '.';
+    project.workingDir = relative;
+    await saveProjects(projects);
+    lines.push(`✅ WorkingDir validated and saved as: ${relative}`);
+  }
+
+  await renderOrEdit(ctx, lines.join('\n'), {
+    reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
+  });
 }
 
 async function handleEditGithubTokenStep(ctx, state) {
@@ -7622,12 +7859,15 @@ async function buildHeavyDiagnosticsReport(project) {
   const lines = [];
   let repoInfo = null;
   let blockedReason = null;
+  let checkoutDir = null;
   const globalSettings = await loadGlobalSettings();
   const baseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
 
   try {
-    repoInfo = getRepoInfo(project);
-    await prepareRepository(project, baseBranch);
+    const projectForCheckout = { ...project, workingDir: undefined };
+    repoInfo = getRepoInfo(projectForCheckout);
+    const prepared = await prepareRepository(projectForCheckout, baseBranch);
+    checkoutDir = prepared?.repoDir || null;
   } catch (error) {
     if (error.message === 'Project is missing repoSlug') {
       blockedReason = 'repoSlug missing';
@@ -7636,16 +7876,19 @@ async function buildHeavyDiagnosticsReport(project) {
     }
   }
 
-  const workingDir = resolveProjectWorkingDir(project) || repoInfo?.workingDir;
+  const workingDir = resolveWorkingDirAgainstCheckout(project.workingDir, checkoutDir) || repoInfo?.workingDir;
   if (!workingDir) {
     blockedReason = blockedReason || 'workingDir missing';
   }
 
-  if (workingDir && !project.workingDir) {
-    await updateProjectField(project.id, 'workingDir', workingDir);
+  if (workingDir && !project.workingDir && checkoutDir) {
+    const relative = path.relative(checkoutDir, workingDir) || '.';
+    await updateProjectField(project.id, 'workingDir', relative);
   }
 
-  const validation = workingDir ? await validateWorkingDir({ ...project, workingDir }) : null;
+  const validation = workingDir
+    ? await validateWorkingDir({ ...project, workingDir: project.workingDir || '.' })
+    : null;
   if (validation && !validation.ok) {
     blockedReason = blockedReason || validation.details || 'workingDir invalid';
   }
@@ -8589,6 +8832,8 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     .text('📝 Edit repo', `proj:edit_repo:${project.id}`)
     .text('📁 Edit working dir', `proj:edit_workdir:${project.id}`)
     .row()
+    .text('🔁 Re-checkout & Validate WorkingDir', `proj:workdir_revalidate:${project.id}`)
+    .row()
     .text('🔑 Edit GitHub token', `proj:edit_github_token:${project.id}`)
     .row()
     .text('🧰 Edit commands', `proj:commands:${project.id}`)
@@ -9177,6 +9422,208 @@ async function renderProjectSqlMenu(ctx, projectId) {
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
+async function renderProjectDbMiniSite(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const envStatus = await buildEnvVaultDbStatus(project, envSetId);
+  const supabaseStatus = await buildSupabaseBindingStatus(project);
+
+  const lines = [
+    `🌐 DB mini-site — ${project.name || project.id}`,
+    '',
+    `Env Vault DB: ${envStatus.summary}`,
+    `Supabase binding: ${supabaseStatus.summary}`,
+    '',
+    'Choose an action:',
+  ];
+
+  const inline = new InlineKeyboard();
+  if (project.supabaseConnectionId) {
+    inline.text('📋 Tables', `supabase:tables:${project.supabaseConnectionId}`).row();
+  } else if (envStatus.ready) {
+    inline.text('📋 Tables', `proj:db_insights:${projectId}:0:0`).row();
+  }
+  inline
+    .text('📊 DB overview', `proj:db_insights:${projectId}:0:0`)
+    .row()
+    .text('📝 SQL runner', `proj:sql_menu:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function resolveDbInsightsSource(project) {
+  const envSetId = await ensureProjectEnvSet(project.id);
+  const envStatus = await buildEnvVaultDbStatus(project, envSetId);
+  if (envStatus.ready) {
+    return { source: 'env_vault', envSetId };
+  }
+  if (project.supabaseConnectionId) {
+    return { source: 'supabase', connectionId: project.supabaseConnectionId };
+  }
+  return { source: null };
+}
+
+async function runDbInsightsQuery(source, options) {
+  if (source === 'env_vault') {
+    const connection = await resolveEnvVaultConnection(options.projectId, options.envSetId);
+    if (!connection.dsn) {
+      throw new Error('Missing ENV Vault DB connection details.');
+    }
+    const poolKey = `${options.projectId}:${options.envSetId}`;
+    let pool = envVaultPools.get(poolKey);
+    if (!pool) {
+      pool = new Pool({ connectionString: connection.dsn });
+      envVaultPools.set(poolKey, pool);
+    }
+    return pool.query({ ...options.query, query_timeout: DB_INSIGHTS_QUERY_TIMEOUT_MS });
+  }
+  return runSupabaseQuery(options.connectionId, {
+    ...options.query,
+    query_timeout: DB_INSIGHTS_QUERY_TIMEOUT_MS,
+  });
+}
+
+function formatDbInsightsTimestamp(value) {
+  if (!value) return '-';
+  try {
+    return new Date(value).toISOString();
+  } catch (error) {
+    return String(value);
+  }
+}
+
+function formatDbInsightsSampleRow(row) {
+  const masked = applyRowMasking(row);
+  return formatSqlRow(masked);
+}
+
+async function fetchDbInsightsTables(sourceInfo, page) {
+  const offset = Math.max(0, page) * DB_INSIGHTS_TABLE_PAGE_SIZE;
+  const query = {
+    text: `
+      SELECT
+        t.table_schema,
+        t.table_name,
+        c.reltuples::bigint AS estimate_rows,
+        GREATEST(s.last_vacuum, s.last_autovacuum, s.last_analyze, s.last_autoanalyze) AS last_stats
+      FROM information_schema.tables t
+      LEFT JOIN pg_namespace n ON n.nspname = t.table_schema
+      LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
+      LEFT JOIN pg_stat_user_tables s ON s.schemaname = t.table_schema AND s.relname = t.table_name
+      WHERE t.table_type = 'BASE TABLE'
+        AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
+      ORDER BY t.table_schema, t.table_name
+      LIMIT $1 OFFSET $2;
+    `,
+    values: [DB_INSIGHTS_TABLE_PAGE_SIZE + 1, offset],
+  };
+
+  const result = await runDbInsightsQuery(sourceInfo.source, {
+    ...sourceInfo,
+    query,
+  });
+  const rows = result.rows || [];
+  return {
+    tables: rows.slice(0, DB_INSIGHTS_TABLE_PAGE_SIZE),
+    hasNext: rows.length > DB_INSIGHTS_TABLE_PAGE_SIZE,
+  };
+}
+
+async function fetchDbInsightsSamples(sourceInfo, tables) {
+  const samples = new Map();
+  for (const table of tables) {
+    const query = {
+      text: `SELECT * FROM ${quoteIdentifier(table.table_schema)}.${quoteIdentifier(table.table_name)} LIMIT $1;`,
+      values: [DB_INSIGHTS_SAMPLE_SIZE],
+    };
+    try {
+      const result = await runDbInsightsQuery(sourceInfo.source, {
+        ...sourceInfo,
+        query,
+      });
+      samples.set(`${table.table_schema}.${table.table_name}`, result.rows || []);
+    } catch (error) {
+      samples.set(`${table.table_schema}.${table.table_name}`, {
+        error: truncateText(error.message || 'sample failed', 80),
+      });
+    }
+  }
+  return samples;
+}
+
+async function renderProjectDbInsights(ctx, projectId, page = 0, sample = 0) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+
+  const sourceInfo = await resolveDbInsightsSource(project);
+  if (!sourceInfo.source) {
+    await renderOrEdit(ctx, 'No DB connection available for insights.', {
+      reply_markup: buildBackKeyboard(`proj:open:${projectId}`),
+    });
+    return;
+  }
+
+  const safePage = Math.max(0, Number.isFinite(page) ? page : 0);
+  const includeSample = Number(sample) === 1;
+  const { tables, hasNext } = await fetchDbInsightsTables(sourceInfo, safePage);
+  const samples = includeSample ? await fetchDbInsightsSamples(sourceInfo, tables) : new Map();
+
+  const lines = [
+    `📊 DB Insights — ${project.name || project.id}`,
+    `Source: ${sourceInfo.source === 'env_vault' ? 'Env Vault' : 'Supabase'}`,
+    `Page: ${safePage + 1}`,
+    `Sample rows: ${includeSample ? `ON (n=${DB_INSIGHTS_SAMPLE_SIZE})` : 'OFF'}`,
+    '',
+  ];
+
+  if (!tables.length) {
+    lines.push('No tables found.');
+  } else {
+    tables.forEach((table) => {
+      const tableLabel = `${table.table_schema}.${table.table_name}`;
+      const estimate = table.estimate_rows == null ? '-' : `~${table.estimate_rows}`;
+      const lastStats = formatDbInsightsTimestamp(table.last_stats);
+      lines.push(`• ${tableLabel} — rows ${estimate} — last stats ${lastStats}`);
+      if (includeSample) {
+        const sampleRows = samples.get(tableLabel);
+        if (Array.isArray(sampleRows)) {
+          if (sampleRows.length) {
+            sampleRows.slice(0, DB_INSIGHTS_SAMPLE_SIZE).forEach((row) => {
+              lines.push(`  ↳ ${formatDbInsightsSampleRow(row)}`);
+            });
+          } else {
+            lines.push('  ↳ (no rows)');
+          }
+        } else if (sampleRows?.error) {
+          lines.push(`  ↳ sample error: ${sampleRows.error}`);
+        }
+      }
+    });
+  }
+
+  const inline = new InlineKeyboard();
+  if (safePage > 0) {
+    inline.text('⬅️ Prev', `proj:db_insights:${projectId}:${safePage - 1}:${includeSample ? 1 : 0}`);
+  }
+  if (hasNext) {
+    inline.text('➡️ Next', `proj:db_insights:${projectId}:${safePage + 1}:${includeSample ? 1 : 0}`);
+  }
+  if (safePage > 0 || hasNext) {
+    inline.row();
+  }
+  inline
+    .text(includeSample ? '🧪 Sample: ON' : '🧪 Sample: OFF', `proj:db_insights:${projectId}:${safePage}:${includeSample ? 0 : 1}`)
+    .row()
+    .text('⬅️ Back', `proj:db_mini:${projectId}`);
+
+  await renderOrEdit(ctx, truncateMessage(lines.join('\n'), SUPABASE_MESSAGE_LIMIT), {
+    reply_markup: inline,
+  });
+}
+
 async function ensureProjectEnvSet(projectId) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
@@ -9607,37 +10054,183 @@ async function renderDataCenterMenu(ctx) {
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
-async function buildDataCenterView(ctx) {
-  const connections = await loadSupabaseConnections();
-  const cronSettings = await getEffectiveCronSettings();
-  const cronStatus = await getCronStatusLine(ctx, cronSettings);
-  const lines = [
-    '🗄️ Database',
-    `🧩 Config DB: ${
-      runtimeStatus.configDbOk
-        ? '✅ OK'
-        : `❌ ERROR – ${runtimeStatus.configDbError || 'see logs'}`
-    }`,
-    `⏱️ ${cronStatus}`,
-  ];
+async function resolveEnvVaultDbKeyStatus(project, envSetId) {
+  const keys = await listEnvVarKeys(project.id, envSetId);
+  const getKeyStatus = async (key) => {
+    if (!keys.includes(key)) {
+      return { key, status: 'MISSING', value: null };
+    }
+    const value = await getEnvVarValue(project.id, key, envSetId);
+    return { key, status: evaluateEnvValueStatus(value).status, value };
+  };
 
-  if (!connections.length) {
-    lines.push('🗄️ Supabase connections: none configured.');
-  } else {
-    lines.push('🗄️ Supabase connections:');
-    connections.forEach((connection) => {
-      lines.push(`• ${connection.id} – env: ${connection.envKey}`);
-    });
+  if (keys.includes('DATABASE_URL')) {
+    const status = await getKeyStatus('DATABASE_URL');
+    return { keyName: status.key, status: status.status, source: 'project_env_vault', value: status.value };
+  }
+  if (keys.includes('SUPABASE_DSN')) {
+    const status = await getKeyStatus('SUPABASE_DSN');
+    return { keyName: status.key, status: status.status, source: 'project_env_vault', value: status.value };
   }
 
-  const inline = new InlineKeyboard()
-    .text('➕ Add Supabase connection', 'supabase:add')
-    .row()
-    .text('🧾 List connections', 'supabase:connections')
-    .row();
+  const hasSupabaseUrl = keys.includes('SUPABASE_URL');
+  const roleKey = keys.includes('SUPABASE_SERVICE_ROLE_KEY')
+    ? 'SUPABASE_SERVICE_ROLE_KEY'
+    : keys.includes('SUPABASE_SERVICE_ROLE')
+      ? 'SUPABASE_SERVICE_ROLE'
+      : null;
+  if (hasSupabaseUrl && roleKey) {
+    const urlValue = await getEnvVarValue(project.id, 'SUPABASE_URL', envSetId);
+    const roleValue = await getEnvVarValue(project.id, roleKey, envSetId);
+    const status = evaluateEnvValueStatus(urlValue).status === 'SET' && evaluateEnvValueStatus(roleValue).status === 'SET'
+      ? 'SET'
+      : 'MISSING';
+    return {
+      keyName: `SUPABASE_URL+${roleKey}`,
+      status,
+      source: 'computed_default',
+      value: status === 'SET' ? buildSupabaseDsnFromUrl(urlValue, roleValue) : null,
+    };
+  }
 
-  if (cronSettings.enabled) {
-    inline.text('⏰ Cron jobs', 'cron:menu').row();
+  return null;
+}
+
+function resolveRuntimeDbKeyStatus() {
+  const runtimeDatabase = process.env.DATABASE_URL;
+  if (runtimeDatabase) {
+    return { keyName: 'DATABASE_URL', status: evaluateEnvValueStatus(runtimeDatabase).status, source: 'runtime', value: runtimeDatabase };
+  }
+  const runtimeDsn = process.env.SUPABASE_DSN;
+  if (runtimeDsn) {
+    return { keyName: 'SUPABASE_DSN', status: evaluateEnvValueStatus(runtimeDsn).status, source: 'runtime', value: runtimeDsn };
+  }
+  const runtimeSupabaseUrl = process.env.SUPABASE_URL;
+  const runtimeRole = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE;
+  if (runtimeSupabaseUrl && runtimeRole) {
+    const status =
+      evaluateEnvValueStatus(runtimeSupabaseUrl).status === 'SET' &&
+      evaluateEnvValueStatus(runtimeRole).status === 'SET'
+        ? 'SET'
+        : 'MISSING';
+    return {
+      keyName: `SUPABASE_URL+${process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SUPABASE_SERVICE_ROLE_KEY' : 'SUPABASE_SERVICE_ROLE'}`,
+      status,
+      source: 'computed_default',
+      value: status === 'SET' ? buildSupabaseDsnFromUrl(runtimeSupabaseUrl, runtimeRole) : null,
+    };
+  }
+  return null;
+}
+
+function resolveDbTypeFromKey(keyName, value) {
+  const haystack = `${keyName || ''} ${value || ''}`.toLowerCase();
+  if (haystack.includes('supabase')) return 'Supabase';
+  if (haystack.includes('postgres')) return 'Postgres';
+  if (keyName) return 'Postgres';
+  return 'Unknown';
+}
+
+async function resolveProjectDbCardInfo(project) {
+  let keyInfo = null;
+  if (isEnvVaultAvailable()) {
+    try {
+      const envSetId = await ensureProjectEnvSet(project.id);
+      keyInfo = await resolveEnvVaultDbKeyStatus(project, envSetId);
+    } catch (error) {
+      console.warn('[db] Failed to resolve Env Vault DB status', {
+        projectId: project.id,
+        error: error.message,
+      });
+    }
+  }
+  if (!keyInfo) {
+    keyInfo = resolveRuntimeDbKeyStatus();
+  }
+  if (!keyInfo && project.databaseUrl) {
+    keyInfo = {
+      keyName: 'DATABASE_URL (project config)',
+      status: evaluateEnvValueStatus(project.databaseUrl).status,
+      source: 'computed_default',
+      value: project.databaseUrl,
+    };
+  }
+  if (!keyInfo && project.supabaseConnectionId) {
+    const connection = await findSupabaseConnection(project.supabaseConnectionId);
+    if (connection) {
+      const dsnInfo = await resolveSupabaseConnectionDsn(connection);
+      keyInfo = {
+        keyName: connection.envKey,
+        status: dsnInfo.dsn ? 'SET' : 'MISSING',
+        source: 'project_env_vault',
+        value: dsnInfo.dsn,
+      };
+    } else {
+      keyInfo = {
+        keyName: 'Supabase binding (missing)',
+        status: 'MISSING',
+        source: 'computed_default',
+        value: null,
+      };
+    }
+  }
+
+  if (!keyInfo) {
+    return {
+      ready: false,
+      dbType: 'Unknown',
+      keyName: '-',
+      status: 'MISSING',
+      source: 'computed_default',
+    };
+  }
+
+  const normalizedStatus = keyInfo.status === 'SET' ? 'SET' : 'MISSING';
+  const dbType = resolveDbTypeFromKey(keyInfo.keyName, keyInfo.value);
+  return {
+    ready: normalizedStatus === 'SET',
+    dbType,
+    keyName: keyInfo.keyName,
+    status: normalizedStatus,
+    source: keyInfo.source,
+  };
+}
+
+async function buildDataCenterView(ctx) {
+  const projects = await loadProjects();
+  const lines = ['🗄️ Database', ''];
+  const inline = new InlineKeyboard();
+  const cards = [];
+
+  for (const project of projects) {
+    const info = await resolveProjectDbCardInfo(project);
+    cards.push({ project, info });
+  }
+
+  const configuredCards = cards.filter((card) => card.info.ready);
+  if (!configuredCards.length) {
+    lines.push('No databases configured.');
+    inline.text('Configure per-project DB', 'proj:list').row();
+  } else {
+    cards.forEach(({ project, info }, index) => {
+      const name = project.name || project.id;
+      lines.push(
+        `📦 ${name} (🆔 ${project.id})`,
+        `- DB type: ${info.dbType}`,
+        `- Source: ${info.source}`,
+        `- Key: ${info.keyName} (${info.status})`,
+      );
+      if (index < cards.length - 1) {
+        lines.push('');
+      }
+      inline
+        .text('Open mini-site', `proj:db_mini:${project.id}`)
+        .text('Edit DB config', `proj:db_config:${project.id}`)
+        .row()
+        .text('Run DB overview', `proj:db_insights:${project.id}:0:0`)
+        .text('SQL runner', `proj:sql_menu:${project.id}`)
+        .row();
+    });
   }
 
   inline.text('⬅️ Back', 'main:back');
@@ -9753,7 +10346,7 @@ async function renderRenderUrlsScreen(ctx, projectId) {
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
-async function renderSupabaseScreen(ctx, projectId) {
+async function renderDatabaseBindingMenu(ctx, projectId, notice) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
@@ -9761,14 +10354,86 @@ async function renderSupabaseScreen(ctx, projectId) {
     return;
   }
 
-  const lines = [`supabaseConnectionId: ${project.supabaseConnectionId || '-'}`];
-  const inline = new InlineKeyboard().text('✏️ Edit', `proj:supabase_edit:${project.id}`);
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const envStatus = await buildEnvVaultDbStatus(project, envSetId);
+  const supabaseStatus = await buildSupabaseBindingStatus(project);
+  const lines = [
+    `🗄️ Database binding — ${project.name || project.id}`,
+    notice || null,
+    '',
+    `Env Vault DB: ${envStatus.summary}`,
+    `Supabase binding: ${supabaseStatus.summary}`,
+    '',
+    'DB URLs are stored in Env Vault (DATABASE_URL by default) — no external env vars required.',
+    'Use Env Vault to map a custom key if needed.',
+  ].filter(Boolean);
+
+  const inline = new InlineKeyboard()
+    .text('📥 Import DB URL', `proj:db_import:${project.id}`)
+    .row()
+    .text('✏️ Edit Supabase binding', `proj:supabase_edit:${project.id}`);
+
   if (project.supabaseConnectionId) {
-    inline.text('🧹 Clear', `proj:supabase_clear:${project.id}`);
+    inline.text('🧹 Clear Supabase binding', `proj:supabase_clear:${project.id}`);
   }
-  inline.row().text('⬅️ Back', `proj:open:${project.id}`);
+
+  inline
+    .row()
+    .text('🔐 Env Vault', `envvault:menu:${project.id}`)
+    .row()
+    .text('⬅️ Back', `proj:open:${project.id}`);
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderSupabaseScreen(ctx, projectId) {
+  await renderDatabaseBindingMenu(ctx, projectId);
+}
+
+async function startDatabaseImportFlow(ctx, projectId) {
+  if (!isEnvVaultAvailable()) {
+    await renderOrEdit(ctx, buildEnvVaultUnavailableMessage('Env Vault unavailable.'), {
+      reply_markup: buildBackKeyboard(`proj:db_config:${projectId}`),
+    });
+    return;
+  }
+  setUserState(ctx.from.id, {
+    type: 'db_import_url',
+    projectId,
+    messageContext: getMessageTargetFromCtx(ctx),
+  });
+  await renderOrEdit(
+    ctx,
+    'Send the DB URL to store in Env Vault as DATABASE_URL.\n(Use Env Vault if you want to map a custom key.)\n(Or press Cancel)',
+    { reply_markup: buildCancelKeyboard() },
+  );
+}
+
+async function handleDatabaseImportInput(ctx, state) {
+  const raw = ctx.message.text?.trim();
+  if (!raw) {
+    await ctx.reply('Please send the DB URL.');
+    return;
+  }
+  if (raw.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderDatabaseBindingMenu(ctx, state.projectId, 'Operation cancelled.');
+    return;
+  }
+  if (!raw.includes('://')) {
+    await ctx.reply('DB URL must include a scheme (for example: postgres://...).');
+    return;
+  }
+  const envSetId = await ensureProjectEnvSet(state.projectId);
+  try {
+    await upsertEnvVar(state.projectId, 'DATABASE_URL', raw, envSetId);
+  } catch (error) {
+    console.error('[db] Failed to import DB URL', error);
+    await ctx.reply(`Failed to save DB URL: ${error.message}`);
+    return;
+  }
+  clearUserState(ctx.from.id);
+  await renderDatabaseBindingMenu(ctx, state.projectId, '✅ DB URL imported into Env Vault.');
 }
 
 function buildGlobalSettingsView(settings, projects, notice) {
@@ -10002,9 +10667,6 @@ async function runPingTest(ctx) {
     const fetchCheck = await checkGitFetch(repoInfo.repoUrl, tokenInfo.token, baseBranch);
     addCheck(fetchCheck.status, 'Git fetch', fetchCheck.detail, fetchCheck.hint);
   }
-
-  const configDb = await checkConfigDbStatus();
-  addCheck(configDb.ok ? 'ok' : 'fail', 'Config DB', configDb.message, configDb.ok ? null : 'Set PATH_APPLIER_CONFIG_DSN.');
 
   const supabaseCheck = await checkSupabaseConnections();
   supabaseCheck.forEach((entry) => addCheck(entry.status, entry.label, entry.detail, entry.hint));
@@ -10315,6 +10977,15 @@ function resolveProjectWorkingDir(project) {
     return path.resolve(checkoutDir, workingDir);
   }
   return path.resolve(workingDir);
+}
+
+function resolveWorkingDirAgainstCheckout(workingDir, checkoutDir) {
+  if (!checkoutDir) return null;
+  const base = workingDir || '.';
+  if (path.isAbsolute(base)) {
+    return path.resolve(base);
+  }
+  return path.resolve(checkoutDir, base);
 }
 
 function classifyDiagnosticsError({ result, project, workingDir, validation }) {
