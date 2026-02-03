@@ -61,7 +61,7 @@ const {
   updateTelegramTestStatus,
   renameTelegramBotProjectId,
 } = require('./telegramBotStore');
-const { getMasterKeyStatus, MASTER_KEY_ERROR_MESSAGE } = require('./envVaultCrypto');
+const { encryptSecret, getMasterKeyStatus, MASTER_KEY_ERROR_MESSAGE } = require('./envVaultCrypto');
 const {
   setWebhook,
   getWebhookInfo,
@@ -140,7 +140,11 @@ const DB_INSIGHTS_SAMPLE_SIZE = 3;
 const DB_INSIGHTS_QUERY_TIMEOUT_MS = 4000;
 const SUPABASE_TABLE_ACCESS_TTL_MS = 60_000;
 const MINI_SITE_TOKEN = process.env.DB_MINI_SITE_TOKEN || process.env.MINI_SITE_TOKEN;
-const MINI_SITE_SESSION_TTL_MS = 10 * 60 * 1000;
+const MINI_SITE_SESSION_DEFAULT_TTL_MINUTES = 10;
+const MINI_SITE_SESSION_MIN_TTL_MINUTES = 10;
+const MINI_SITE_SESSION_CLOCK_SKEW_MS = 30 * 1000;
+const MINI_SITE_SESSION_SECRET =
+  process.env.DB_MINI_SITE_SESSION_SECRET || process.env.MINI_SITE_SESSION_SECRET || null;
 const MINI_SITE_SESSION_COOKIE = 'pm_db_session';
 const MINI_SITE_EDIT_SESSION_COOKIE = 'pm_db_edit_session';
 const MINI_SITE_SETTINGS_KEY = 'dbMiniSite';
@@ -173,7 +177,6 @@ const supabasePools = new Map();
 const envVaultPools = new Map();
 const miniSitePools = new Map();
 const supabaseTableAccess = new Map();
-const miniSiteSessions = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
 const userState = new Map();
@@ -701,6 +704,57 @@ function parseEnvVaultImportText(text) {
 
 function isSupabaseUrl(value) {
   return typeof value === 'string' && value.startsWith('https://') && value.includes('.supabase.co');
+}
+
+function extractSupabaseProjectRef(input) {
+  const trimmed = String(input || '').trim();
+  if (!trimmed) return null;
+  if (trimmed.includes('supabase.co')) {
+    try {
+      const url = trimmed.startsWith('http') ? trimmed : `https://${trimmed}`;
+      const parsed = new URL(url);
+      const host = parsed.hostname || '';
+      const candidate = host.split('.')[0];
+      return candidate || null;
+    } catch (error) {
+      return null;
+    }
+  }
+  const sanitized = trimmed.replace(/[^a-zA-Z0-9-_]/g, '');
+  if (!sanitized) return null;
+  return sanitized;
+}
+
+function buildSupabaseUrlFromRef(projectRef) {
+  return `https://${projectRef}.supabase.co`;
+}
+
+function maskSupabaseKey(token) {
+  const raw = String(token || '');
+  if (!raw) return '••••';
+  const suffix = raw.slice(-4);
+  return `••••${suffix}`;
+}
+
+function buildSupabaseKeyStorage(rawKey) {
+  const trimmed = String(rawKey || '').trim();
+  const hashed = crypto.createHash('sha256').update(trimmed).digest('hex');
+  if (getMasterKeyStatus().ok) {
+    try {
+      return {
+        stored: encryptSecret(trimmed),
+        storage: 'encrypted',
+        mask: maskSupabaseKey(trimmed),
+      };
+    } catch (error) {
+      // fall back to hash storage
+    }
+  }
+  return {
+    stored: `sha256:${hashed}`,
+    storage: 'hashed',
+    mask: maskSupabaseKey(trimmed),
+  };
 }
 
 function validateEnvValue(key, value) {
@@ -1405,8 +1459,8 @@ async function handleStatefulMessage(ctx, state) {
     case 'edit_render_url':
       await handleEditRenderUrl(ctx, state);
       break;
-    case 'edit_supabase':
-      await handleEditSupabase(ctx, state);
+    case 'supabase_binding':
+      await handleSupabaseBindingInput(ctx, state);
       break;
     case 'db_import_url':
       await handleDatabaseImportInput(ctx, state);
@@ -1788,17 +1842,77 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'supabase_edit':
       setUserState(ctx.from.id, {
-        type: 'edit_supabase',
+        type: 'supabase_binding',
         projectId,
+        step: 'project_ref',
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await renderOrEdit(ctx, 'Send new supabaseConnectionId.\n(Or press Cancel)', {
-        reply_markup: buildCancelKeyboard(),
-      });
+      await renderOrEdit(
+        ctx,
+        'Send Supabase project ref (the first part of https://<ref>.supabase.co).\nJWT strings are API keys, not DB DSN.\n(Or press Cancel)',
+        { reply_markup: buildCancelKeyboard() },
+      );
       break;
+    case 'supabase_key_type': {
+      const state = getUserState(ctx.from.id);
+      if (!state || state.type !== 'supabase_binding' || state.step !== 'key_type') {
+        await ctx.answerCallbackQuery({
+          text: 'Supabase binding flow not active. Please restart.',
+          show_alert: true,
+        });
+        return;
+      }
+      const keyType = extra === 'service_role' ? 'service_role' : 'anon';
+      setUserState(ctx.from.id, {
+        ...state,
+        step: 'key_input',
+        supabaseKeyType: keyType,
+      });
+      await renderOrEdit(
+        ctx,
+        'Paste the Supabase API key (JWT).\nIt will be shown once, then masked.\nJWT strings are API keys, not DB DSN.\n(Or press Cancel)',
+        { reply_markup: buildCancelKeyboard() },
+      );
+      break;
+    }
+    case 'supabase_toggle': {
+      const projects = await loadProjects();
+      const project = findProjectById(projects, projectId);
+      if (!project) {
+        await renderOrEdit(ctx, 'Project not found.');
+        return;
+      }
+      const nextEnabled = !resolveSupabaseEnabled(project);
+      const idx = projects.findIndex((p) => p.id === projectId);
+      projects[idx] = { ...projects[idx], supabaseEnabled: nextEnabled };
+      await saveProjectsWithFeedback(ctx, projects);
+      await renderDatabaseBindingMenu(
+        ctx,
+        projectId,
+        nextEnabled ? '✅ Supabase binding enabled.' : '🚫 Supabase binding disabled.',
+      );
+      break;
+    }
     case 'supabase_clear':
-      await updateProjectField(projectId, 'supabaseConnectionId', undefined);
-      await renderProjectSettings(ctx, projectId);
+      {
+        const projects = await loadProjects();
+        const idx = projects.findIndex((p) => p.id === projectId);
+        if (idx === -1) {
+          await renderOrEdit(ctx, 'Project not found.');
+          return;
+        }
+        projects[idx] = {
+          ...projects[idx],
+          supabaseProjectRef: undefined,
+          supabaseUrl: undefined,
+          supabaseKeyType: undefined,
+          supabaseKey: undefined,
+          supabaseKeyMask: undefined,
+          supabaseEnabled: false,
+        };
+        await saveProjectsWithFeedback(ctx, projects);
+      }
+      await renderDatabaseBindingMenu(ctx, projectId, '🧹 Supabase binding cleared.');
       break;
     case 'sql_menu':
       await renderProjectSqlMenu(ctx, projectId);
@@ -4091,8 +4205,8 @@ async function resolveSupabaseConnectionDsn(connection) {
     }
     return { dsn, source: connection.envKey, error: null };
   } catch (error) {
-    console.error('[supabase] Failed to read DSN from Env Vault', error);
-    await forwardSelfLog('error', 'Failed to read Supabase DSN from Env Vault', {
+    console.error('[supabase] Failed to read DB URL from Env Vault', error);
+    await forwardSelfLog('error', 'Failed to read Supabase URL/API key from Env Vault', {
       context: {
         envKey: connection.envKey,
         error: error?.message,
@@ -4371,7 +4485,7 @@ async function renderSupabaseConnectionsMenu(ctx) {
   const inline = new InlineKeyboard();
   statuses.forEach((status) => {
     lines.push(
-      `• ${status.connection.name} (${status.connection.id}) — env: ${status.connection.envKey} — DSN: ${status.dsnStatus} — Connect: ${status.connectStatus}`,
+      `• ${status.connection.name} (${status.connection.id}) — env: ${status.connection.envKey} — DB URL: ${status.dsnStatus} — Connect: ${status.connectStatus}`,
     );
     inline
       .text(`🗄️ ${status.connection.name}`, `supabase:conn:${status.connection.id}`)
@@ -4393,7 +4507,7 @@ async function renderSupabaseConnectionMenu(ctx, connectionId) {
   const lines = [
     `DB Explorer: ${connection.name}`,
     `Env key: ${connection.envKey}`,
-    `DSN: ${dsnInfo.dsn ? '✅ present' : `❌ ${dsnInfo.error}`}`,
+    `DB URL: ${dsnInfo.dsn ? '✅ present' : `❌ ${dsnInfo.error}`}`,
   ];
   const inline = new InlineKeyboard()
     .text('📋 Tables', `supabase:tables:${connectionId}`)
@@ -6371,7 +6485,7 @@ async function runSupabaseQuery(connectionId, sql) {
   }
   const dsnInfo = await resolveSupabaseConnectionDsn(connection);
   if (!dsnInfo.dsn) {
-    throw new Error(dsnInfo.error || `Supabase DSN not configured for ${connection.name}.`);
+    throw new Error(dsnInfo.error || `Supabase URL/API key not configured for ${connection.name}.`);
   }
   const pool = await getSupabasePool(connectionId, dsnInfo.dsn);
   return pool.query(normalizeSupabaseQuery(sql));
@@ -8152,7 +8266,7 @@ async function handleEditRenderUrl(ctx, state) {
   }
 }
 
-async function handleEditSupabase(ctx, state) {
+async function handleSupabaseBindingInput(ctx, state) {
   const text = ctx.message.text?.trim();
   if (!text) {
     await ctx.reply('Please send text.');
@@ -8160,23 +8274,92 @@ async function handleEditSupabase(ctx, state) {
   }
   if (text.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.');
-    await renderMainMenu(ctx);
+    await renderDatabaseBindingMenu(ctx, state.projectId, 'Operation cancelled.');
     return;
   }
 
-  const updated = await updateProjectField(state.projectId, 'supabaseConnectionId', text);
-  if (!updated) {
-    await ctx.reply('Project not found.');
+  if (state.step === 'project_ref') {
+    const projectRef = extractSupabaseProjectRef(text);
+    if (!projectRef) {
+      await ctx.reply('Invalid Supabase project ref. Use the first part of https://<ref>.supabase.co.');
+      return;
+    }
+    const suggestedUrl = buildSupabaseUrlFromRef(projectRef);
+    setUserState(ctx.from.id, {
+      ...state,
+      step: 'url',
+      supabaseProjectRef: projectRef,
+      supabaseUrl: suggestedUrl,
+      messageContext: state.messageContext || getMessageTargetFromCtx(ctx),
+    });
+    await renderOrEdit(
+      ctx,
+      `Supabase URL (default: ${suggestedUrl}).\nSend URL or "-" to use the default.\nJWT strings are API keys, not DB DSN.\n(Or press Cancel)`,
+      { reply_markup: buildCancelKeyboard() },
+    );
+    return;
+  }
+
+  if (state.step === 'url') {
+    const chosen = text.trim() === '-' ? state.supabaseUrl : text.trim();
+    if (!isSupabaseUrl(chosen)) {
+      await ctx.reply('Supabase URL must start with https:// and include .supabase.co.');
+      return;
+    }
+    setUserState(ctx.from.id, {
+      ...state,
+      step: 'key_type',
+      supabaseUrl: chosen,
+      messageContext: state.messageContext || getMessageTargetFromCtx(ctx),
+    });
+    const inline = new InlineKeyboard()
+      .text('Anon (recommended)', `proj:supabase_key_type:${state.projectId}:anon`)
+      .text('Service role (dangerous)', `proj:supabase_key_type:${state.projectId}:service_role`);
+    await renderOrEdit(ctx, 'Select Supabase API key type:', { reply_markup: inline });
+    return;
+  }
+
+  if (state.step === 'key_input') {
+    if (!state.supabaseKeyType) {
+      await ctx.reply('Supabase key type not selected. Please restart the binding flow.');
+      clearUserState(ctx.from.id);
+      await renderDatabaseBindingMenu(ctx, state.projectId);
+      return;
+    }
+    const storage = buildSupabaseKeyStorage(text);
+    const projects = await loadProjects();
+    const idx = projects.findIndex((p) => p.id === state.projectId);
+    if (idx === -1) {
+      await ctx.reply('Project not found.');
+      clearUserState(ctx.from.id);
+      return;
+    }
+    projects[idx] = {
+      ...projects[idx],
+      supabaseProjectRef: state.supabaseProjectRef,
+      supabaseUrl: state.supabaseUrl,
+      supabaseKeyType: state.supabaseKeyType,
+      supabaseKey: storage.stored,
+      supabaseKeyMask: storage.mask,
+      supabaseEnabled: true,
+    };
+    await saveProjectsWithFeedback(ctx, projects);
     clearUserState(ctx.from.id);
+    const storageNotice =
+      storage.storage === 'hashed'
+        ? 'Supabase API key stored as a hash (Env Vault master key missing).'
+        : 'Supabase API key stored securely.';
+    await renderDatabaseBindingMenu(
+      ctx,
+      state.projectId,
+      `✅ Supabase binding saved (${state.supabaseKeyType}).\n${storageNotice}`,
+    );
     return;
   }
 
+  await ctx.reply('Unexpected Supabase binding step. Please restart.');
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
-  if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
-  }
+  await renderDatabaseBindingMenu(ctx, state.projectId);
 }
 
 async function handleEditServiceHealthInput(ctx, state) {
@@ -8417,14 +8600,13 @@ async function buildLightDiagnosticsReport(project, options = {}) {
     detail: telegramCheck.detail || 'unknown',
   });
 
-  const supabaseEnabled =
-    resolveProjectFeatureFlag(project, 'supabaseEnabled') === true || project?.supabaseEnabled === true;
-  if (!supabaseEnabled) {
-    checks.push({ status: 'ok', label: 'Supabase binding', detail: 'not enabled' });
-  } else if (!project.supabaseConnectionId) {
-    checks.push({ status: 'fail', label: 'Supabase binding', detail: 'connectionId missing' });
+  const supabaseStatus = await buildSupabaseBindingStatus(project);
+  if (!supabaseStatus.enabled) {
+    checks.push({ status: 'ok', label: 'Supabase binding', detail: supabaseStatus.summary });
+  } else if (!supabaseStatus.ready) {
+    checks.push({ status: 'fail', label: 'Supabase binding', detail: supabaseStatus.summary });
   } else {
-    checks.push({ status: 'ok', label: 'Supabase binding', detail: project.supabaseConnectionId });
+    checks.push({ status: 'ok', label: 'Supabase binding', detail: supabaseStatus.summary });
   }
 
   const runModeNormalized = String(project?.runMode || project?.run_mode || '').toLowerCase();
@@ -9313,8 +9495,7 @@ async function getMissingRequirements(project) {
     resolveProjectFeatureFlag(project, 'databaseEnabled') === true ||
     project?.databaseEnabled === true ||
     project?.dbEnabled === true;
-  const supabaseEnabled =
-    resolveProjectFeatureFlag(project, 'supabaseEnabled') === true || project?.supabaseEnabled === true;
+  const supabaseEnabled = resolveSupabaseEnabled(project);
   const healthPath = project?.healthPath || project?.health_path;
   const servicePort =
     project?.servicePort || project?.expectedPort || project?.port || project?.healthPort;
@@ -9390,14 +9571,17 @@ async function getMissingRequirements(project) {
     });
   }
 
-  if (supabaseEnabled && isMissingRequirementValue(project?.supabaseConnectionId)) {
-    missing.push({
-      key: 'supabaseConnection',
-      title: 'Supabase binding missing',
-      description: 'Bind Supabase connection to enable DB features for this project.',
-      severity: 'required',
-      fixAction: 'FIX_SUPABASE_BINDING',
-    });
+  if (supabaseEnabled) {
+    const supabaseMissing = getSupabaseBindingMissingFields(project);
+    if (supabaseMissing.length) {
+      missing.push({
+        key: 'supabaseConnection',
+        title: 'Supabase binding missing',
+        description: `Add Supabase project ref, URL, and API key (${supabaseMissing.join(', ')}).`,
+        severity: 'required',
+        fixAction: 'FIX_SUPABASE_BINDING',
+      });
+    }
   }
 
   if (runModeNormalized === 'service') {
@@ -9521,7 +9705,10 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
     `- 🪝 deploy hook: ${project.renderDeployHookUrl || '-'}`,
     '',
     '🗄️ Database:',
-    `- 🔗 connectionId: ${project.supabaseConnectionId || '-'}`,
+    `- Supabase enabled: ${resolveSupabaseEnabled(project) ? 'yes' : 'no'}`,
+    `- Supabase project ref: ${project.supabaseProjectRef || '-'}`,
+    `- Supabase URL: ${project.supabaseUrl || '-'}`,
+    `- Supabase API key: ${getSupabaseKeyMask(project)} (${project.supabaseKeyType || '-'})`,
   ].filter((line) => line !== null);
 
   const inline = new InlineKeyboard()
@@ -10125,7 +10312,7 @@ async function renderProjectSqlMenu(ctx, projectId) {
     inline.text('➕ Add missing required keys', `envvault:add_missing:${projectId}`).row();
   }
   if (project.supabaseConnectionId) {
-    inline.text('🗄 Use Supabase binding', `proj:sql_supabase:${projectId}`).row();
+    inline.text('🗄 Use Supabase connection', `proj:sql_supabase:${projectId}`).row();
   }
   inline.text('⬅️ Back', `proj:open:${projectId}`);
 
@@ -10214,7 +10401,6 @@ async function rotateProjectDbMiniSiteToken(ctx, projectId) {
   const ready = await ensureMiniSiteDbAvailable(ctx, projectId);
   if (!ready.ok) return;
   const result = await ensureMiniSiteAdminToken({ rotate: true });
-  miniSiteSessions.clear();
   if (result.token) {
     await sendMiniSiteAdminTokenOnce(ctx, result.token, result.settings, 'Rotated');
   }
@@ -10228,23 +10414,25 @@ async function openProjectDbMiniSite(ctx, projectId) {
   if (result.created && result.token) {
     await sendMiniSiteAdminTokenOnce(ctx, result.token, result.settings, 'Auto-generated');
   }
-  const sessionToken = createMiniSiteSession({
+  const { settings: miniSiteSettings } = await getMiniSiteSettingsState();
+  const sessionTtlMs = resolveMiniSiteSessionTtlMs(miniSiteSettings);
+  const sessionTtlMinutes = Math.round(sessionTtlMs / 60000);
+  const sessionToken = await createMiniSiteSession({
     scope: 'link',
-    ttlMs: MINI_SITE_SESSION_TTL_MS,
-    singleUse: true,
+    ttlMs: sessionTtlMs,
   });
   const baseUrl = getPublicBaseUrl().replace(/\/$/, '');
   const miniSiteUrl = `${baseUrl}/db-mini/${encodeURIComponent(projectId)}?session=${encodeURIComponent(
     sessionToken,
   )}`;
   const inline = new InlineKeyboard()
-    .url('🌐 Open mini-site (10 min)', miniSiteUrl)
+    .url(`🌐 Open mini-site (${sessionTtlMinutes} min)`, miniSiteUrl)
     .row()
     .text('⬅️ Back', `proj:db_config:${projectId}`);
   const lines = [
     `🌐 DB mini-site — ${ready.project.name || ready.project.id}`,
     '',
-    'Session link (valid for 10 minutes):',
+    `Session link (expires in ${sessionTtlMinutes} minutes):`,
     miniSiteUrl,
   ];
   await renderOrEdit(ctx, lines.join('\n'), {
@@ -10453,19 +10641,36 @@ async function buildEnvVaultDbStatus(project, envSetId) {
   return { ready: false, summary: `⚠️ Missing: ${missing.join(', ')}`, missingRequired: missing };
 }
 
+function resolveSupabaseEnabled(project) {
+  return resolveProjectFeatureFlag(project, 'supabaseEnabled') === true || project?.supabaseEnabled === true;
+}
+
+function getSupabaseBindingMissingFields(project) {
+  const missing = [];
+  if (isMissingRequirementValue(project?.supabaseProjectRef)) missing.push('projectRef');
+  if (isMissingRequirementValue(project?.supabaseUrl)) missing.push('supabaseUrl');
+  if (isMissingRequirementValue(project?.supabaseKeyType)) missing.push('keyType');
+  if (isMissingRequirementValue(project?.supabaseKey)) missing.push('apiKey');
+  return missing;
+}
+
+function getSupabaseKeyMask(project) {
+  if (project?.supabaseKeyMask) return project.supabaseKeyMask;
+  if (project?.supabaseKey) return 'configured';
+  return 'not set';
+}
+
 async function buildSupabaseBindingStatus(project) {
-  if (!project.supabaseConnectionId) {
-    return { ready: false, summary: 'not configured' };
+  const enabled = resolveSupabaseEnabled(project);
+  const missing = getSupabaseBindingMissingFields(project);
+  if (!enabled) {
+    return { ready: false, summary: 'not set (optional)', enabled, missing };
   }
-  const connection = await findSupabaseConnection(project.supabaseConnectionId);
-  if (!connection) {
-    return { ready: false, summary: 'missing connection' };
+  if (missing.length) {
+    return { ready: false, summary: `missing required fields: ${missing.join(', ')}`, enabled, missing };
   }
-  const dsnInfo = await resolveSupabaseConnectionDsn(connection);
-  if (!dsnInfo.dsn) {
-    return { ready: false, summary: dsnInfo.error || `env ${connection.envKey} missing` };
-  }
-  return { ready: true, summary: `✅ ${connection.id}` };
+  const keyType = project.supabaseKeyType || 'unknown';
+  return { ready: true, summary: `set (${keyType})`, enabled, missing };
 }
 
 async function resolveEnvVaultConnection(projectId, envSetId) {
@@ -10672,35 +10877,101 @@ async function markMiniSiteTokenShown(settings) {
   return saveMiniSiteSettingsState(settings, updated);
 }
 
-function pruneMiniSiteSessions(now = Date.now()) {
-  for (const [tokenHash, session] of miniSiteSessions.entries()) {
-    if (!session || session.expiresAt <= now) {
-      miniSiteSessions.delete(tokenHash);
-    }
+function resolveMiniSiteSessionTtlMinutes(settings) {
+  const settingValue = Number(settings?.[MINI_SITE_SETTINGS_KEY]?.sessionTtlMinutes);
+  const envValue = Number(
+    process.env.DB_MINI_SITE_SESSION_TTL_MINUTES || process.env.MINI_SITE_SESSION_TTL_MINUTES,
+  );
+  const resolved = Number.isFinite(envValue) && envValue > 0
+    ? envValue
+    : Number.isFinite(settingValue) && settingValue > 0
+      ? settingValue
+      : MINI_SITE_SESSION_DEFAULT_TTL_MINUTES;
+  return Math.max(MINI_SITE_SESSION_MIN_TTL_MINUTES, resolved);
+}
+
+function resolveMiniSiteSessionTtlMs(settings) {
+  return resolveMiniSiteSessionTtlMinutes(settings) * 60 * 1000;
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(value, 'base64url').toString('utf8');
+}
+
+function isMiniSiteSignatureValid(token, secret) {
+  if (!token || !secret) return false;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const [payload, signature] = parts;
+  const expected = base64UrlEncode(crypto.createHmac('sha256', secret).update(payload).digest());
+  const left = Buffer.from(signature);
+  const right = Buffer.from(expected);
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+async function ensureMiniSiteSessionSecret() {
+  if (MINI_SITE_SESSION_SECRET) {
+    return { secret: MINI_SITE_SESSION_SECRET, fromEnv: true };
   }
+  const { settings, miniSite } = await getMiniSiteSettingsState();
+  if (miniSite.sessionSecret) {
+    return { secret: miniSite.sessionSecret, fromEnv: false };
+  }
+  const secret = crypto.randomBytes(32).toString('base64url');
+  const nextMiniSite = {
+    ...miniSite,
+    sessionSecret: secret,
+    sessionSecretCreatedAt: new Date().toISOString(),
+  };
+  await saveMiniSiteSettingsState(settings, nextMiniSite);
+  return { secret, fromEnv: false };
 }
 
-function createMiniSiteSession({ scope, ttlMs, singleUse }) {
-  const token = crypto.randomBytes(32).toString('base64url');
-  const tokenHash = hashMiniSiteToken(token);
-  const expiresAt = Date.now() + ttlMs;
-  miniSiteSessions.set(tokenHash, { scope, expiresAt, singleUse: Boolean(singleUse) });
-  return token;
+async function createMiniSiteSession({ scope, ttlMs }) {
+  const { secret } = await ensureMiniSiteSessionSecret();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiresSeconds = nowSeconds + Math.floor(ttlMs / 1000);
+  const payload = {
+    v: 1,
+    scope,
+    iat: nowSeconds,
+    exp: expiresSeconds,
+    nonce: crypto.randomBytes(8).toString('base64url'),
+  };
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signature = base64UrlEncode(crypto.createHmac('sha256', secret).update(encodedPayload).digest());
+  return `${encodedPayload}.${signature}`;
 }
 
-function validateMiniSiteSession(token, scope, { consume = false } = {}) {
+async function validateMiniSiteSession(token, scope) {
   if (!token) return { ok: false, reason: 'missing' };
-  pruneMiniSiteSessions();
-  const tokenHash = hashMiniSiteToken(token);
-  const session = miniSiteSessions.get(tokenHash);
-  if (!session) return { ok: false, reason: 'missing' };
-  if (session.scope !== scope) return { ok: false, reason: 'scope' };
-  if (session.expiresAt <= Date.now()) {
-    miniSiteSessions.delete(tokenHash);
-    return { ok: false, reason: 'expired' };
+  const { secret } = await ensureMiniSiteSessionSecret();
+  const parts = token.split('.');
+  if (parts.length !== 2) return { ok: false, reason: 'invalid_format' };
+  const [payloadPart] = parts;
+  if (!isMiniSiteSignatureValid(token, secret)) {
+    return { ok: false, reason: 'invalid_signature' };
   }
-  if (session.singleUse && consume) {
-    miniSiteSessions.delete(tokenHash);
+  let payload = null;
+  try {
+    payload = JSON.parse(base64UrlDecode(payloadPart));
+  } catch (error) {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+  if (!payload?.exp || !payload?.iat) return { ok: false, reason: 'invalid_payload' };
+  if (payload.scope !== scope) return { ok: false, reason: 'invalid_scope' };
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const leewaySeconds = Math.floor(MINI_SITE_SESSION_CLOCK_SKEW_MS / 1000);
+  if (payload.iat - nowSeconds > leewaySeconds) {
+    return { ok: false, reason: 'clock_skew' };
+  }
+  if (nowSeconds > payload.exp + leewaySeconds) {
+    return { ok: false, reason: 'expired' };
   }
   return { ok: true };
 }
@@ -10723,18 +10994,18 @@ function isMiniSiteAdminTokenValid(token, adminTokenHash) {
   return compareHashedTokens(candidateHash, adminTokenHash);
 }
 
-function isMiniSiteAuthed(req, adminTokenHash) {
+async function isMiniSiteAuthed(req, adminTokenHash) {
   const bearerToken = getBearerToken(req);
   if (isMiniSiteAdminTokenValid(bearerToken, adminTokenHash)) return true;
   const cookies = parseCookies(req);
-  return validateMiniSiteSession(cookies[MINI_SITE_SESSION_COOKIE], 'browse').ok;
+  return (await validateMiniSiteSession(cookies[MINI_SITE_SESSION_COOKIE], 'browse')).ok;
 }
 
-function isMiniSiteEditAuthed(req, adminTokenHash) {
+async function isMiniSiteEditAuthed(req, adminTokenHash) {
   const bearerToken = getBearerToken(req);
   if (isMiniSiteAdminTokenValid(bearerToken, adminTokenHash)) return true;
   const cookies = parseCookies(req);
-  return validateMiniSiteSession(cookies[MINI_SITE_EDIT_SESSION_COOKIE], 'edit').ok;
+  return (await validateMiniSiteSession(cookies[MINI_SITE_EDIT_SESSION_COOKIE], 'edit')).ok;
 }
 
 function renderMiniSiteLogin(message) {
@@ -10846,7 +11117,7 @@ async function handleProjectSqlInput(ctx, state) {
   if (state.source === 'supabase') {
     const project = await getProjectById(state.projectId, ctx);
     if (!project?.supabaseConnectionId) {
-      await ctx.reply('Supabase binding is not configured.');
+      await ctx.reply('Supabase connection is not configured.');
     } else {
       await runSupabaseSql(ctx, project.supabaseConnectionId, sql);
     }
@@ -11254,7 +11525,7 @@ async function resolveProjectDbCardInfo(project) {
       };
     } else {
       keyInfo = {
-        keyName: 'Supabase binding (missing)',
+        keyName: 'Supabase connection (missing)',
         status: 'MISSING',
         source: 'computed_default',
         value: null,
@@ -11463,26 +11734,40 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
   const miniSiteTokenLabel = miniSiteTokenConfigured
     ? `${miniSiteTokenMask || 'configured'}${miniSiteTokenSource}`
     : 'not configured';
+  const supabaseEnabledLabel = supabaseStatus.enabled ? '✅ enabled' : '⚪ disabled';
   const lines = [
     `🗄️ Database binding — ${project.name || project.id}`,
     notice || null,
     '',
     `Env Vault DB: ${envStatus.summary}`,
+    `Supabase enabled: ${supabaseEnabledLabel}`,
     `Supabase binding: ${supabaseStatus.summary}`,
+    `Supabase project ref: ${project.supabaseProjectRef || '-'}`,
+    `Supabase URL: ${project.supabaseUrl || '-'}`,
+    `Supabase API key: ${getSupabaseKeyMask(project)} (${project.supabaseKeyType || '-'})`,
     '',
     `Mini-site DB: ${miniSiteDbReady ? '✅ ready' : '⚠️ missing'}`,
     `Mini-site token: ${miniSiteTokenLabel}`,
     '',
     'DB URLs are stored in Env Vault (DATABASE_URL by default) — no external env vars required.',
     'Use Env Vault to map a custom key if needed.',
+    'JWT strings are API keys, not DB DSN.',
   ].filter(Boolean);
 
   const inline = new InlineKeyboard()
     .text('📥 Import DB URL', `proj:db_import:${project.id}`)
     .row()
+    .text(supabaseStatus.enabled ? '🚫 Disable Supabase binding' : '✅ Enable Supabase binding', `proj:supabase_toggle:${project.id}`)
+    .row()
     .text('✏️ Edit Supabase binding', `proj:supabase_edit:${project.id}`);
 
-  if (project.supabaseConnectionId) {
+  if (
+    project.supabaseProjectRef ||
+    project.supabaseUrl ||
+    project.supabaseKey ||
+    project.supabaseKeyMask ||
+    project.supabaseKeyType
+  ) {
     inline.text('🧹 Clear Supabase binding', `proj:supabase_clear:${project.id}`);
   }
 
@@ -12240,7 +12525,7 @@ async function checkSupabaseConnections() {
       results.push({
         status: 'fail',
         label: `Supabase (${connection.name})`,
-        detail: dsnInfo.error || 'missing DSN',
+        detail: dsnInfo.error || 'missing DB URL',
         hint: `Set ${connection.envKey} in Env Vault.`,
       });
       continue;
@@ -12254,7 +12539,7 @@ async function checkSupabaseConnections() {
         status: 'fail',
         label: `Supabase (${connection.name})`,
         detail: truncateText(error.message || 'connect failed', 60),
-        hint: 'Verify DSN/SSL settings.',
+        hint: 'Verify DB URL/SSL settings.',
       });
     }
   }
@@ -12662,19 +12947,24 @@ async function handleMiniSiteRequest(req, res, url) {
     return true;
   }
 
+  const sessionTtlMs = resolveMiniSiteSessionTtlMs(miniSiteSettings);
+
   if (req.method === 'GET' && url.searchParams.has('session')) {
     const sessionToken = url.searchParams.get('session');
-    const sessionCheck = validateMiniSiteSession(sessionToken, 'link', { consume: true });
+    const sessionCheck = await validateMiniSiteSession(sessionToken, 'link');
     if (!sessionCheck.ok) {
       console.warn('[mini-site] invalid session token', { path: url.pathname, reason: sessionCheck.reason });
       res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Session token is invalid or expired.');
+      if (sessionCheck.reason === 'expired') {
+        res.end('Session token expired. Generate a new link from the bot.');
+      } else {
+        res.end('Session token invalid. Generate a new link from the bot.');
+      }
       return true;
     }
-    const browseToken = createMiniSiteSession({
+    const browseToken = await createMiniSiteSession({
       scope: 'browse',
-      ttlMs: MINI_SITE_SESSION_TTL_MS,
-      singleUse: false,
+      ttlMs: sessionTtlMs,
     });
     const redirectUrl = new URL(url.toString());
     redirectUrl.searchParams.delete('session');
@@ -12684,7 +12974,7 @@ async function handleMiniSiteRequest(req, res, url) {
       'Set-Cookie': buildMiniSiteCookie(
         MINI_SITE_SESSION_COOKIE,
         browseToken,
-        Math.floor(MINI_SITE_SESSION_TTL_MS / 1000),
+        Math.floor(sessionTtlMs / 1000),
       ),
     });
     res.end();
@@ -12699,17 +12989,16 @@ async function handleMiniSiteRequest(req, res, url) {
       res.end(renderMiniSiteLogin('Invalid token. Try again.'));
       return true;
     }
-    const browseToken = createMiniSiteSession({
+    const browseToken = await createMiniSiteSession({
       scope: 'browse',
-      ttlMs: MINI_SITE_SESSION_TTL_MS,
-      singleUse: false,
+      ttlMs: sessionTtlMs,
     });
     res.writeHead(302, {
       Location: '/db-mini',
       'Set-Cookie': buildMiniSiteCookie(
         MINI_SITE_SESSION_COOKIE,
         browseToken,
-        Math.floor(MINI_SITE_SESSION_TTL_MS / 1000),
+        Math.floor(sessionTtlMs / 1000),
       ),
     });
     res.end();
@@ -12724,10 +13013,9 @@ async function handleMiniSiteRequest(req, res, url) {
       res.end(renderMiniSiteEditLogin(form.redirect || '/db-mini'));
       return true;
     }
-    const editToken = createMiniSiteSession({
+    const editToken = await createMiniSiteSession({
       scope: 'edit',
       ttlMs: MINI_SITE_EDIT_TOKEN_TTL_SEC * 1000,
-      singleUse: false,
     });
     res.writeHead(302, {
       Location: form.redirect || '/db-mini',
@@ -12737,7 +13025,7 @@ async function handleMiniSiteRequest(req, res, url) {
     return true;
   }
 
-  if (!isMiniSiteAuthed(req, adminTokenHash)) {
+  if (!(await isMiniSiteAuthed(req, adminTokenHash))) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderMiniSiteLogin());
     return true;
@@ -12931,7 +13219,7 @@ async function handleMiniSiteRequest(req, res, url) {
     }
 
     const editMode = url.searchParams.get('edit') === '1';
-    if (editMode && !isMiniSiteEditAuthed(req, adminTokenHash)) {
+    if (editMode && !(await isMiniSiteEditAuthed(req, adminTokenHash))) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteEditLogin(url.pathname + url.search));
       return true;
@@ -12990,7 +13278,7 @@ async function handleMiniSiteRequest(req, res, url) {
   }
 
   if (req.method === 'POST' && pathParts.length === 8 && pathParts[2] === 'table' && pathParts[5] === 'row' && pathParts[7] === 'edit') {
-    if (!isMiniSiteEditAuthed(req, adminTokenHash)) {
+    if (!(await isMiniSiteEditAuthed(req, adminTokenHash))) {
       res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteEditLogin(url.pathname.replace(/\/edit$/, '')));
       return true;
