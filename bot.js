@@ -6,12 +6,10 @@ if (!require.extensions['.ts']) {
 
 process.on('unhandledRejection', (reason) => {
   console.error('[FATAL] Unhandled promise rejection', reason);
-  process.exit(1);
 });
 
 process.on('uncaughtException', (error) => {
   console.error('[FATAL] Uncaught exception', error?.stack || error);
-  process.exit(1);
 });
 
 console.error('[boot] starting');
@@ -150,6 +148,9 @@ const MINI_SITE_EDIT_SESSION_COOKIE = 'pm_db_edit_session';
 const MINI_SITE_SETTINGS_KEY = 'dbMiniSite';
 const MINI_SITE_PAGE_SIZE = 25;
 const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
+const PROJECT_DB_SSL_DEFAULT_MODE = 'require';
+const PROJECT_DB_SSL_DEFAULT_VERIFY = true;
+const PROJECT_DB_SSL_MODES = new Set(['disable', 'require', 'verify-full']);
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
 const LOG_API_ADMIN_CHAT_ID =
   process.env.TELEGRAM_ADMIN_CHAT_ID ||
@@ -1786,6 +1787,18 @@ async function handleProjectCallback(ctx, data) {
     case 'db_config':
       resetUserState(ctx);
       await renderDatabaseBindingMenu(ctx, projectId);
+      break;
+    case 'db_ssl_settings':
+      resetUserState(ctx);
+      await renderProjectDbSslSettings(ctx, projectId);
+      break;
+    case 'db_ssl_mode':
+      resetUserState(ctx);
+      await updateProjectDbSslMode(ctx, projectId, extra);
+      break;
+    case 'db_ssl_verify':
+      resetUserState(ctx);
+      await toggleProjectDbSslVerify(ctx, projectId);
       break;
     case 'db_import':
       resetUserState(ctx);
@@ -10334,6 +10347,8 @@ async function renderProjectDbMiniSite(ctx, projectId) {
   const miniSiteTokenLabel = miniSiteTokenConfigured
     ? `${miniSiteTokenMask || 'configured'}${miniSiteTokenSource}`
     : 'not configured';
+  const sslSettings = resolveProjectDbSslSettings(project);
+  const sslSummary = formatProjectDbSslSummary(sslSettings);
 
   const lines = [
     `🌐 DB mini-site — ${project.name || project.id}`,
@@ -10343,6 +10358,7 @@ async function renderProjectDbMiniSite(ctx, projectId) {
     '',
     `Mini-site DB: ${miniSiteDbReady ? '✅ ready' : '⚠️ missing'}`,
     `Mini-site token: ${miniSiteTokenLabel}`,
+    `SSL: ${sslSummary}`,
   ];
 
   const inline = new InlineKeyboard();
@@ -10703,6 +10719,61 @@ function buildSupabaseDsnFromUrl(supabaseUrl, serviceRoleKey) {
   return `postgres://postgres:${password}@db.${projectRef}.supabase.co:5432/postgres?sslmode=require`;
 }
 
+function normalizeProjectDbSslMode(value) {
+  if (!value) return PROJECT_DB_SSL_DEFAULT_MODE;
+  const normalized = String(value).toLowerCase();
+  if (PROJECT_DB_SSL_MODES.has(normalized)) return normalized;
+  return PROJECT_DB_SSL_DEFAULT_MODE;
+}
+
+function resolveProjectDbSslSettings(project) {
+  const sslMode = normalizeProjectDbSslMode(project?.dbSslMode);
+  const sslVerify =
+    typeof project?.dbSslVerify === 'boolean' ? project.dbSslVerify : PROJECT_DB_SSL_DEFAULT_VERIFY;
+  return { sslMode, sslVerify };
+}
+
+function formatProjectDbSslSummary(settings) {
+  const verifyLabel = settings.sslVerify ? 'verify' : 'no-verify';
+  return `${settings.sslMode} (${verifyLabel})`;
+}
+
+function buildPgSslOptions(settings) {
+  if (!settings || settings.sslMode === 'disable') return null;
+  if (settings.sslVerify === false) return { rejectUnauthorized: false };
+  return { rejectUnauthorized: true };
+}
+
+function buildMiniSitePoolKey(dsn, settings) {
+  if (!dsn) return null;
+  const sslMode = settings?.sslMode || PROJECT_DB_SSL_DEFAULT_MODE;
+  const sslVerify = settings?.sslVerify ? 'verify' : 'no-verify';
+  return `${dsn}::ssl=${sslMode}:${sslVerify}`;
+}
+
+function buildMiniSiteRequestId() {
+  return crypto.randomBytes(6).toString('hex');
+}
+
+function renderMiniSiteDbErrorPage({ requestId, adminHint }) {
+  const hintBlock = adminHint
+    ? `
+      <div class="card">
+        <h4>Admin hint</h4>
+        <p>${adminHint}</p>
+      </div>
+    `
+    : '';
+  const body = `
+    <div class="card">
+      <h3>Database unavailable</h3>
+      <p class="muted">Request ID: ${escapeHtml(requestId)}</p>
+    </div>
+    ${hintBlock}
+  `;
+  return renderMiniSiteLayout('Database unavailable', body);
+}
+
 async function resolveMiniSiteDbConnection(project) {
   if (!project) return { dsn: null, source: 'missing_project' };
   if (isEnvVaultAvailable()) {
@@ -10730,12 +10801,19 @@ async function resolveMiniSiteDbConnection(project) {
   return { dsn: null, source: 'missing' };
 }
 
-function getMiniSitePool(dsn) {
+function getMiniSitePool(dsn, sslSettings) {
   if (!dsn) return null;
-  if (!miniSitePools.has(dsn)) {
-    miniSitePools.set(dsn, new Pool({ connectionString: dsn }));
+  const poolKey = buildMiniSitePoolKey(dsn, sslSettings);
+  if (!poolKey) return null;
+  if (!miniSitePools.has(poolKey)) {
+    const poolConfig = { connectionString: dsn };
+    const sslOptions = buildPgSslOptions(sslSettings);
+    if (sslOptions) {
+      poolConfig.ssl = sslOptions;
+    }
+    miniSitePools.set(poolKey, new Pool(poolConfig));
   }
-  return miniSitePools.get(dsn);
+  return miniSitePools.get(poolKey);
 }
 
 async function listMiniSiteTables(pool) {
@@ -11569,20 +11647,23 @@ async function buildDataCenterView(ctx) {
 
   for (const project of projects) {
     const info = await resolveProjectDbCardInfo(project);
-    cards.push({ project, info });
+    const sslSettings = resolveProjectDbSslSettings(project);
+    const sslSummary = formatProjectDbSslSummary(sslSettings);
+    cards.push({ project, info, sslSummary });
   }
 
   if (!cards.length) {
     lines.push('No projects configured yet.');
     inline.text('Configure per-project DB', ensureCallbackData('Configure per-project DB', 'proj:list')).row();
   } else {
-    cards.forEach(({ project, info }, index) => {
+    cards.forEach(({ project, info, sslSummary }, index) => {
       const name = project.name || project.id;
       lines.push(
         `📦 ${name} (🆔 ${project.id})`,
         `DB type: ${info.dbType}`,
         `Source: ${info.source}`,
         `Key: ${info.keyName} (${info.status})`,
+        `SSL: ${sslSummary}`,
       );
       inline
         .text(`📦 ${name} (🆔 ${project.id})`, ensureCallbackData(`Project ${project.id}`, `proj:open:${project.id}`))
@@ -11735,6 +11816,8 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
     ? `${miniSiteTokenMask || 'configured'}${miniSiteTokenSource}`
     : 'not configured';
   const supabaseEnabledLabel = supabaseStatus.enabled ? '✅ enabled' : '⚪ disabled';
+  const sslSettings = resolveProjectDbSslSettings(project);
+  const sslSummary = formatProjectDbSslSummary(sslSettings);
   const lines = [
     `🗄️ Database binding — ${project.name || project.id}`,
     notice || null,
@@ -11748,6 +11831,7 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
     '',
     `Mini-site DB: ${miniSiteDbReady ? '✅ ready' : '⚠️ missing'}`,
     `Mini-site token: ${miniSiteTokenLabel}`,
+    `SSL: ${sslSummary}`,
     '',
     'DB URLs are stored in Env Vault (DATABASE_URL by default) — no external env vars required.',
     'Use Env Vault to map a custom key if needed.',
@@ -11756,6 +11840,8 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
 
   const inline = new InlineKeyboard()
     .text('📥 Import DB URL', `proj:db_import:${project.id}`)
+    .row()
+    .text('🔐 SSL settings', `proj:db_ssl_settings:${project.id}`)
     .row()
     .text(supabaseStatus.enabled ? '🚫 Disable Supabase binding' : '✅ Enable Supabase binding', `proj:supabase_toggle:${project.id}`)
     .row()
@@ -11789,6 +11875,76 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
     .text('⬅️ Back', `proj:open:${project.id}`);
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderProjectDbSslSettings(ctx, projectId, notice) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await ctx.reply('Project not found.');
+    return;
+  }
+
+  const settings = resolveProjectDbSslSettings(project);
+  const lines = [
+    `🔐 DB SSL settings — ${project.name || project.id}`,
+    notice || null,
+    '',
+    `SSL mode: ${settings.sslMode}`,
+    `SSL verify: ${settings.sslVerify ? '✅ on' : '⚠️ off'}`,
+    '',
+    'These settings apply to DB mini-site connections.',
+  ].filter(Boolean);
+
+  const inline = new InlineKeyboard()
+    .text(`${settings.sslMode === 'disable' ? '✅' : '⚪'} disable`, `proj:db_ssl_mode:${project.id}:disable`)
+    .text(`${settings.sslMode === 'require' ? '✅' : '⚪'} require`, `proj:db_ssl_mode:${project.id}:require`)
+    .row()
+    .text(`${settings.sslMode === 'verify-full' ? '✅' : '⚪'} verify-full`, `proj:db_ssl_mode:${project.id}:verify-full`)
+    .row()
+    .text(
+      `SSL verify: ${settings.sslVerify ? '✅ on' : '⚪ off'}`,
+      `proj:db_ssl_verify:${project.id}`,
+    )
+    .row()
+    .text('⬅️ Back', `proj:db_config:${project.id}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function updateProjectDbSslMode(ctx, projectId, mode) {
+  if (!PROJECT_DB_SSL_MODES.has(mode)) {
+    await renderProjectDbSslSettings(ctx, projectId);
+    return;
+  }
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  project.dbSslMode = mode;
+  const saved = await saveProjectsWithFeedback(ctx, projects);
+  if (!saved) return;
+  await renderProjectDbSslSettings(ctx, projectId, `✅ SSL mode set to ${mode}.`);
+}
+
+async function toggleProjectDbSslVerify(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const current = resolveProjectDbSslSettings(project);
+  project.dbSslVerify = !current.sslVerify;
+  const saved = await saveProjectsWithFeedback(ctx, projects);
+  if (!saved) return;
+  await renderProjectDbSslSettings(
+    ctx,
+    projectId,
+    `✅ SSL verify ${project.dbSslVerify ? 'enabled' : 'disabled'}.`,
+  );
 }
 
 async function renderSupabaseScreen(ctx, projectId) {
@@ -12938,401 +13094,432 @@ async function handleMiniSiteRequest(req, res, url) {
   if (!url.pathname.startsWith('/db-mini')) {
     return false;
   }
-  const { settings: miniSiteSettings } = await getMiniSiteSettingsState();
-  const adminTokenHash = getMiniSiteAdminTokenHash(miniSiteSettings);
-  if (!adminTokenHash) {
-    console.warn('[mini-site] token missing', { path: url.pathname });
-    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('DB mini-site token is not configured. Use the bot to enable the mini-site.');
-    return true;
-  }
+  const requestId = buildMiniSiteRequestId();
+  let adminTokenHash = null;
+  let project = null;
 
-  const sessionTtlMs = resolveMiniSiteSessionTtlMs(miniSiteSettings);
-
-  if (req.method === 'GET' && url.searchParams.has('session')) {
-    const sessionToken = url.searchParams.get('session');
-    const sessionCheck = await validateMiniSiteSession(sessionToken, 'link');
-    if (!sessionCheck.ok) {
-      console.warn('[mini-site] invalid session token', { path: url.pathname, reason: sessionCheck.reason });
+  try {
+    const { settings: miniSiteSettings } = await getMiniSiteSettingsState();
+    adminTokenHash = getMiniSiteAdminTokenHash(miniSiteSettings);
+    if (!adminTokenHash) {
+      console.warn('[mini-site] token missing', { path: url.pathname });
       res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
-      if (sessionCheck.reason === 'expired') {
-        res.end('Session token expired. Generate a new link from the bot.');
-      } else {
-        res.end('Session token invalid. Generate a new link from the bot.');
+      res.end('DB mini-site token is not configured. Use the bot to enable the mini-site.');
+      return true;
+    }
+
+    const sessionTtlMs = resolveMiniSiteSessionTtlMs(miniSiteSettings);
+
+    if (req.method === 'GET' && url.searchParams.has('session')) {
+      const sessionToken = url.searchParams.get('session');
+      const sessionCheck = await validateMiniSiteSession(sessionToken, 'link');
+      if (!sessionCheck.ok) {
+        console.warn('[mini-site] invalid session token', { path: url.pathname, reason: sessionCheck.reason });
+        res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+        if (sessionCheck.reason === 'expired') {
+          res.end('Session token expired. Generate a new link from the bot.');
+        } else {
+          res.end('Session token invalid. Generate a new link from the bot.');
+        }
+        return true;
       }
-      return true;
-    }
-    const browseToken = await createMiniSiteSession({
-      scope: 'browse',
-      ttlMs: sessionTtlMs,
-    });
-    const redirectUrl = new URL(url.toString());
-    redirectUrl.searchParams.delete('session');
-    const location = `${redirectUrl.pathname}${redirectUrl.search}` || '/db-mini';
-    res.writeHead(302, {
-      Location: location,
-      'Set-Cookie': buildMiniSiteCookie(
-        MINI_SITE_SESSION_COOKIE,
-        browseToken,
-        Math.floor(sessionTtlMs / 1000),
-      ),
-    });
-    res.end();
-    return true;
-  }
-
-  if (req.method === 'POST' && url.pathname === '/db-mini/login') {
-    const body = await readRequestBody(req);
-    const form = parseFormBody(body);
-    if (!isMiniSiteAdminTokenValid(form.token, adminTokenHash)) {
-      res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderMiniSiteLogin('Invalid token. Try again.'));
-      return true;
-    }
-    const browseToken = await createMiniSiteSession({
-      scope: 'browse',
-      ttlMs: sessionTtlMs,
-    });
-    res.writeHead(302, {
-      Location: '/db-mini',
-      'Set-Cookie': buildMiniSiteCookie(
-        MINI_SITE_SESSION_COOKIE,
-        browseToken,
-        Math.floor(sessionTtlMs / 1000),
-      ),
-    });
-    res.end();
-    return true;
-  }
-
-  if (req.method === 'POST' && url.pathname === '/db-mini/edit-login') {
-    const body = await readRequestBody(req);
-    const form = parseFormBody(body);
-    if (!isMiniSiteAdminTokenValid(form.token, adminTokenHash)) {
-      res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderMiniSiteEditLogin(form.redirect || '/db-mini'));
-      return true;
-    }
-    const editToken = await createMiniSiteSession({
-      scope: 'edit',
-      ttlMs: MINI_SITE_EDIT_TOKEN_TTL_SEC * 1000,
-    });
-    res.writeHead(302, {
-      Location: form.redirect || '/db-mini',
-      'Set-Cookie': buildMiniSiteCookie(MINI_SITE_EDIT_SESSION_COOKIE, editToken, MINI_SITE_EDIT_TOKEN_TTL_SEC),
-    });
-    res.end();
-    return true;
-  }
-
-  if (!(await isMiniSiteAuthed(req, adminTokenHash))) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteLogin());
-    return true;
-  }
-
-  const pathParts = url.pathname.split('/').filter(Boolean);
-  const projectId = pathParts[1] ? decodeURIComponent(pathParts[1]) : null;
-
-  if (req.method === 'GET' && pathParts.length === 1) {
-    const projects = await loadProjects();
-    const cards = projects
-      .map((project) => {
-        const label = escapeHtml(project.name || project.id);
-        return `
-          <div class="card">
-            <h3>${label}</h3>
-            <p class="muted">ID: ${escapeHtml(project.id)}</p>
-            <a class="button" href="/db-mini/${encodeURIComponent(project.id)}">Open project</a>
-          </div>
-        `;
-      })
-      .join('');
-    const body = cards || '<p class="muted">No projects configured yet.</p>';
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteLayout('Project list', body));
-    return true;
-  }
-
-  const project = projectId ? await getProjectById(projectId) : null;
-  if (!project) {
-    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteLayout('Project not found', '<p>Unknown project.</p>'));
-    return true;
-  }
-
-  const connection = await resolveMiniSiteDbConnection(project);
-  if (!connection.dsn) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(
-      renderMiniSiteLayout(
-        'Database not configured',
-        `<div class="card"><p>Database connection missing for this project.</p><p class="muted">Source: ${escapeHtml(connection.source || '-')}</p></div>`,
-      ),
-    );
-    return true;
-  }
-  const pool = getMiniSitePool(connection.dsn);
-  if (!pool) {
-    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Failed to connect to database.');
-    return true;
-  }
-
-  if (req.method === 'GET' && pathParts.length === 2) {
-    const tables = await listMiniSiteTables(pool);
-    const body = `
-      <div class="card">
-        <h3>${escapeHtml(project.name || project.id)}</h3>
-        <p class="muted">Source: ${escapeHtml(connection.source || '-')}</p>
-        <p>Tables: <span class="pill">${tables.length}</span></p>
-        <div class="row-actions">
-          <a class="button" href="/db-mini/${encodeURIComponent(project.id)}/tables">View tables</a>
-        </div>
-      </div>
-    `;
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteLayout(`Project ${project.id}`, body));
-    return true;
-  }
-
-  if (req.method === 'GET' && pathParts.length === 3 && pathParts[2] === 'tables') {
-    const tables = await listMiniSiteTables(pool);
-    const items = tables
-      .map(
-        (table) => `
-          <tr>
-            <td>${escapeHtml(table.table_schema)}</td>
-            <td>${escapeHtml(table.table_name)}</td>
-            <td><a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
-              table.table_schema,
-            )}/${encodeURIComponent(table.table_name)}">Browse</a></td>
-          </tr>
-        `,
-      )
-      .join('');
-    const body = `
-      <div class="card">
-        <h3>Tables (${tables.length})</h3>
-        <table>
-          <thead><tr><th>Schema</th><th>Table</th><th></th></tr></thead>
-          <tbody>${items}</tbody>
-        </table>
-        <p><a href="/db-mini/${encodeURIComponent(project.id)}">⬅ Back</a></p>
-      </div>
-    `;
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteLayout('Tables', body));
-    return true;
-  }
-
-  if (req.method === 'GET' && pathParts.length === 5 && pathParts[2] === 'table') {
-    const schema = decodeURIComponent(pathParts[3]);
-    const table = decodeURIComponent(pathParts[4]);
-    const page = Math.max(0, Number(url.searchParams.get('page') || 0));
-    const offset = page * MINI_SITE_PAGE_SIZE;
-    const columns = await fetchMiniSiteTableColumns(pool, schema, table);
-    const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
-    const orderBy = primaryKeys.length
-      ? `ORDER BY ${primaryKeys.map((key) => quoteIdentifier(key)).join(', ')}`
-      : '';
-    const { rows } = await pool.query(
-      `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} ${orderBy} LIMIT $1 OFFSET $2`,
-      [MINI_SITE_PAGE_SIZE + 1, offset],
-    );
-    const hasNext = rows.length > MINI_SITE_PAGE_SIZE;
-    const pageRows = rows.slice(0, MINI_SITE_PAGE_SIZE);
-    const headerCells = columns.map((col) => `<th>${escapeHtml(col.column_name)}</th>`).join('');
-    const bodyRows = pageRows
-      .map((row) => {
-        const keyPayload = primaryKeys.length
-          ? { mode: 'pk', values: primaryKeys.reduce((acc, key) => ({ ...acc, [key]: row[key] }), {}) }
-          : { mode: 'ctid', values: { ctid: row.ctid } };
-        const encoded = encodeMiniSiteRowKey(keyPayload);
-        const cells = columns
-          .map((col) => `<td>${escapeHtml(row[col.column_name])}</td>`)
-          .join('');
-        return `
-          <tr>
-            ${cells}
-            <td><a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
-              schema,
-            )}/${encodeURIComponent(table)}/row/${encoded}">View</a></td>
-          </tr>
-        `;
-      })
-      .join('');
-    const pager = `
-      <div class="row-actions">
-        ${page > 0 ? `<a class="button" href="?page=${page - 1}">⬅ Prev</a>` : ''}
-        ${hasNext ? `<a class="button" href="?page=${page + 1}">Next ➡</a>` : ''}
-      </div>
-    `;
-    const body = `
-      <div class="card">
-        <h3>${escapeHtml(schema)}.${escapeHtml(table)}</h3>
-        <p class="muted">Page ${page + 1}</p>
-        <table>
-          <thead><tr>${headerCells}<th></th></tr></thead>
-          <tbody>${bodyRows || '<tr><td colspan="99" class="muted">(no rows)</td></tr>'}</tbody>
-        </table>
-        ${pager}
-        <p><a href="/db-mini/${encodeURIComponent(project.id)}/tables">⬅ Back to tables</a></p>
-      </div>
-    `;
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteLayout(`${schema}.${table}`, body));
-    return true;
-  }
-
-  if (pathParts.length === 7 && pathParts[2] === 'table' && pathParts[5] === 'row') {
-    const schema = decodeURIComponent(pathParts[3]);
-    const table = decodeURIComponent(pathParts[4]);
-    const keyData = decodeMiniSiteRowKey(pathParts[6]);
-    if (!keyData) {
-      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Invalid row key.');
-      return true;
-    }
-    const columns = await fetchMiniSiteTableColumns(pool, schema, table);
-    const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
-    let row = null;
-    if (keyData.mode === 'pk') {
-      const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${index + 1}`);
-      const values = primaryKeys.map((key) => keyData.values?.[key]);
-      const { rows } = await pool.query(
-        `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ${whereParts.join(' AND ')} LIMIT 1`,
-        values,
-      );
-      row = rows[0] || null;
-    } else if (keyData.mode === 'ctid') {
-      const { rows } = await pool.query(
-        `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ctid = $1 LIMIT 1`,
-        [keyData.values?.ctid],
-      );
-      row = rows[0] || null;
-    }
-    if (!row) {
-      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderMiniSiteLayout('Row not found', '<p>Row not found.</p>'));
+      const browseToken = await createMiniSiteSession({
+        scope: 'browse',
+        ttlMs: sessionTtlMs,
+      });
+      const redirectUrl = new URL(url.toString());
+      redirectUrl.searchParams.delete('session');
+      const location = `${redirectUrl.pathname}${redirectUrl.search}` || '/db-mini';
+      res.writeHead(302, {
+        Location: location,
+        'Set-Cookie': buildMiniSiteCookie(
+          MINI_SITE_SESSION_COOKIE,
+          browseToken,
+          Math.floor(sessionTtlMs / 1000),
+        ),
+      });
+      res.end();
       return true;
     }
 
-    const editMode = url.searchParams.get('edit') === '1';
-    if (editMode && !(await isMiniSiteEditAuthed(req, adminTokenHash))) {
+    if (req.method === 'POST' && url.pathname === '/db-mini/login') {
+      const body = await readRequestBody(req);
+      const form = parseFormBody(body);
+      if (!isMiniSiteAdminTokenValid(form.token, adminTokenHash)) {
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteLogin('Invalid token. Try again.'));
+        return true;
+      }
+      const browseToken = await createMiniSiteSession({
+        scope: 'browse',
+        ttlMs: sessionTtlMs,
+      });
+      res.writeHead(302, {
+        Location: '/db-mini',
+        'Set-Cookie': buildMiniSiteCookie(
+          MINI_SITE_SESSION_COOKIE,
+          browseToken,
+          Math.floor(sessionTtlMs / 1000),
+        ),
+      });
+      res.end();
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/db-mini/edit-login') {
+      const body = await readRequestBody(req);
+      const form = parseFormBody(body);
+      if (!isMiniSiteAdminTokenValid(form.token, adminTokenHash)) {
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteEditLogin(form.redirect || '/db-mini'));
+        return true;
+      }
+      const editToken = await createMiniSiteSession({
+        scope: 'edit',
+        ttlMs: MINI_SITE_EDIT_TOKEN_TTL_SEC * 1000,
+      });
+      res.writeHead(302, {
+        Location: form.redirect || '/db-mini',
+        'Set-Cookie': buildMiniSiteCookie(MINI_SITE_EDIT_SESSION_COOKIE, editToken, MINI_SITE_EDIT_TOKEN_TTL_SEC),
+      });
+      res.end();
+      return true;
+    }
+
+    if (!(await isMiniSiteAuthed(req, adminTokenHash))) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderMiniSiteEditLogin(url.pathname + url.search));
+      res.end(renderMiniSiteLogin());
       return true;
     }
 
-    const rowsHtml = columns
-      .map((col) => `<tr><th>${escapeHtml(col.column_name)}</th><td>${escapeHtml(row[col.column_name])}</td></tr>`)
-      .join('');
-    const editToggle = `<a class="button" href="${url.pathname}?edit=1">Enable edit mode</a>`;
-    let editForm = '';
-    if (editMode) {
-      if (!primaryKeys.length) {
-        editForm = '<p class="muted">Editing disabled: no primary key detected.</p>';
-      } else {
-        const inputs = columns
-          .filter((col) => !primaryKeys.includes(col.column_name))
-          .map(
-            (col) => `
-              <div class="form-row">
-                <label>${escapeHtml(col.column_name)}</label>
-                <input name="${escapeHtml(col.column_name)}" value="${escapeHtml(row[col.column_name] ?? '')}" />
-              </div>
-            `,
-          )
-          .join('');
-        editForm = `
-          <div class="card">
-            <h4>✏️ Edit row</h4>
-            <form method="POST" action="${url.pathname}/edit">
-              ${inputs}
-              <div class="form-row">
-                <input name="confirm" placeholder="Type CONFIRM to save" required />
-              </div>
-              <button class="button" type="submit">Save changes</button>
-            </form>
+    const pathParts = url.pathname.split('/').filter(Boolean);
+    const projectId = pathParts[1] ? decodeURIComponent(pathParts[1]) : null;
+
+    if (req.method === 'GET' && pathParts.length === 1) {
+      const projects = await loadProjects();
+      const cards = projects
+        .map((projectItem) => {
+          const label = escapeHtml(projectItem.name || projectItem.id);
+          return `
+            <div class="card">
+              <h3>${label}</h3>
+              <p class="muted">ID: ${escapeHtml(projectItem.id)}</p>
+              <a class="button" href="/db-mini/${encodeURIComponent(projectItem.id)}">Open project</a>
+            </div>
+          `;
+        })
+        .join('');
+      const body = cards || '<p class="muted">No projects configured yet.</p>';
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout('Project list', body));
+      return true;
+    }
+
+    project = projectId ? await getProjectById(projectId) : null;
+    if (!project) {
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout('Project not found', '<p>Unknown project.</p>'));
+      return true;
+    }
+
+    const connection = await resolveMiniSiteDbConnection(project);
+    if (!connection.dsn) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(
+        renderMiniSiteLayout(
+          'Database not configured',
+          `<div class="card"><p>Database connection missing for this project.</p><p class="muted">Source: ${escapeHtml(connection.source || '-')}</p></div>`,
+        ),
+      );
+      return true;
+    }
+    const sslSettings = resolveProjectDbSslSettings(project);
+    const pool = getMiniSitePool(connection.dsn, sslSettings);
+    if (!pool) {
+      res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(`Database unavailable. Request ID: ${requestId}`);
+      return true;
+    }
+
+    if (req.method === 'GET' && pathParts.length === 2) {
+      const tables = await listMiniSiteTables(pool);
+      const body = `
+        <div class="card">
+          <h3>${escapeHtml(project.name || project.id)}</h3>
+          <p class="muted">Source: ${escapeHtml(connection.source || '-')}</p>
+          <p>Tables: <span class="pill">${tables.length}</span></p>
+          <div class="row-actions">
+            <a class="button" href="/db-mini/${encodeURIComponent(project.id)}/tables">View tables</a>
           </div>
-        `;
-      }
-    }
-    const body = `
-      <div class="card">
-        <h3>Row detail</h3>
-        <table>${rowsHtml}</table>
-        <div class="row-actions">
-          ${editToggle}
-          <a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
-            schema,
-          )}/${encodeURIComponent(table)}">⬅ Back</a>
         </div>
-      </div>
-      ${editForm}
-    `;
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteLayout(`Row ${schema}.${table}`, body));
-    return true;
-  }
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout(`Project ${project.id}`, body));
+      return true;
+    }
 
-  if (req.method === 'POST' && pathParts.length === 8 && pathParts[2] === 'table' && pathParts[5] === 'row' && pathParts[7] === 'edit') {
-    if (!(await isMiniSiteEditAuthed(req, adminTokenHash))) {
-      res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderMiniSiteEditLogin(url.pathname.replace(/\/edit$/, '')));
+    if (req.method === 'GET' && pathParts.length === 3 && pathParts[2] === 'tables') {
+      const tables = await listMiniSiteTables(pool);
+      const items = tables
+        .map(
+          (table) => `
+            <tr>
+              <td>${escapeHtml(table.table_schema)}</td>
+              <td>${escapeHtml(table.table_name)}</td>
+              <td><a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
+                table.table_schema,
+              )}/${encodeURIComponent(table.table_name)}">Browse</a></td>
+            </tr>
+          `,
+        )
+        .join('');
+      const body = `
+        <div class="card">
+          <h3>Tables (${tables.length})</h3>
+          <table>
+            <thead><tr><th>Schema</th><th>Table</th><th></th></tr></thead>
+            <tbody>${items}</tbody>
+          </table>
+          <p><a href="/db-mini/${encodeURIComponent(project.id)}">⬅ Back</a></p>
+        </div>
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout('Tables', body));
       return true;
     }
-    const schema = decodeURIComponent(pathParts[3]);
-    const table = decodeURIComponent(pathParts[4]);
-    const keyData = decodeMiniSiteRowKey(pathParts[6]);
-    if (!keyData || keyData.mode !== 'pk') {
-      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Row editing requires a primary key.');
+
+    if (req.method === 'GET' && pathParts.length === 5 && pathParts[2] === 'table') {
+      const schema = decodeURIComponent(pathParts[3]);
+      const table = decodeURIComponent(pathParts[4]);
+      const page = Math.max(0, Number(url.searchParams.get('page') || 0));
+      const offset = page * MINI_SITE_PAGE_SIZE;
+      const columns = await fetchMiniSiteTableColumns(pool, schema, table);
+      const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
+      const orderBy = primaryKeys.length
+        ? `ORDER BY ${primaryKeys.map((key) => quoteIdentifier(key)).join(', ')}`
+        : '';
+      const { rows } = await pool.query(
+        `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} ${orderBy} LIMIT $1 OFFSET $2`,
+        [MINI_SITE_PAGE_SIZE + 1, offset],
+      );
+      const hasNext = rows.length > MINI_SITE_PAGE_SIZE;
+      const pageRows = rows.slice(0, MINI_SITE_PAGE_SIZE);
+      const headerCells = columns.map((col) => `<th>${escapeHtml(col.column_name)}</th>`).join('');
+      const bodyRows = pageRows
+        .map((row) => {
+          const keyPayload = primaryKeys.length
+            ? { mode: 'pk', values: primaryKeys.reduce((acc, key) => ({ ...acc, [key]: row[key] }), {}) }
+            : { mode: 'ctid', values: { ctid: row.ctid } };
+          const encoded = encodeMiniSiteRowKey(keyPayload);
+          const cells = columns
+            .map((col) => `<td>${escapeHtml(row[col.column_name])}</td>`)
+            .join('');
+          return `
+            <tr>
+              ${cells}
+              <td><a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
+                schema,
+              )}/${encodeURIComponent(table)}/row/${encoded}">View</a></td>
+            </tr>
+          `;
+        })
+        .join('');
+      const pager = `
+        <div class="row-actions">
+          ${page > 0 ? `<a class="button" href="?page=${page - 1}">⬅ Prev</a>` : ''}
+          ${hasNext ? `<a class="button" href="?page=${page + 1}">Next ➡</a>` : ''}
+        </div>
+      `;
+      const body = `
+        <div class="card">
+          <h3>${escapeHtml(schema)}.${escapeHtml(table)}</h3>
+          <p class="muted">Page ${page + 1}</p>
+          <table>
+            <thead><tr>${headerCells}<th></th></tr></thead>
+            <tbody>${bodyRows || '<tr><td colspan="99" class="muted">(no rows)</td></tr>'}</tbody>
+          </table>
+          ${pager}
+          <p><a href="/db-mini/${encodeURIComponent(project.id)}/tables">⬅ Back to tables</a></p>
+        </div>
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout(`${schema}.${table}`, body));
       return true;
     }
-    const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
-    if (!primaryKeys.length) {
-      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Row editing requires a primary key.');
-      return true;
-    }
-    const body = await readRequestBody(req);
-    const form = parseFormBody(body);
-    if (form.confirm !== 'CONFIRM') {
-      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Confirmation missing. Type CONFIRM to save.');
-      return true;
-    }
-    const columns = await fetchMiniSiteTableColumns(pool, schema, table);
-    const editableCols = columns.map((col) => col.column_name).filter((col) => !primaryKeys.includes(col));
-    const updates = [];
-    const values = [];
-    editableCols.forEach((col) => {
-      if (Object.prototype.hasOwnProperty.call(form, col)) {
-        values.push(form[col]);
-        updates.push(`${quoteIdentifier(col)} = $${values.length}`);
+
+    if (pathParts.length === 7 && pathParts[2] === 'table' && pathParts[5] === 'row') {
+      const schema = decodeURIComponent(pathParts[3]);
+      const table = decodeURIComponent(pathParts[4]);
+      const keyData = decodeMiniSiteRowKey(pathParts[6]);
+      if (!keyData) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Invalid row key.');
+        return true;
       }
-    });
-    if (!updates.length) {
-      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('No editable fields provided.');
+      const columns = await fetchMiniSiteTableColumns(pool, schema, table);
+      const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
+      let row = null;
+      if (keyData.mode === 'pk') {
+        const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${index + 1}`);
+        const values = primaryKeys.map((key) => keyData.values?.[key]);
+        const { rows } = await pool.query(
+          `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ${whereParts.join(' AND ')} LIMIT 1`,
+          values,
+        );
+        row = rows[0] || null;
+      } else if (keyData.mode === 'ctid') {
+        const { rows } = await pool.query(
+          `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ctid = $1 LIMIT 1`,
+          [keyData.values?.ctid],
+        );
+        row = rows[0] || null;
+      }
+      if (!row) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteLayout('Row not found', '<p>Row not found.</p>'));
+        return true;
+      }
+
+      const editMode = url.searchParams.get('edit') === '1';
+      if (editMode && !(await isMiniSiteEditAuthed(req, adminTokenHash))) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteEditLogin(url.pathname + url.search));
+        return true;
+      }
+
+      const rowsHtml = columns
+        .map((col) => `<tr><th>${escapeHtml(col.column_name)}</th><td>${escapeHtml(row[col.column_name])}</td></tr>`)
+        .join('');
+      const editToggle = `<a class="button" href="${url.pathname}?edit=1">Enable edit mode</a>`;
+      let editForm = '';
+      if (editMode) {
+        if (!primaryKeys.length) {
+          editForm = '<p class="muted">Editing disabled: no primary key detected.</p>';
+        } else {
+          const inputs = columns
+            .filter((col) => !primaryKeys.includes(col.column_name))
+            .map(
+              (col) => `
+                <div class="form-row">
+                  <label>${escapeHtml(col.column_name)}</label>
+                  <input name="${escapeHtml(col.column_name)}" value="${escapeHtml(row[col.column_name] ?? '')}" />
+                </div>
+              `,
+            )
+            .join('');
+          editForm = `
+            <div class="card">
+              <h4>✏️ Edit row</h4>
+              <form method="POST" action="${url.pathname}/edit">
+                ${inputs}
+                <div class="form-row">
+                  <input name="confirm" placeholder="Type CONFIRM to save" required />
+                </div>
+                <button class="button" type="submit">Save changes</button>
+              </form>
+            </div>
+          `;
+        }
+      }
+      const body = `
+        <div class="card">
+          <h3>Row detail</h3>
+          <table>${rowsHtml}</table>
+          <div class="row-actions">
+            ${editToggle}
+            <a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
+              schema,
+            )}/${encodeURIComponent(table)}">⬅ Back</a>
+          </div>
+        </div>
+        ${editForm}
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout(`Row ${schema}.${table}`, body));
       return true;
     }
-    const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${values.length + index + 1}`);
-    const whereValues = primaryKeys.map((key) => keyData.values?.[key]);
-    await pool.query(
-      `UPDATE ${quoteIdentifier(schema)}.${quoteIdentifier(table)} SET ${updates.join(', ')} WHERE ${whereParts.join(' AND ')}`,
-      [...values, ...whereValues],
-    );
-    res.writeHead(302, { Location: url.pathname.replace(/\/edit$/, '') + '?edit=1' });
-    res.end();
+
+    if (req.method === 'POST' && pathParts.length === 8 && pathParts[2] === 'table' && pathParts[5] === 'row' && pathParts[7] === 'edit') {
+      if (!(await isMiniSiteEditAuthed(req, adminTokenHash))) {
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteEditLogin(url.pathname.replace(/\/edit$/, '')));
+        return true;
+      }
+      const schema = decodeURIComponent(pathParts[3]);
+      const table = decodeURIComponent(pathParts[4]);
+      const keyData = decodeMiniSiteRowKey(pathParts[6]);
+      if (!keyData || keyData.mode !== 'pk') {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Row editing requires a primary key.');
+        return true;
+      }
+      const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
+      if (!primaryKeys.length) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Row editing requires a primary key.');
+        return true;
+      }
+      const body = await readRequestBody(req);
+      const form = parseFormBody(body);
+      if (form.confirm !== 'CONFIRM') {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Confirmation missing. Type CONFIRM to save.');
+        return true;
+      }
+      const columns = await fetchMiniSiteTableColumns(pool, schema, table);
+      const editableCols = columns.map((col) => col.column_name).filter((col) => !primaryKeys.includes(col));
+      const updates = [];
+      const values = [];
+      editableCols.forEach((col) => {
+        if (Object.prototype.hasOwnProperty.call(form, col)) {
+          values.push(form[col]);
+          updates.push(`${quoteIdentifier(col)} = $${values.length}`);
+        }
+      });
+      if (!updates.length) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('No editable fields provided.');
+        return true;
+      }
+      const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${values.length + index + 1}`);
+      const whereValues = primaryKeys.map((key) => keyData.values?.[key]);
+      await pool.query(
+        `UPDATE ${quoteIdentifier(schema)}.${quoteIdentifier(table)} SET ${updates.join(', ')} WHERE ${whereParts.join(' AND ')}`,
+        [...values, ...whereValues],
+      );
+      res.writeHead(302, { Location: url.pathname.replace(/\/edit$/, '') + '?edit=1' });
+      res.end();
+      return true;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not found');
+    return true;
+  } catch (error) {
+    console.error('[mini-site] request failed', {
+      requestId,
+      path: url.pathname,
+      projectId: project?.id,
+      error: error?.message,
+      code: error?.code,
+      stack: error?.stack,
+    });
+    const isSelfSigned =
+      error?.code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+      String(error?.message || '').toLowerCase().includes('self-signed certificate');
+    let adminHint = null;
+    if (isSelfSigned) {
+      const isAdminHintAllowed = adminTokenHash
+        ? await isMiniSiteEditAuthed(req, adminTokenHash)
+        : false;
+      if (isAdminHintAllowed) {
+        adminHint = `Self-signed certificate detected. Update SSL verify to "off" in the bot: Database → project → SSL settings.`;
+      }
+    }
+    res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteDbErrorPage({ requestId, adminHint }));
     return true;
   }
-
-  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Not found');
-  return true;
 }
 
 function startHttpServer() {
