@@ -64,6 +64,34 @@ function normalizeProject(rawProject) {
     project.default_env_set_id = project.defaultEnvSetId;
   }
 
+  const logTest = project.logTest || {};
+  const lastTest = logTest.lastTest || {};
+  const reminder = logTest.reminder || {};
+  const normalizedLastStatus = ['never', 'pass', 'fail', 'partial'].includes(lastTest.status)
+    ? lastTest.status
+    : 'never';
+  const normalizedLastCorrelationIds = Array.isArray(lastTest.lastCorrelationIds)
+    ? lastTest.lastCorrelationIds.filter(Boolean).map(String)
+    : [];
+  const reminderNeedsTest =
+    typeof reminder.needsTest === 'boolean' ? reminder.needsTest : normalizedLastStatus !== 'pass';
+  project.logTest = {
+    enabled: typeof logTest.enabled === 'boolean' ? logTest.enabled : Boolean(logTest.testEndpointUrl),
+    testEndpointUrl: logTest.testEndpointUrl || null,
+    diagnosticsEndpointUrl: logTest.diagnosticsEndpointUrl || null,
+    tokenKeyInEnvVault: logTest.tokenKeyInEnvVault || null,
+    lastTest: {
+      status: normalizedLastStatus,
+      lastRunAt: lastTest.lastRunAt || null,
+      lastSummary: lastTest.lastSummary || '',
+      lastCorrelationIds: normalizedLastCorrelationIds,
+    },
+    reminder: {
+      needsTest: reminderNeedsTest,
+      snoozedUntil: reminder.snoozedUntil || null,
+    },
+  };
+
   return project;
 }
 

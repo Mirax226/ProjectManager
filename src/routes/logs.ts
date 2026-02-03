@@ -102,6 +102,20 @@ function formatMetaSummary(meta) {
   return `${summary.slice(0, Math.max(0, META_TRUNCATE_LIMIT - 1))}…`;
 }
 
+function extractCorrelationId(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const meta = entry.meta || {};
+  return (
+    meta.correlationId ||
+    meta.correlationID ||
+    meta.requestId ||
+    meta.requestID ||
+    entry.correlationId ||
+    entry.correlationID ||
+    null
+  );
+}
+
 function validatePayload(payload, nowProvider) {
   if (!payload || typeof payload !== 'object') {
     return { ok: false, error: 'Invalid payload' };
@@ -238,6 +252,7 @@ function createLogsRouter(options) {
     getAllowedProjectsMode,
     logger = console,
     sendTelegramMessage,
+    onLogReceived,
     now = () => Date.now(),
     rateLimitPerMinute = DEFAULT_RATE_LIMIT_PER_MINUTE,
     payloadLimitBytes = DEFAULT_PAYLOAD_LIMIT_BYTES,
@@ -338,6 +353,22 @@ function createLogsRouter(options) {
       res.writeHead(429, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
       return;
+    }
+
+    const correlationId = extractCorrelationId(entry);
+    if (typeof onLogReceived === 'function' && correlationId) {
+      try {
+        await onLogReceived({
+          correlationId,
+          entry,
+          receivedAt: new Date(nowMs).toISOString(),
+        });
+      } catch (error) {
+        logger.error('[LOG_API] onLogReceived failed', {
+          project: entry.project,
+          error: error?.message,
+        });
+      }
     }
 
     logger.log(
