@@ -246,6 +246,7 @@ const ephemeralMessageIdsByChat = new Map();
 const ephemeralTimersByChat = new Map();
 const webSessions = new Map();
 const webLoginAttempts = new Map();
+const pendingLogTests = new Map();
 let httpServerPromise = null;
 let cachedSettings = null;
 let cachedSettingsAt = 0;
@@ -277,7 +278,20 @@ const logsRouter = createLogsRouter({
   now: () => Date.now(),
   rateLimitPerMinute: 20,
   sendTelegramMessage: async (chatId, text, options) => bot.api.sendMessage(chatId, text, options),
+  onLogReceived: async ({ correlationId, entry, receivedAt }) =>
+    handlePendingLogTestReceipt({ correlationId, entry, receivedAt }),
 });
+
+const LOG_TEST_MODES = ['info', 'warn', 'error', 'timeout'];
+const LOG_TEST_RECEIPT_TIMEOUT_MS = 15_000;
+const LOG_TEST_CALL_TIMEOUTS_MS = {
+  info: 12_000,
+  warn: 12_000,
+  error: 12_000,
+  timeout: 20_000,
+};
+const LOG_TEST_REMINDER_SNOOZE_DAYS = [1, 3, 7];
+const LOG_TEST_DAILY_REMINDER_ENABLED = String(process.env.LOG_TEST_DAILY_REMINDER || '').toLowerCase() === 'true';
 
 const CRON_RATE_LIMIT_MESSAGE = 'Cron API rate limit reached. Please wait a bit and try again.';
 const CRON_JOBS_CACHE_TTL_MS = 30_000;
@@ -1804,6 +1818,10 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     await handleProjectLogCallback(ctx, data);
     return;
   }
+  if (data.startsWith('logtest:')) {
+    await handleLogTestCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('dbmenu:')) {
     await handleDatabaseMenuCallback(ctx, data);
     return;
@@ -1954,6 +1972,9 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'proj_log_chat_input':
       await handleProjectLogChatInput(ctx, state);
+      break;
+    case 'log_test_config':
+      await handleLogTestConfigInput(ctx, state);
       break;
     case 'note_create':
       await handleNoteCreateInput(ctx, state);
@@ -2534,6 +2555,118 @@ async function handleProjectLogCallback(ctx, data) {
 
   await upsertProjectLogSettings(projectId, updated);
   await renderProjectLogAlerts(ctx, projectId);
+}
+
+async function handleLogTestCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const parts = data.split(':');
+  const action = parts[1];
+  const projectId = parts[2];
+  const extra = parts[3];
+
+  if (action === 'mode_menu' && projectId) {
+    await renderOrEdit(ctx, 'Select a log test mode:', {
+      reply_markup: buildLogTestModeMenu(projectId),
+    });
+    return;
+  }
+
+  if (action === 'mode' && projectId && extra) {
+    await runSingleLogTest(ctx, projectId, extra);
+    return;
+  }
+
+  if (action === 'all' && projectId) {
+    await runAllLogTests(ctx, projectId);
+    return;
+  }
+
+  if (action === 'config' && projectId) {
+    await startLogTestConfigFlow(ctx, projectId);
+    return;
+  }
+
+  if (action === 'status' && projectId) {
+    await renderLogTestStatus(ctx, projectId);
+    return;
+  }
+
+  if (action === 'diagnostics' && projectId) {
+    const projects = await loadProjects();
+    const project = findProjectById(projects, projectId);
+    if (!project) {
+      await renderOrEdit(ctx, 'Project not found.');
+      return;
+    }
+    const logTest = normalizeLogTestSettings(project);
+    if (!logTest.diagnosticsEndpointUrl) {
+      await renderProjectLogAlerts(ctx, projectId, '⚠️ Diagnostics endpoint not configured.');
+      return;
+    }
+    const tokenResult = await fetchLogTestToken(projectId, logTest);
+    if (!tokenResult.ok) {
+      await renderProjectLogAlerts(ctx, projectId, `⚠️ ${tokenResult.error}`);
+      return;
+    }
+    const diag = await requestLogDiagnostics(project, logTest, tokenResult.token);
+    if (!diag.ok) {
+      await renderProjectLogAlerts(ctx, projectId, `❌ Diagnostics failed.\n${diag.error}`);
+      return;
+    }
+    await renderProjectLogAlerts(ctx, projectId, buildLogTestDiagnosticsReport(diag.payload));
+    return;
+  }
+
+  if (action === 'snooze' && projectId) {
+    await renderLogTestSnoozeMenu(ctx, projectId);
+    return;
+  }
+
+  if (action === 'snooze_set' && projectId && extra) {
+    const days = Number(extra);
+    if (!Number.isFinite(days) || days <= 0) {
+      await renderLogTestSnoozeMenu(ctx, projectId);
+      return;
+    }
+    const snoozedUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+    await updateProjectLogTest(projectId, (current) => ({
+      ...current,
+      reminder: { ...current.reminder, snoozedUntil },
+    }));
+    await renderProjectLogAlerts(ctx, projectId, `⏰ Reminder snoozed for ${days} day(s).`);
+    return;
+  }
+
+  if (action === 'snooze_clear' && projectId) {
+    await updateProjectLogTest(projectId, (current) => ({
+      ...current,
+      reminder: { ...current.reminder, snoozedUntil: null },
+    }));
+    await renderProjectLogAlerts(ctx, projectId, '🔄 Snooze cleared.');
+    return;
+  }
+
+  if (action === 'reminders') {
+    await renderLogTestReminders(ctx);
+    return;
+  }
+
+  if (action === 'generate_task' && projectId) {
+    const task = [
+      '🧩 Codex task: add PM log test + diagnostics',
+      '',
+      'Implement:',
+      '- POST /pm/test-log (alias /__pm/test-log) with PM_TEST_TOKEN auth.',
+      '- GET /pm/diagnostics (alias /__pm/diagnostics).',
+      '- PM logger to send to PM_URL + "/api/logs" with PM_INGEST_TOKEN.',
+      '',
+      'Include correlationId in meta, add interceptors + process hooks, and keep secrets masked.',
+    ].join('\n');
+    await renderOrEdit(ctx, task, { reply_markup: buildBackKeyboard(`projlog:menu:${projectId}`) });
+    return;
+  }
+
+  await renderLogsProjectList(ctx);
 }
 
 async function handleGlobalSettingsCallback(ctx, data) {
@@ -10875,13 +11008,122 @@ async function updateProjectType(ctx, projectId, typeId) {
   await renderProjectSettings(ctx, projectId);
 }
 
+function normalizeLogTestSettings(project) {
+  const logTest = project?.logTest || {};
+  const lastTest = logTest.lastTest || {};
+  const reminder = logTest.reminder || {};
+  return {
+    enabled: typeof logTest.enabled === 'boolean' ? logTest.enabled : Boolean(logTest.testEndpointUrl),
+    testEndpointUrl: logTest.testEndpointUrl || null,
+    diagnosticsEndpointUrl: logTest.diagnosticsEndpointUrl || null,
+    tokenKeyInEnvVault: logTest.tokenKeyInEnvVault || null,
+    lastTest: {
+      status: ['never', 'pass', 'fail', 'partial'].includes(lastTest.status)
+        ? lastTest.status
+        : 'never',
+      lastRunAt: lastTest.lastRunAt || null,
+      lastSummary: lastTest.lastSummary || '',
+      lastCorrelationIds: Array.isArray(lastTest.lastCorrelationIds)
+        ? lastTest.lastCorrelationIds.filter(Boolean).map(String)
+        : [],
+    },
+    reminder: {
+      needsTest:
+        typeof reminder.needsTest === 'boolean'
+          ? reminder.needsTest
+          : lastTest.status !== 'pass',
+      snoozedUntil: reminder.snoozedUntil || null,
+    },
+  };
+}
+
+function resolveLogTestReminderState(logTest, nowMs = Date.now()) {
+  const snoozedUntil = logTest.reminder?.snoozedUntil
+    ? new Date(logTest.reminder.snoozedUntil).getTime()
+    : null;
+  const isSnoozed = snoozedUntil && !Number.isNaN(snoozedUntil) && snoozedUntil > nowMs;
+  const needsTest = logTest.reminder?.needsTest === true;
+  return { needsTest, isSnoozed, snoozedUntil: snoozedUntil || null };
+}
+
+function formatLogTestStatusLine(logTest) {
+  const status = logTest.lastTest?.status || 'never';
+  const lastRunAt = logTest.lastTest?.lastRunAt
+    ? new Date(logTest.lastTest.lastRunAt).toISOString()
+    : null;
+  if (!logTest.testEndpointUrl) {
+    return 'Log test: ⚠️ not configured';
+  }
+  if (status === 'pass') {
+    return `Log test: ✅ passed${lastRunAt ? ` (${lastRunAt})` : ''}`;
+  }
+  if (status === 'partial') {
+    return `Log test: ❌ partial${lastRunAt ? ` (${lastRunAt})` : ''}`;
+  }
+  if (status === 'fail') {
+    return `Log test: ❌ failed${lastRunAt ? ` (${lastRunAt})` : ''}`;
+  }
+  return 'Log test: ⚠️ not run yet';
+}
+
+function formatLogTestReminderLine(logTest) {
+  const { needsTest, isSnoozed, snoozedUntil } = resolveLogTestReminderState(logTest);
+  if (!needsTest) return 'Reminder: ✅ up to date';
+  if (isSnoozed) {
+    return `Reminder: ⏰ snoozed until ${new Date(snoozedUntil).toISOString()}`;
+  }
+  return 'Reminder: ⚠️ needs log test';
+}
+
+async function updateProjectLogTest(projectId, updater) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) return null;
+  const current = normalizeLogTestSettings(project);
+  const next = typeof updater === 'function' ? updater(current) : { ...current, ...updater };
+  project.logTest = next;
+  await saveProjects(projects);
+  return { project, logTest: next };
+}
+
+async function updateProjectLogTestResult(projectId, result) {
+  const { status, summary, correlationIds = [] } = result;
+  const now = new Date().toISOString();
+  const outcome = await updateProjectLogTest(projectId, (current) => {
+    const lastCorrelationIds = [...(current.lastTest.lastCorrelationIds || []), ...correlationIds]
+      .filter(Boolean)
+      .slice(-10);
+    const needsTest = status !== 'pass';
+    return {
+      ...current,
+      lastTest: {
+        status,
+        lastRunAt: now,
+        lastSummary: summary,
+        lastCorrelationIds,
+      },
+      reminder: {
+        ...current.reminder,
+        needsTest,
+        snoozedUntil: needsTest ? current.reminder.snoozedUntil : null,
+      },
+    };
+  });
+  return outcome;
+}
+
 function buildProjectLogAlertsView(project, settings, notice) {
   const forwarding = normalizeProjectLogSettings(settings);
+  const logTest = normalizeLogTestSettings(project);
+  const reminderLine = formatLogTestReminderLine(logTest);
   const levelsLabel = forwarding.levels.length ? forwarding.levels.join(' / ') : 'error';
   const destinationLabel = forwarding.destinationChatId || 'not set';
   const lines = [
     `📣 Logs — ${project.name || project.id}`,
     notice || null,
+    '',
+    formatLogTestStatusLine(logTest),
+    reminderLine,
     '',
     `Status: ${forwarding.enabled ? '✅ enabled' : '🚫 disabled'}`,
     `Levels: ${levelsLabel}`,
@@ -10889,6 +11131,20 @@ function buildProjectLogAlertsView(project, settings, notice) {
   ].filter(Boolean);
 
   const inline = new InlineKeyboard()
+    .text('🧪 Run log test', `logtest:mode_menu:${project.id}`)
+    .row()
+    .text('🧪 Run ALL tests', `logtest:all:${project.id}`)
+    .row()
+    .text(logTest.diagnosticsEndpointUrl ? '🔎 Diagnostics' : '🔎 Diagnostics (set URL)', `logtest:diagnostics:${project.id}`)
+    .row()
+    .text('⚙️ Configure test endpoints', `logtest:config:${project.id}`)
+    .row()
+    .text('📌 Test status & last results', `logtest:status:${project.id}`)
+    .row()
+    .text('⏰ Snooze reminder', `logtest:snooze:${project.id}`)
+    .row()
+    .text('🧩 Generate Codex Task', `logtest:generate_task:${project.id}`)
+    .row()
     .text(forwarding.enabled ? '🟢 Disable forwarding' : '🟢 Enable forwarding', `projlog:toggle:${project.id}`)
     .row()
     .text('🎚 Select log levels', `projlog:levels:${project.id}`)
@@ -10933,6 +11189,764 @@ async function renderProjectLogAlertsForMessage(messageContext, projectId, notic
     );
   } catch (error) {
     console.error('[UI] Failed to update log alerts message', error);
+  }
+}
+
+function buildLogTestModeMenu(projectId) {
+  const inline = new InlineKeyboard()
+    .text('ℹ️ Info', `logtest:mode:${projectId}:info`)
+    .text('⚠️ Warn', `logtest:mode:${projectId}:warn`)
+    .row()
+    .text('❌ Error', `logtest:mode:${projectId}:error`)
+    .text('⏱ Timeout', `logtest:mode:${projectId}:timeout`)
+    .row()
+    .text('⬅️ Back', `projlog:menu:${projectId}`);
+  return inline;
+}
+
+function resolveLogTestTokenKey(projectId, logTest) {
+  if (logTest?.tokenKeyInEnvVault) return logTest.tokenKeyInEnvVault;
+  return `PM_TEST_TOKEN_${String(projectId).toUpperCase().replace(/[^A-Z0-9_]+/g, '_')}`;
+}
+
+function resolveLogTestEndpoints(rawInput) {
+  const url = new URL(rawInput);
+  const baseOrigin = `${url.protocol}//${url.host}`;
+  let basePath = url.pathname || '';
+  if (basePath.endsWith('/pm/test-log') || basePath.endsWith('/__pm/test-log')) {
+    basePath = basePath.replace(/\/(__pm|pm)\/test-log$/, '');
+  }
+  const normalizedBasePath = basePath.replace(/\/+$/, '');
+  const base = `${baseOrigin}${normalizedBasePath}`;
+  return {
+    baseUrl: base || baseOrigin,
+    testEndpointUrl: `${base || baseOrigin}/pm/test-log`,
+    diagnosticsEndpointUrl: `${base || baseOrigin}/pm/diagnostics`,
+  };
+}
+
+function formatLogTestConfigSummary(logTest, tokenKey) {
+  const lines = [
+    `Test endpoint: ${logTest.testEndpointUrl || '-'}`,
+    `Diagnostics endpoint: ${logTest.diagnosticsEndpointUrl || '-'}`,
+    `Token key (Env Vault): ${tokenKey || '-'}`,
+  ];
+  return lines.join('\n');
+}
+
+function formatLogTestSummary(logTest) {
+  const lines = [
+    `Status: ${logTest.lastTest.status}`,
+    `Last run: ${logTest.lastTest.lastRunAt || '-'}`,
+    `Summary: ${logTest.lastTest.lastSummary || '-'}`,
+  ];
+  if (logTest.lastTest.lastCorrelationIds?.length) {
+    lines.push(`Correlation IDs: ${logTest.lastTest.lastCorrelationIds.slice(-5).join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+function buildLogTestStatusView(project, logTest) {
+  const lines = [
+    `📌 Log test status — ${project.name || project.id}`,
+    '',
+    formatLogTestStatusLine(logTest),
+    formatLogTestReminderLine(logTest),
+    '',
+    formatLogTestSummary(logTest),
+  ];
+  const inline = new InlineKeyboard()
+    .text('🧪 Run log test', `logtest:mode_menu:${project.id}`)
+    .text('🧪 Run ALL tests', `logtest:all:${project.id}`)
+    .row()
+    .text('🔎 Diagnostics', `logtest:diagnostics:${project.id}`)
+    .row()
+    .text('⬅️ Back', `projlog:menu:${project.id}`);
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderLogTestStatus(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const logTest = normalizeLogTestSettings(project);
+  const view = buildLogTestStatusView(project, logTest);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+function buildLogTestSnoozeMenu(projectId) {
+  const inline = new InlineKeyboard();
+  LOG_TEST_REMINDER_SNOOZE_DAYS.forEach((days) => {
+    inline.text(`⏰ Snooze ${days}d`, `logtest:snooze_set:${projectId}:${days}`).row();
+  });
+  inline.text('🔄 Clear snooze', `logtest:snooze_clear:${projectId}`).row();
+  inline.text('⬅️ Back', `projlog:menu:${projectId}`);
+  return inline;
+}
+
+async function renderLogTestSnoozeMenu(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const logTest = normalizeLogTestSettings(project);
+  const lines = [
+    `⏰ Snooze log test reminder — ${project.name || project.id}`,
+    '',
+    formatLogTestReminderLine(logTest),
+  ];
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: buildLogTestSnoozeMenu(projectId) });
+}
+
+async function startLogTestConfigFlow(ctx, projectId) {
+  if (!isEnvVaultAvailable()) {
+    await renderOrEdit(ctx, buildEnvVaultUnavailableMessage('Env Vault unavailable.'), {
+      reply_markup: buildBackKeyboard(`projlog:menu:${projectId}`),
+    });
+    return;
+  }
+  setUserState(ctx.from.id, {
+    type: 'log_test_config',
+    step: 'url',
+    projectId,
+    messageContext: getMessageTargetFromCtx(ctx),
+  });
+  await renderOrEdit(
+    ctx,
+    'Send the base URL or full /pm/test-log endpoint URL.\n(Example: https://api.example.com or https://api.example.com/pm/test-log)\n(Or press Cancel)',
+    { reply_markup: buildCancelKeyboard() },
+  );
+}
+
+async function handleLogTestConfigInput(ctx, state) {
+  const raw = ctx.message.text?.trim();
+  if (!raw) {
+    await ctx.reply('Please send a valid URL.');
+    return;
+  }
+  if (raw.toLowerCase() === 'cancel') {
+    clearUserState(ctx.from.id);
+    await renderProjectLogAlerts(ctx, state.projectId, 'Operation cancelled.');
+    return;
+  }
+
+  if (state.step === 'url') {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(raw);
+    } catch (error) {
+      await ctx.reply('Invalid URL. Please include http:// or https://');
+      return;
+    }
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      await ctx.reply('URL must include http:// or https://');
+      return;
+    }
+    const { testEndpointUrl, diagnosticsEndpointUrl } = resolveLogTestEndpoints(parsedUrl.toString());
+    const updated = await updateProjectLogTest(state.projectId, (current) => ({
+      ...current,
+      enabled: true,
+      testEndpointUrl,
+      diagnosticsEndpointUrl,
+    }));
+    if (!updated) {
+      clearUserState(ctx.from.id);
+      await renderOrEdit(ctx, 'Project not found.');
+      return;
+    }
+    state.step = 'token';
+    setUserState(ctx.from.id, state);
+    await renderOrEdit(
+      ctx,
+      `✅ Endpoints saved.\nSend PM_TEST_TOKEN to store in Env Vault.\n(Or press Cancel)`,
+      { reply_markup: buildCancelKeyboard() },
+    );
+    return;
+  }
+
+  if (state.step === 'token') {
+    const token = raw;
+    if (!token) {
+      await ctx.reply('Please send a token.');
+      return;
+    }
+    const envSetId = await ensureProjectEnvSet(state.projectId);
+    const projects = await loadProjects();
+    const project = findProjectById(projects, state.projectId);
+    if (!project) {
+      clearUserState(ctx.from.id);
+      await renderOrEdit(ctx, 'Project not found.');
+      return;
+    }
+    const logTest = normalizeLogTestSettings(project);
+    const tokenKey = resolveLogTestTokenKey(project.id, logTest);
+    try {
+      await upsertEnvVar(state.projectId, tokenKey, token, envSetId);
+      const updated = await updateProjectLogTest(state.projectId, (current) => ({
+        ...current,
+        tokenKeyInEnvVault: tokenKey,
+        enabled: true,
+      }));
+      if (updated?.logTest) {
+        project.logTest = updated.logTest;
+      }
+    } catch (error) {
+      console.error('[log-test] Failed to save token', error);
+      await ctx.reply(`Failed to store token: ${error.message}`);
+      return;
+    }
+    clearUserState(ctx.from.id);
+    await renderProjectLogAlerts(
+      ctx,
+      state.projectId,
+      `✅ Log test configured.\n${formatLogTestConfigSummary(normalizeLogTestSettings(project), tokenKey)}`,
+    );
+  }
+}
+
+async function fetchLogTestToken(projectId, logTest) {
+  if (!isEnvVaultAvailable()) {
+    return { ok: false, error: 'Env Vault unavailable.' };
+  }
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const tokenKey = resolveLogTestTokenKey(projectId, logTest);
+  const token = await getEnvVarValue(projectId, tokenKey, envSetId);
+  if (!token) {
+    return { ok: false, error: `Token not found in Env Vault key ${tokenKey}.` };
+  }
+  return { ok: true, token, tokenKey };
+}
+
+function buildLogTestPayload(project, mode, correlationId) {
+  const env = project?.environment || project?.env || null;
+  return {
+    mode,
+    correlationId,
+    projectId: project.id,
+    env: env || undefined,
+  };
+}
+
+function requestUrlWithBodyAndHeaders(options) {
+  const { method, targetUrl, headers, body, timeoutMs } = options;
+  return new Promise((resolve, reject) => {
+    const url = new URL(targetUrl);
+    const isHttps = url.protocol === 'https:';
+    const lib = isHttps ? https : http;
+    const payload = body ? JSON.stringify(body) : null;
+    const finalHeaders = {
+      ...headers,
+      ...(payload
+        ? {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          }
+        : {}),
+    };
+    const requestOptions = {
+      method,
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      headers: Object.fromEntries(Object.entries(finalHeaders).filter(([, value]) => value)),
+    };
+    const start = Date.now();
+    const req = lib.request(requestOptions, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      res.on('end', () => {
+        resolve({ status: res.statusCode, body: data, durationMs: Date.now() - start });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs || 15000, () => {
+      req.destroy(new Error('Request timed out'));
+    });
+    if (payload) {
+      req.write(payload);
+    }
+    req.end();
+  });
+}
+
+function buildLogTestFailureHint(error, response) {
+  if (response) {
+    if (response.status === 404) {
+      return 'Endpoint not found (404). Implement POST /pm/test-log (or alias /__pm/test-log).';
+    }
+    if (response.status === 401) {
+      return 'Unauthorized (401). PM_TEST_TOKEN mismatch or PM_TEST_ENABLED is off.';
+    }
+    if (response.status === 403) {
+      return 'Forbidden (403). Check IP allowlists and PM_TEST_TOKEN.';
+    }
+    if (response.status >= 500) {
+      return 'Server error. Check client logs and PM_TEST_ENABLED.';
+    }
+    return `Unexpected status ${response.status}.`;
+  }
+  const code = error?.code || '';
+  if (code === 'ENOTFOUND') {
+    return 'DNS lookup failed. Check test endpoint URL.';
+  }
+  if (code === 'ECONNREFUSED') {
+    return 'Connection refused. Service may be down or wrong port.';
+  }
+  if (code === 'ETIMEDOUT' || String(error?.message || '').toLowerCase().includes('timed out')) {
+    return 'Request timed out. Service may be asleep or network blocked.';
+  }
+  return error?.message || 'Request failed.';
+}
+
+function buildLogTestReceiptHint() {
+  return [
+    'Client call succeeded but no log arrived.',
+    'Verify client PM_URL and PM_INGEST_TOKEN.',
+    'Ensure correlationId is included in log payload meta.',
+    'Check outbound connectivity from client to PM.',
+  ].join('\n');
+}
+
+function buildLogTestDiagnosticsReport(diagnostics) {
+  const missing = [];
+  if (diagnostics.logger) {
+    if (!diagnostics.logger.hasPmLogger) missing.push('PM logger not installed');
+    if (!diagnostics.logger.hasAxiosInterceptor) missing.push('Axios interceptor missing');
+    if (!diagnostics.logger.hasFetchInterceptor) missing.push('Fetch interceptor missing');
+    if (!diagnostics.logger.hasUnhandledRejectionHook)
+      missing.push('Unhandled rejection hook missing');
+    if (!diagnostics.logger.hasUncaughtExceptionHook)
+      missing.push('Uncaught exception hook missing');
+  }
+  if (diagnostics.pmConfig) {
+    if (!diagnostics.pmConfig.hasPmUrl) missing.push('PM_URL not configured');
+    if (!diagnostics.pmConfig.hasPmToken) missing.push('PM_INGEST_TOKEN not configured');
+  }
+  const lines = [
+    '🔎 Diagnostics report',
+    `Project: ${diagnostics.projectId || '-'}`,
+    '',
+    `Logger: ${JSON.stringify(diagnostics.logger || {})}`,
+    `PM config: ${JSON.stringify(diagnostics.pmConfig || {})}`,
+    `Last send: ${JSON.stringify(diagnostics.lastSend || {})}`,
+  ];
+  if (missing.length) {
+    lines.push('', `Missing: ${missing.join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+async function requestLogDiagnostics(project, logTest, token) {
+  if (!logTest.diagnosticsEndpointUrl) {
+    return { ok: false, error: 'Diagnostics endpoint not configured.' };
+  }
+  try {
+    const response = await requestUrlWithBodyAndHeaders({
+      method: 'GET',
+      targetUrl: logTest.diagnosticsEndpointUrl,
+      headers: { Authorization: `Bearer ${token}` },
+      timeoutMs: 12_000,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      return { ok: false, error: `Diagnostics request failed (${response.status}).` };
+    }
+    let payload = null;
+    try {
+      payload = response.body ? JSON.parse(response.body) : null;
+    } catch (error) {
+      payload = null;
+    }
+    if (!payload || typeof payload !== 'object') {
+      return { ok: false, error: 'Diagnostics response invalid.' };
+    }
+    return { ok: true, payload };
+  } catch (error) {
+    return { ok: false, error: buildLogTestFailureHint(error) };
+  }
+}
+
+function createPendingLogTestEntry({ correlationId, projectId, mode, chatId, requestId, timeoutMs }) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const expiresAt = startedAt + timeoutMs;
+    const timer = setTimeout(() => {
+      if (pendingLogTests.has(correlationId)) {
+        pendingLogTests.delete(correlationId);
+        resolve({ ok: false, status: 'timeout', correlationId, startedAt, expiresAt });
+      }
+    }, timeoutMs);
+    pendingLogTests.set(correlationId, {
+      correlationId,
+      projectId,
+      mode,
+      chatId,
+      requestId,
+      startedAt,
+      expiresAt,
+      resolve,
+      timer,
+    });
+  });
+}
+
+function cancelPendingLogTest(correlationId, reason = 'cancelled') {
+  const pending = pendingLogTests.get(correlationId);
+  if (!pending) return;
+  pendingLogTests.delete(correlationId);
+  if (pending.timer) {
+    clearTimeout(pending.timer);
+  }
+  pending.resolve({
+    ok: false,
+    status: reason,
+    correlationId,
+    startedAt: pending.startedAt,
+    expiresAt: pending.expiresAt,
+  });
+}
+
+function formatLogTestReceipt(entry) {
+  const summary = {
+    level: entry.level,
+    message: truncateText(entry.message, 160),
+    env: entry.meta?.env || entry.meta?.environment || '-',
+  };
+  return `✅ Log received.\nLevel: ${summary.level}\nEnv: ${summary.env}\nMessage: ${summary.message}`;
+}
+
+async function handlePendingLogTestReceipt({ correlationId, entry, receivedAt }) {
+  if (!correlationId) return;
+  const pending = pendingLogTests.get(correlationId);
+  if (!pending) return;
+  pendingLogTests.delete(correlationId);
+  if (pending.timer) {
+    clearTimeout(pending.timer);
+  }
+  pending.resolve({
+    ok: true,
+    status: 'received',
+    correlationId,
+    receivedAt,
+    entry,
+    startedAt: pending.startedAt,
+  });
+  if (pending.chatId) {
+    try {
+      await bot.api.sendMessage(pending.chatId, formatLogTestReceipt(entry), {
+        disable_web_page_preview: true,
+      });
+    } catch (error) {
+      console.error('[log-test] Failed to notify receipt', {
+        correlationId,
+        error: error?.message,
+      });
+    }
+  }
+}
+
+async function runSingleLogTest(ctx, projectId, mode) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  if (!LOG_TEST_MODES.includes(mode)) {
+    await renderProjectLogAlerts(ctx, projectId, 'Invalid test mode.');
+    return;
+  }
+  const logTest = normalizeLogTestSettings(project);
+  if (!logTest.testEndpointUrl) {
+    await renderProjectLogAlerts(ctx, projectId, '⚠️ Configure test endpoints first.');
+    return;
+  }
+
+  const tokenResult = await fetchLogTestToken(projectId, logTest);
+  if (!tokenResult.ok) {
+    await renderProjectLogAlerts(ctx, projectId, `⚠️ ${tokenResult.error}`);
+    return;
+  }
+  const correlationId = crypto.randomUUID();
+  const requestId = crypto.randomUUID();
+  const payload = buildLogTestPayload(project, mode, correlationId);
+  const timeoutMs = LOG_TEST_CALL_TIMEOUTS_MS[mode] || 12_000;
+  const receiptPromise = createPendingLogTestEntry({
+    correlationId,
+    projectId,
+    mode,
+    chatId: ctx.chat?.id,
+    requestId,
+    timeoutMs: LOG_TEST_RECEIPT_TIMEOUT_MS,
+  });
+  let response;
+  try {
+    response = await requestUrlWithBodyAndHeaders({
+      method: 'POST',
+      targetUrl: logTest.testEndpointUrl,
+      headers: {
+        Authorization: `Bearer ${tokenResult.token}`,
+        'X-PM-Request-Id': requestId,
+      },
+      body: payload,
+      timeoutMs,
+    });
+  } catch (error) {
+    cancelPendingLogTest(correlationId, 'call_failed');
+    await updateProjectLogTestResult(projectId, {
+      status: 'fail',
+      summary: buildLogTestFailureHint(error),
+      correlationIds: [correlationId],
+    });
+    let notice = `❌ Test call failed.\n${buildLogTestFailureHint(error)}`;
+    if (!logTest.diagnosticsEndpointUrl) {
+      notice +=
+        '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+    }
+    await renderProjectLogAlerts(ctx, projectId, notice);
+    return;
+  }
+
+  if (!response || response.status < 200 || response.status >= 300) {
+    cancelPendingLogTest(correlationId, 'call_failed');
+    const hint = buildLogTestFailureHint(null, response);
+    await updateProjectLogTestResult(projectId, {
+      status: 'fail',
+      summary: hint,
+      correlationIds: [correlationId],
+    });
+    let notice = `❌ Test call failed.\n${hint}\nStatus: ${response?.status || 'unknown'}`;
+    if (!logTest.diagnosticsEndpointUrl) {
+      notice +=
+        '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+    }
+    await renderProjectLogAlerts(ctx, projectId, notice);
+    return;
+  }
+
+  const receipt = await receiptPromise;
+  if (!receipt.ok) {
+    const hint = buildLogTestReceiptHint();
+    await updateProjectLogTestResult(projectId, {
+      status: 'partial',
+      summary: hint,
+      correlationIds: [correlationId],
+    });
+    let notice = `⚠️ Test call succeeded but no log received.\n${hint}`;
+    if (!logTest.diagnosticsEndpointUrl) {
+      notice +=
+        '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+    }
+    await renderProjectLogAlerts(ctx, projectId, notice);
+    return;
+  }
+
+  await updateProjectLogTestResult(projectId, {
+    status: 'pass',
+    summary: `Mode ${mode} received.`,
+    correlationIds: [correlationId],
+  });
+  await renderProjectLogAlerts(ctx, projectId, `✅ ${mode} test passed.`);
+}
+
+async function runAllLogTests(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const logTest = normalizeLogTestSettings(project);
+  if (!logTest.testEndpointUrl) {
+    await renderProjectLogAlerts(ctx, projectId, '⚠️ Configure test endpoints first.');
+    return;
+  }
+  const tokenResult = await fetchLogTestToken(projectId, logTest);
+  if (!tokenResult.ok) {
+    await renderProjectLogAlerts(ctx, projectId, `⚠️ ${tokenResult.error}`);
+    return;
+  }
+
+  const results = [];
+  for (const mode of LOG_TEST_MODES) {
+    const correlationId = crypto.randomUUID();
+    const requestId = crypto.randomUUID();
+    const payload = buildLogTestPayload(project, mode, correlationId);
+    const timeoutMs = LOG_TEST_CALL_TIMEOUTS_MS[mode] || 12_000;
+    const receiptPromise = createPendingLogTestEntry({
+      correlationId,
+      projectId,
+      mode,
+      chatId: ctx.chat?.id,
+      requestId,
+      timeoutMs: LOG_TEST_RECEIPT_TIMEOUT_MS,
+    });
+    let response;
+    try {
+      response = await requestUrlWithBodyAndHeaders({
+        method: 'POST',
+        targetUrl: logTest.testEndpointUrl,
+        headers: {
+          Authorization: `Bearer ${tokenResult.token}`,
+          'X-PM-Request-Id': requestId,
+        },
+        body: payload,
+        timeoutMs,
+      });
+    } catch (error) {
+      cancelPendingLogTest(correlationId, 'call_failed');
+      results.push({
+        mode,
+        status: 'call_failed',
+        error: buildLogTestFailureHint(error),
+        correlationId,
+      });
+      break;
+    }
+
+    if (!response || response.status < 200 || response.status >= 300) {
+      cancelPendingLogTest(correlationId, 'call_failed');
+      results.push({
+        mode,
+        status: 'call_failed',
+        error: buildLogTestFailureHint(null, response),
+        statusCode: response?.status || null,
+        correlationId,
+        callDurationMs: response?.durationMs || null,
+      });
+      break;
+    }
+
+    const receipt = await receiptPromise;
+    if (!receipt.ok) {
+      results.push({
+        mode,
+        status: 'log_missing',
+        error: buildLogTestReceiptHint(),
+        correlationId,
+        callDurationMs: response?.durationMs || null,
+      });
+      break;
+    }
+    const receivedAtMs = receipt.receivedAt ? new Date(receipt.receivedAt).getTime() : null;
+    const logDelayMs =
+      Number.isFinite(receivedAtMs) && Number.isFinite(receipt.startedAt)
+        ? Math.max(0, receivedAtMs - receipt.startedAt)
+        : null;
+    results.push({
+      mode,
+      status: 'ok',
+      correlationId,
+      callDurationMs: response?.durationMs || null,
+      logDelayMs,
+    });
+  }
+
+  const summaryLines = ['🧪 Log test suite results', `Project: ${project.name || project.id}`, ''];
+  results.forEach((result) => {
+    if (result.status === 'ok') {
+      summaryLines.push(
+        `✅ ${result.mode}: log received (call ${result.callDurationMs ?? '-'}ms, log ${result.logDelayMs ?? '-'}ms)`,
+      );
+    } else if (result.status === 'call_failed') {
+      summaryLines.push(
+        `❌ ${result.mode}: client call failed (${result.error})${result.callDurationMs ? ` in ${result.callDurationMs}ms` : ''}`,
+      );
+    } else {
+      summaryLines.push(
+        `⚠️ ${result.mode}: log missing (${result.error})${result.callDurationMs ? ` (call ${result.callDurationMs}ms)` : ''}`,
+      );
+    }
+  });
+
+  const allPassed = results.length === LOG_TEST_MODES.length && results.every((r) => r.status === 'ok');
+  const anyCallFailed = results.some((r) => r.status === 'call_failed');
+  const status = allPassed ? 'pass' : anyCallFailed ? 'fail' : 'partial';
+  const summary = summaryLines.slice(0, 4).join(' ');
+  await updateProjectLogTestResult(projectId, {
+    status,
+    summary,
+    correlationIds: results.map((result) => result.correlationId).filter(Boolean),
+  });
+
+  let notice = summaryLines.join('\n');
+  if (!allPassed && logTest.diagnosticsEndpointUrl) {
+    const diag = await requestLogDiagnostics(project, logTest, tokenResult.token);
+    if (diag.ok) {
+      notice += `\n\n${buildLogTestDiagnosticsReport(diag.payload)}`;
+    } else {
+      notice += `\n\nDiagnostics failed: ${diag.error}`;
+    }
+  } else if (!allPassed && !logTest.diagnosticsEndpointUrl) {
+    notice +=
+      '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+  }
+  await renderProjectLogAlerts(ctx, projectId, notice);
+}
+
+async function renderLogTestReminders(ctx) {
+  const projects = await loadProjects();
+  const nowMs = Date.now();
+  const needing = projects.filter((project) => {
+    const logTest = normalizeLogTestSettings(project);
+    const reminder = resolveLogTestReminderState(logTest, nowMs);
+    return reminder.needsTest && !reminder.isSnoozed;
+  });
+  const lines = ['🧾 Projects needing log test', ''];
+  if (!needing.length) {
+    lines.push('✅ All projects are up to date.');
+  } else {
+    needing.forEach((project) => {
+      lines.push(`• ${project.name || project.id}`);
+    });
+  }
+  const inline = new InlineKeyboard();
+  needing.forEach((project) => {
+    inline.text(project.name || project.id, `logmenu:open:${project.id}`).row();
+  });
+  inline.text('⬅️ Back', 'logmenu:list');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function sendLogTestReminderDigest() {
+  if (!LOG_TEST_DAILY_REMINDER_ENABLED) return;
+  const projects = await loadProjects();
+  const nowMs = Date.now();
+  const needing = projects.filter((project) => {
+    const logTest = normalizeLogTestSettings(project);
+    const reminder = resolveLogTestReminderState(logTest, nowMs);
+    return reminder.needsTest && !reminder.isSnoozed;
+  });
+  if (!needing.length) return;
+  const lines = ['🧾 Daily log test reminder', ''];
+  needing.forEach((project) => {
+    lines.push(`• ${project.name || project.id}`);
+  });
+  try {
+    await bot.api.sendMessage(ADMIN_TELEGRAM_ID, lines.join('\n'), {
+      disable_web_page_preview: true,
+    });
+  } catch (error) {
+    console.error('[log-test] Failed to send daily reminder', error);
+  }
+}
+
+function scheduleLogTestDailyReminder() {
+  if (!LOG_TEST_DAILY_REMINDER_ENABLED) return;
+  const interval = setInterval(() => {
+    sendLogTestReminderDigest().catch((error) => {
+      console.error('[log-test] Daily reminder failed', error);
+    });
+  }, 24 * 60 * 60 * 1000);
+  if (typeof interval.unref === 'function') {
+    interval.unref();
   }
 }
 
@@ -13671,12 +14685,16 @@ async function renderLogsProjectList(ctx, notice) {
   const projects = await loadProjects();
   const lines = ['📣 Logs', notice || null, '', 'Select a project:'].filter(Boolean);
   const inline = new InlineKeyboard();
+  inline.text('🧾 Projects needing log test', 'logtest:reminders').row();
   if (!projects.length) {
     lines.push('', 'No projects configured yet.');
     inline.text('➕ Add project', 'proj:add').row();
   } else {
     projects.forEach((project) => {
-      const label = `📦 ${project.name || project.id}`;
+      const logTest = normalizeLogTestSettings(project);
+      const reminder = resolveLogTestReminderState(logTest);
+      const reminderBadge = reminder.needsTest && !reminder.isSnoozed ? '⚠️ ' : '';
+      const label = `📦 ${reminderBadge}${project.name || project.id}`;
       inline.text(label, `logmenu:open:${project.id}`).row();
     });
   }
@@ -16391,6 +17409,7 @@ async function startBot() {
     console.error('[Project Manager] Failed to delete webhook:', error?.stack || error);
   }
   await startBotPolling();
+  scheduleLogTestDailyReminder();
   console.error('[boot] bot started');
 }
 
