@@ -4,12 +4,34 @@ if (!require.extensions['.ts']) {
   require.extensions['.ts'] = require.extensions['.js'];
 }
 
+const runtimeStatus = {
+  configDbOk: false,
+  configDbError: null,
+  vaultOk: null,
+  vaultError: null,
+  fatalError: null,
+};
+
 process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] Unhandled promise rejection', reason);
+  const error = reason instanceof Error ? reason : new Error(String(reason || 'Unhandled rejection'));
+  runtimeStatus.fatalError = {
+    source: 'unhandledRejection',
+    message: error.message,
+    stack: error.stack,
+    timestamp: new Date().toISOString(),
+  };
+  console.error('[FATAL] Unhandled promise rejection', runtimeStatus.fatalError);
 });
 
 process.on('uncaughtException', (error) => {
-  console.error('[FATAL] Uncaught exception', error?.stack || error);
+  const fatalError = error instanceof Error ? error : new Error(String(error || 'Uncaught exception'));
+  runtimeStatus.fatalError = {
+    source: 'uncaughtException',
+    message: fatalError.message,
+    stack: fatalError.stack,
+    timestamp: new Date().toISOString(),
+  };
+  console.error('[FATAL] Uncaught exception', runtimeStatus.fatalError);
 });
 
 console.error('[boot] starting');
@@ -150,7 +172,7 @@ const MINI_SITE_PAGE_SIZE = 25;
 const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
 const PROJECT_DB_SSL_DEFAULT_MODE = 'require';
 const PROJECT_DB_SSL_DEFAULT_VERIFY = true;
-const PROJECT_DB_SSL_MODES = new Set(['disable', 'require', 'verify-full']);
+const PROJECT_DB_SSL_MODES = new Set(['disable', 'require']);
 const WEB_DASHBOARD_SETTINGS_KEY = 'webDashboard';
 const WEB_DASHBOARD_SESSION_COOKIE = 'pm_web_session';
 const WEB_DASHBOARD_SESSION_TTL_MINUTES = 20;
@@ -236,12 +258,6 @@ const logsRouter = createLogsRouter({
   sendTelegramMessage: async (chatId, text, options) => bot.api.sendMessage(chatId, text, options),
 });
 
-const runtimeStatus = {
-  configDbOk: false,
-  configDbError: null,
-  vaultOk: null,
-  vaultError: null,
-};
 const CRON_RATE_LIMIT_MESSAGE = 'Cron API rate limit reached. Please wait a bit and try again.';
 const CRON_JOBS_CACHE_TTL_MS = 30_000;
 let lastCronJobsCache = null;
@@ -4504,10 +4520,15 @@ function renderMiniSiteLayout(title, body) {
           th { color: #93c5fd; font-weight: 600; }
           .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1e293b; color: #cbd5f5; font-size: 12px; }
           .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+          .grid { display: grid; gap: 16px; }
+          .grid.two-col { grid-template-columns: 1fr; }
           .fade-in { animation: fadeIn .35s ease; }
           @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
           input, select, textarea { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color: #e6e8ef; }
           .form-row { margin-bottom: 12px; }
+          @media (min-width: 720px) {
+            .grid.two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          }
         </style>
       </head>
       <body>
@@ -10471,7 +10492,7 @@ async function renderProjectDbMiniSite(ctx, projectId) {
   const miniSiteTokenLabel = miniSiteTokenConfigured
     ? `${miniSiteTokenMask || 'configured'}${miniSiteTokenSource}`
     : 'not configured';
-  const sslSettings = resolveProjectDbSslSettings(project);
+  const sslSettings = resolveProjectDbSslSettings(project, miniSiteDb);
   const sslSummary = formatProjectDbSslSummary(sslSettings);
 
   const lines = [
@@ -10850,10 +10871,34 @@ function normalizeProjectDbSslMode(value) {
   return PROJECT_DB_SSL_DEFAULT_MODE;
 }
 
-function resolveProjectDbSslSettings(project) {
+function isSupabaseMiniSiteConnection(connection) {
+  if (!connection) return false;
+  const source = String(connection.source || '').toLowerCase();
+  if (source.includes('supabase')) return true;
+  const dsn = String(connection.dsn || '').toLowerCase();
+  return dsn.includes('.supabase.co');
+}
+
+function hasRequireSslModeInDsn(dsn) {
+  if (!dsn) return false;
+  try {
+    const parsed = new URL(dsn);
+    return String(parsed.searchParams.get('sslmode') || '').toLowerCase() === 'require';
+  } catch (error) {
+    return String(dsn).toLowerCase().includes('sslmode=require');
+  }
+}
+
+function resolveProjectDbSslSettings(project, connection) {
   const sslMode = normalizeProjectDbSslMode(project?.dbSslMode);
-  const sslVerify =
-    typeof project?.dbSslVerify === 'boolean' ? project.dbSslVerify : PROJECT_DB_SSL_DEFAULT_VERIFY;
+  if (typeof project?.dbSslVerify === 'boolean') {
+    return { sslMode, sslVerify: project.dbSslVerify };
+  }
+  const dsn = connection?.dsn;
+  const shouldDisableVerify =
+    hasRequireSslModeInDsn(dsn) ||
+    isSupabaseMiniSiteConnection(connection);
+  const sslVerify = shouldDisableVerify ? false : PROJECT_DB_SSL_DEFAULT_VERIFY;
   return { sslMode, sslVerify };
 }
 
@@ -10864,14 +10909,13 @@ function formatProjectDbSslSummary(settings) {
 
 function buildPgSslOptions(settings) {
   if (!settings || settings.sslMode === 'disable') return null;
-  if (settings.sslVerify === false) return { rejectUnauthorized: false };
-  return { rejectUnauthorized: true };
+  return { rejectUnauthorized: settings.sslVerify !== false };
 }
 
 function buildMiniSitePoolKey(dsn, settings) {
   if (!dsn) return null;
   const sslMode = settings?.sslMode || PROJECT_DB_SSL_DEFAULT_MODE;
-  const sslVerify = settings?.sslVerify ? 'verify' : 'no-verify';
+  const sslVerify = settings?.sslVerify !== false ? 'verify' : 'no-verify';
   return `${dsn}::ssl=${sslMode}:${sslVerify}`;
 }
 
@@ -10880,11 +10924,12 @@ function buildMiniSiteRequestId() {
 }
 
 function renderMiniSiteDbErrorPage({ requestId, adminHint }) {
+  const safeAdminHint = adminHint ? escapeHtml(adminHint) : null;
   const hintBlock = adminHint
     ? `
       <div class="card">
         <h4>Admin hint</h4>
-        <p>${adminHint}</p>
+        <p>${safeAdminHint}</p>
       </div>
     `
     : '';
@@ -12327,7 +12372,7 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
     ? `${miniSiteTokenMask || 'configured'}${miniSiteTokenSource}`
     : 'not configured';
   const supabaseEnabledLabel = supabaseStatus.enabled ? '✅ enabled' : '⚪ disabled';
-  const sslSettings = resolveProjectDbSslSettings(project);
+  const sslSettings = resolveProjectDbSslSettings(project, miniSiteDb);
   const sslSummary = formatProjectDbSslSummary(sslSettings);
   const lines = [
     `🗄️ Database binding — ${project.name || project.id}`,
@@ -12396,7 +12441,8 @@ async function renderProjectDbSslSettings(ctx, projectId, notice) {
     return;
   }
 
-  const settings = resolveProjectDbSslSettings(project);
+  const connection = await resolveMiniSiteDbConnection(project);
+  const settings = resolveProjectDbSslSettings(project, connection);
   const lines = [
     `🔐 DB SSL settings — ${project.name || project.id}`,
     notice || null,
@@ -12410,8 +12456,6 @@ async function renderProjectDbSslSettings(ctx, projectId, notice) {
   const inline = new InlineKeyboard()
     .text(`${settings.sslMode === 'disable' ? '✅' : '⚪'} disable`, `proj:db_ssl_mode:${project.id}:disable`)
     .text(`${settings.sslMode === 'require' ? '✅' : '⚪'} require`, `proj:db_ssl_mode:${project.id}:require`)
-    .row()
-    .text(`${settings.sslMode === 'verify-full' ? '✅' : '⚪'} verify-full`, `proj:db_ssl_mode:${project.id}:verify-full`)
     .row()
     .text(
       `SSL verify: ${settings.sslVerify ? '✅ on' : '⚪ off'}`,
@@ -13874,6 +13918,7 @@ async function handleMiniSiteRequest(req, res, url) {
     return false;
   }
   const requestId = buildMiniSiteRequestId();
+  console.info('[mini-site] request', { requestId, method: req.method, path: url.pathname });
   let adminTokenHash = null;
   let project = null;
 
@@ -13988,7 +14033,9 @@ async function handleMiniSiteRequest(req, res, url) {
           `;
         })
         .join('');
-      const body = cards || '<p class="muted">No projects configured yet.</p>';
+      const body = cards
+        ? `<div class="grid two-col">${cards}</div>`
+        : '<p class="muted">No projects configured yet.</p>';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteLayout('Project list', body));
       return true;
@@ -14012,11 +14059,11 @@ async function handleMiniSiteRequest(req, res, url) {
       );
       return true;
     }
-    const sslSettings = resolveProjectDbSslSettings(project);
+    const sslSettings = resolveProjectDbSslSettings(project, connection);
     const pool = getMiniSitePool(connection.dsn, sslSettings);
     if (!pool) {
-      res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end(`Database unavailable. Request ID: ${requestId}`);
+      res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteDbErrorPage({ requestId }));
       return true;
     }
 
@@ -14283,17 +14330,17 @@ async function handleMiniSiteRequest(req, res, url) {
       code: error?.code,
       stack: error?.stack,
     });
+    const errorCode = error?.code || 'unknown';
     const isSelfSigned =
-      error?.code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+      errorCode === 'SELF_SIGNED_CERT_IN_CHAIN' ||
       String(error?.message || '').toLowerCase().includes('self-signed certificate');
+    const isSslError =
+      isSelfSigned ||
+      String(error?.message || '').toLowerCase().includes('ssl') ||
+      String(error?.message || '').toLowerCase().includes('certificate');
     let adminHint = null;
-    if (isSelfSigned) {
-      const isAdminHintAllowed = adminTokenHash
-        ? await isMiniSiteEditAuthed(req, adminTokenHash)
-        : false;
-      if (isAdminHintAllowed) {
-        adminHint = `Self-signed certificate detected. Update SSL verify to "off" in the bot: Database → project → SSL settings.`;
-      }
+    if (isSslError) {
+      adminHint = `SSL error code: ${errorCode}. Suggestion: set dbSslVerify=false or provide CA.`;
     }
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderMiniSiteDbErrorPage({ requestId, adminHint }));
@@ -14308,6 +14355,28 @@ function startHttpServer() {
   httpServerPromise = new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
+      if (runtimeStatus.fatalError) {
+        const requestId = buildMiniSiteRequestId();
+        if (url.pathname.startsWith('/db-mini')) {
+          res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(
+            renderMiniSiteDbErrorPage({
+              requestId,
+              adminHint: `Server fatal error (${runtimeStatus.fatalError.source}). Check logs for details.`,
+            }),
+          );
+          return;
+        }
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: 'Server encountered a fatal error.',
+            requestId,
+          }),
+        );
+        return;
+      }
       if (await handleWebRequest(req, res, url)) {
         return;
       }
