@@ -34,6 +34,15 @@ const DEFAULT_GLOBAL_SETTINGS = {
     events: ['deploy_started', 'deploy_ended'],
     lastVerifiedAt: null,
   },
+  renderDeploy: {
+    pollingEnabledGlobal: true,
+    webhookEnabledGlobal: true,
+    pollIntervalSec: 60,
+    pollMaxServicesPerTick: 10,
+    pollTimeoutMs: 8000,
+    workspaceId: null,
+    unmappedEvents: [],
+  },
   backups: {
     channelId: '',
     captionTemplate:
@@ -69,6 +78,10 @@ function applySettingsDefaults(settings) {
     renderWebhook: {
       ...DEFAULT_GLOBAL_SETTINGS.renderWebhook,
       ...(payload.renderWebhook || {}),
+    },
+    renderDeploy: {
+      ...DEFAULT_GLOBAL_SETTINGS.renderDeploy,
+      ...(payload.renderDeploy || {}),
     },
     backups: {
       ...DEFAULT_GLOBAL_SETTINGS.backups,

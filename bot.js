@@ -179,8 +179,12 @@ const MINI_SITE_EDIT_SESSION_COOKIE = 'pm_db_edit_session';
 const MINI_SITE_SETTINGS_KEY = 'dbMiniSite';
 const MINI_SITE_PAGE_SIZE = 25;
 const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
-const MINI_SITE_CONNECTION_TIMEOUT_MS = 5000;
-const MINI_SITE_QUERY_TIMEOUT_MS = 5000;
+const MINI_SITE_CONNECTION_TIMEOUT_MS = Number(process.env.MINI_SITE_CONNECTION_TIMEOUT_MS) || 8000;
+const MINI_SITE_QUERY_TIMEOUT_MS = Number(process.env.MINI_SITE_QUERY_TIMEOUT_MS) || 8000;
+const MINI_SITE_STATEMENT_TIMEOUT_MS = Number(process.env.MINI_SITE_STATEMENT_TIMEOUT_MS) || 8000;
+const MINI_SITE_SQL_DEFAULT_LIMIT = 100;
+const MINI_SITE_SQL_MAX_LIMIT = 1000;
+const MINI_SITE_SQL_WRITE_WINDOW_MS = 60 * 1000;
 const PROJECT_DB_SSL_DEFAULT_MODE = 'require';
 const PROJECT_DB_SSL_DEFAULT_VERIFY = true;
 const PROJECT_DB_SSL_MODES = new Set(['disable', 'require']);
@@ -229,6 +233,7 @@ const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
 const envVaultPools = new Map();
 const miniSitePools = new Map();
+const miniSiteWriteGrants = new Map();
 const supabaseTableAccess = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
@@ -327,14 +332,21 @@ const CRON_JOBS_CACHE_TTL_MS = 30_000;
 let lastCronJobsCache = null;
 let lastCronJobsFetchedAt = 0;
 const TELEGRAM_WEBHOOK_PATH_PREFIX = '/webhook';
-const RENDER_API_KEY = process.env.RENDER_API_KEY;
+const RENDER_API_KEY_ENV = process.env.RENDER_API_KEY;
 const RENDER_API_BASE_URL = 'https://api.render.com/v1';
 const RENDER_WEBHOOK_EVENTS_DEFAULT = ['deploy_started', 'deploy_ended'];
+const RENDER_POLL_INTERVAL_SEC_DEFAULT = 60;
+const RENDER_POLL_MAX_SERVICES_PER_TICK_DEFAULT = 10;
+const RENDER_POLL_TIMEOUT_MS_DEFAULT = 8000;
+const RENDER_ENV_VAULT_PROJECT_ID = '__render_global__';
 const RENDER_WEBHOOK_RATE_LIMIT = { limit: 12, windowMs: 60 * 1000 };
 const RENDER_WEBHOOK_DEDUP_TTL_MS = 6 * 60 * 60 * 1000;
 const renderWebhookRateLimits = new Map();
 const renderWebhookEventCache = new Map();
 const renderWebhookUnknownServiceNotices = new Map();
+const renderServiceDiscoveryCache = new Map();
+const renderPollingLocks = new Set();
+let renderPollTimer = null;
 
 function normalizeLogLevels(levels) {
   if (!Array.isArray(levels)) return [];
@@ -2003,6 +2015,9 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'deploy_service_id':
       await handleDeployServiceIdInput(ctx, state);
+      break;
+    case 'render_api_key':
+      await handleRenderApiKeyInput(ctx, state);
       break;
     case 'projcron_keepalive_schedule':
     case 'projcron_keepalive_recreate':
@@ -5323,6 +5338,10 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;');
 }
 
+function escapeHtmlAttribute(value) {
+  return escapeHtml(value).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function parseCookies(request) {
   const header = request.headers?.cookie;
   if (!header) return {};
@@ -5341,6 +5360,88 @@ function parseFormBody(body) {
     result[key] = value;
   });
   return result;
+}
+
+function hashSqlQuery(sql) {
+  return crypto.createHash('sha256').update(String(sql || '')).digest('hex');
+}
+
+function normalizeSqlInput(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) {
+    return { ok: false, error: 'Query is required.' };
+  }
+  const stripped = trimmed.replace(/;+\s*$/, '');
+  if (stripped.includes(';')) {
+    return { ok: false, error: 'Multiple statements are not allowed.' };
+  }
+  return { ok: true, sql: stripped };
+}
+
+function normalizeSqlLimit(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return MINI_SITE_SQL_DEFAULT_LIMIT;
+  }
+  return Math.min(parsed, MINI_SITE_SQL_MAX_LIMIT);
+}
+
+function isSqlWriteAttempt(sql) {
+  const forbidden = [
+    'insert',
+    'update',
+    'delete',
+    'drop',
+    'alter',
+    'truncate',
+    'grant',
+    'revoke',
+    'create',
+    'vacuum',
+    'merge',
+    'reindex',
+    'cluster',
+    'comment',
+  ];
+  const lowered = String(sql || '').toLowerCase();
+  if (forbidden.some((keyword) => new RegExp(`\\b${keyword}\\b`, 'i').test(lowered))) {
+    return true;
+  }
+  const firstWord = lowered.trim().split(/\s+/)[0];
+  return !['select', 'show', 'explain'].includes(firstWord);
+}
+
+function getMiniSiteWriteGrantKey(req, adminTokenHash) {
+  const bearerToken = getBearerToken(req);
+  if (isMiniSiteAdminTokenValid(bearerToken, adminTokenHash)) {
+    return `bearer:${hashMiniSiteToken(bearerToken)}`;
+  }
+  const cookies = parseCookies(req);
+  const editToken = cookies[MINI_SITE_EDIT_SESSION_COOKIE];
+  if (editToken) {
+    return `edit:${editToken}`;
+  }
+  return null;
+}
+
+function enableMiniSiteWriteGrant(req, adminTokenHash) {
+  const key = getMiniSiteWriteGrantKey(req, adminTokenHash);
+  if (!key) return null;
+  const expiresAt = Date.now() + MINI_SITE_SQL_WRITE_WINDOW_MS;
+  miniSiteWriteGrants.set(key, expiresAt);
+  return expiresAt;
+}
+
+function isMiniSiteWriteGrantActive(req, adminTokenHash) {
+  const key = getMiniSiteWriteGrantKey(req, adminTokenHash);
+  if (!key) return false;
+  const expiresAt = miniSiteWriteGrants.get(key);
+  if (!expiresAt) return false;
+  if (Date.now() > expiresAt) {
+    miniSiteWriteGrants.delete(key);
+    return false;
+  }
+  return true;
 }
 
 function renderMiniSiteLayout(title, body) {
@@ -5368,11 +5469,15 @@ function renderMiniSiteLayout(title, body) {
           .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1e293b; color: #cbd5f5; font-size: 12px; }
           .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
           .grid { display: grid; gap: 16px; }
-          .grid.two-col { grid-template-columns: 1fr; }
+          .grid.two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
           .fade-in { animation: fadeIn .35s ease; }
           @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
           input, select, textarea { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color: #e6e8ef; }
           .form-row { margin-bottom: 12px; }
+          .tag { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 12px; background: #1f2937; color: #cbd5f5; }
+          .warning { color: #fca5a5; }
+          .success { color: #86efac; }
+          .stack { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
           @media (min-width: 720px) {
             .grid.two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
           }
@@ -9353,13 +9458,44 @@ async function handleDeployServiceIdInput(ctx, state) {
     await renderDeployProjectPanel(ctx, state.projectId, 'Operation cancelled.');
     return;
   }
+  const cache = getRenderServiceCache();
+  const matched = cache?.services?.find((service) => service.id === text) || null;
   await updateProjectDeploySettings(state.projectId, (current) => ({
     ...current,
     deployProvider: 'render',
-    render: { ...current.render, serviceId: text },
+    render: {
+      ...current.render,
+      serviceId: text,
+      serviceName: matched?.name || current.render.serviceName || null,
+      enabled: true,
+      pollingEnabled: true,
+      pollingStatus: null,
+    },
   }));
   clearUserState(ctx.from.id);
   await renderDeployProjectPanel(ctx, state.projectId, '✅ Render serviceId updated.');
+}
+
+async function handleRenderApiKeyInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a valid Render API key.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    clearUserState(ctx.from.id);
+    await renderDeploysProjectList(ctx, 'Operation cancelled.');
+    return;
+  }
+  try {
+    await storeRenderApiKey(text);
+    clearUserState(ctx.from.id);
+    await renderDeploysProjectList(ctx, '✅ Render API key saved.');
+  } catch (error) {
+    clearUserState(ctx.from.id);
+    const message = error?.message || 'Failed to save API key.';
+    await renderDeploysProjectList(ctx, `❌ ${message}`);
+  }
 }
 
 async function handleSupabaseBindingInput(ctx, state) {
@@ -11255,17 +11391,138 @@ function normalizeRenderWebhookSettings(settings) {
   };
 }
 
+function parseEnvBoolean(value) {
+  if (value == null) return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false;
+  return null;
+}
+
+function normalizeRenderGlobalSettings(settings) {
+  const render = settings?.renderDeploy || {};
+  return {
+    pollingEnabledGlobal:
+      typeof render.pollingEnabledGlobal === 'boolean' ? render.pollingEnabledGlobal : true,
+    webhookEnabledGlobal:
+      typeof render.webhookEnabledGlobal === 'boolean' ? render.webhookEnabledGlobal : true,
+    pollIntervalSec: Number(render.pollIntervalSec) || RENDER_POLL_INTERVAL_SEC_DEFAULT,
+    pollMaxServicesPerTick:
+      Number(render.pollMaxServicesPerTick) || RENDER_POLL_MAX_SERVICES_PER_TICK_DEFAULT,
+    pollTimeoutMs: Number(render.pollTimeoutMs) || RENDER_POLL_TIMEOUT_MS_DEFAULT,
+    workspaceId: render.workspaceId || null,
+    unmappedEvents: Array.isArray(render.unmappedEvents) ? render.unmappedEvents : [],
+  };
+}
+
+function resolveRenderGlobalSettings(settings) {
+  const normalized = normalizeRenderGlobalSettings(settings);
+  const pollIntervalEnv = Number(process.env.RENDER_POLL_INTERVAL_SEC);
+  const pollMaxEnv = Number(process.env.RENDER_POLL_MAX_SERVICES_PER_TICK);
+  const pollTimeoutEnv = Number(process.env.RENDER_POLL_TIMEOUT_MS);
+  const workspaceEnv = process.env.RENDER_WORKSPACE_ID;
+  const pollingEnabledEnv = parseEnvBoolean(process.env.RENDER_POLLING_ENABLED_GLOBAL);
+  const webhookEnabledEnv = parseEnvBoolean(process.env.RENDER_WEBHOOK_ENABLED_GLOBAL);
+  return {
+    ...normalized,
+    pollIntervalSec:
+      Number.isFinite(pollIntervalEnv) && pollIntervalEnv > 0
+        ? pollIntervalEnv
+        : normalized.pollIntervalSec,
+    pollMaxServicesPerTick:
+      Number.isFinite(pollMaxEnv) && pollMaxEnv > 0 ? pollMaxEnv : normalized.pollMaxServicesPerTick,
+    pollTimeoutMs:
+      Number.isFinite(pollTimeoutEnv) && pollTimeoutEnv > 0 ? pollTimeoutEnv : normalized.pollTimeoutMs,
+    workspaceId: workspaceEnv || normalized.workspaceId || null,
+    pollingEnabledGlobal:
+      typeof pollingEnabledEnv === 'boolean' ? pollingEnabledEnv : normalized.pollingEnabledGlobal,
+    webhookEnabledGlobal:
+      typeof webhookEnabledEnv === 'boolean' ? webhookEnabledEnv : normalized.webhookEnabledGlobal,
+  };
+}
+
+function upsertUnmappedRenderEvent(events, payload) {
+  const now = new Date().toISOString();
+  const existingIndex = events.findIndex((entry) => entry.serviceId === payload.serviceId);
+  const base = existingIndex >= 0 ? events[existingIndex] : null;
+  const updated = {
+    serviceId: payload.serviceId,
+    lastEventType: payload.eventType || base?.lastEventType || null,
+    lastSeenAt: now,
+    count: (base?.count || 0) + 1,
+  };
+  if (existingIndex >= 0) {
+    const next = [...events];
+    next[existingIndex] = updated;
+    return next;
+  }
+  return [updated, ...events].slice(0, 20);
+}
+
+async function recordUnmappedRenderEvent(payload) {
+  const settings = await getCachedSettings(true);
+  const renderSettings = normalizeRenderGlobalSettings(settings);
+  const nextEvents = upsertUnmappedRenderEvent(renderSettings.unmappedEvents, payload);
+  const nextSettings = {
+    ...settings,
+    renderDeploy: {
+      ...settings.renderDeploy,
+      unmappedEvents: nextEvents,
+    },
+  };
+  await saveGlobalSettingsAndCache(nextSettings);
+  await recordAuditLog('render_unmapped_event', {
+    serviceId: payload.serviceId,
+    eventType: payload.eventType,
+  });
+  return nextEvents;
+}
+
+async function clearUnmappedRenderService(serviceId) {
+  if (!serviceId) return null;
+  const settings = await getCachedSettings(true);
+  const renderSettings = normalizeRenderGlobalSettings(settings);
+  const nextEvents = (renderSettings.unmappedEvents || []).filter((entry) => entry.serviceId !== serviceId);
+  const nextSettings = {
+    ...settings,
+    renderDeploy: {
+      ...settings.renderDeploy,
+      unmappedEvents: nextEvents,
+    },
+  };
+  await saveGlobalSettingsAndCache(nextSettings);
+  return nextEvents;
+}
+
 function normalizeProjectDeploySettings(project) {
   const render = project?.render || {};
   const deployNotifications = project?.deployNotifications || {};
+  const enabled =
+    typeof render.enabled === 'boolean'
+      ? render.enabled
+      : typeof deployNotifications.enabled === 'boolean'
+        ? deployNotifications.enabled
+        : Boolean(render.serviceId || project?.renderServiceId);
   return {
     deployProvider: project?.deployProvider || (render.serviceId ? 'render' : null),
     render: {
       serviceId: render.serviceId || project?.renderServiceId || null,
+      serviceName: render.serviceName || null,
+      enabled,
+      pollingEnabled: typeof render.pollingEnabled === 'boolean' ? render.pollingEnabled : enabled,
+      webhookEnabled: typeof render.webhookEnabled === 'boolean' ? render.webhookEnabled : true,
+      pollingStatus: render.pollingStatus || null,
+      lastDeployId: render.lastDeployId || null,
+      lastDeployStatus: render.lastDeployStatus || null,
+      lastSeenAt: render.lastSeenAt || null,
+      notifyOnStart: typeof render.notifyOnStart === 'boolean' ? render.notifyOnStart : true,
+      notifyOnFinish: typeof render.notifyOnFinish === 'boolean' ? render.notifyOnFinish : true,
+      notifyOnFail: typeof render.notifyOnFail === 'boolean' ? render.notifyOnFail : true,
+      recentEvents: Array.isArray(render.recentEvents) ? render.recentEvents : [],
       eventsEnabled: Array.isArray(render.eventsEnabled) ? render.eventsEnabled.filter(Boolean) : null,
     },
     notifications: {
-      enabled: typeof deployNotifications.enabled === 'boolean' ? deployNotifications.enabled : false,
+      enabled,
       lastEvent: deployNotifications.lastEvent || null,
       lastStatus: deployNotifications.lastStatus || null,
     },
@@ -11379,16 +11636,69 @@ async function updateProjectDeploySettings(projectId, updater) {
   project.render = {
     ...(project.render || {}),
     serviceId: next.render?.serviceId || null,
-    eventsEnabled: next.render?.eventsEnabled || null,
+    serviceName: next.render?.serviceName || project.render?.serviceName || null,
+    enabled: typeof next.render?.enabled === 'boolean' ? next.render.enabled : current.render.enabled,
+    pollingEnabled:
+      typeof next.render?.pollingEnabled === 'boolean'
+        ? next.render.pollingEnabled
+        : current.render.pollingEnabled,
+    webhookEnabled:
+      typeof next.render?.webhookEnabled === 'boolean'
+        ? next.render.webhookEnabled
+        : current.render.webhookEnabled,
+    pollingStatus: next.render?.pollingStatus || current.render.pollingStatus || null,
+    lastDeployId: next.render?.lastDeployId || current.render.lastDeployId || null,
+    lastDeployStatus: next.render?.lastDeployStatus || current.render.lastDeployStatus || null,
+    lastSeenAt: next.render?.lastSeenAt || current.render.lastSeenAt || null,
+    notifyOnStart:
+      typeof next.render?.notifyOnStart === 'boolean' ? next.render.notifyOnStart : current.render.notifyOnStart,
+    notifyOnFinish:
+      typeof next.render?.notifyOnFinish === 'boolean' ? next.render.notifyOnFinish : current.render.notifyOnFinish,
+    notifyOnFail:
+      typeof next.render?.notifyOnFail === 'boolean' ? next.render.notifyOnFail : current.render.notifyOnFail,
+    recentEvents: Array.isArray(next.render?.recentEvents) ? next.render.recentEvents : current.render.recentEvents,
+    eventsEnabled: next.render?.eventsEnabled || current.render.eventsEnabled || null,
   };
   project.deployNotifications = {
     ...(project.deployNotifications || {}),
-    enabled: Boolean(next.notifications?.enabled),
+    enabled: Boolean(next.notifications?.enabled ?? next.render?.enabled ?? current.notifications.enabled),
     lastEvent: next.notifications?.lastEvent || null,
     lastStatus: next.notifications?.lastStatus || null,
   };
   await saveProjects(projects);
   return { project, settings: next };
+}
+
+function appendRenderRecentEvent(events, entry) {
+  const next = Array.isArray(events) ? [entry, ...events] : [entry];
+  return next.slice(0, 12);
+}
+
+async function recordRenderDeployState(projectId, payload) {
+  const receivedAt = payload.receivedAt || new Date().toISOString();
+  const eventEntry = {
+    eventType: payload.eventType,
+    status: payload.status || payload.eventType,
+    deployId: payload.deployId || null,
+    source: payload.source || null,
+    receivedAt,
+  };
+  return updateProjectDeploySettings(projectId, (current) => ({
+    ...current,
+    render: {
+      ...current.render,
+      lastDeployId: payload.deployId || current.render.lastDeployId || null,
+      lastDeployStatus: payload.status || payload.eventType || current.render.lastDeployStatus || null,
+      lastSeenAt: receivedAt,
+      recentEvents: appendRenderRecentEvent(current.render.recentEvents, eventEntry),
+      pollingStatus: payload.pollingStatus || current.render.pollingStatus || null,
+    },
+    notifications: {
+      ...current.notifications,
+      lastEvent: eventEntry,
+      lastStatus: payload.status || payload.eventType || current.notifications.lastStatus || null,
+    },
+  }));
 }
 
 function buildProjectLogAlertsView(project, settings, notice) {
@@ -11770,8 +12080,52 @@ function requestUrlWithBodyAndHeaders(options) {
   });
 }
 
-async function requestRenderApi({ method, path, body }) {
-  if (!RENDER_API_KEY) {
+async function ensureRenderEnvVaultSet() {
+  if (!isEnvVaultAvailable()) return null;
+  return ensureDefaultEnvVarSet(RENDER_ENV_VAULT_PROJECT_ID);
+}
+
+async function getRenderApiKeyStatus() {
+  if (RENDER_API_KEY_ENV) {
+    return { key: RENDER_API_KEY_ENV, source: 'env' };
+  }
+  if (!isEnvVaultAvailable()) {
+    return { key: null, source: 'vault_unavailable' };
+  }
+  const envSetId = await ensureRenderEnvVaultSet();
+  if (!envSetId) {
+    return { key: null, source: 'vault_missing' };
+  }
+  const key = await getEnvVarValue(RENDER_ENV_VAULT_PROJECT_ID, 'RENDER_API_KEY', envSetId);
+  return { key: key || null, source: key ? 'env_vault' : 'missing' };
+}
+
+async function storeRenderApiKey(value) {
+  if (!isEnvVaultAvailable()) {
+    throw new Error(MASTER_KEY_ERROR_MESSAGE);
+  }
+  const envSetId = await ensureRenderEnvVaultSet();
+  if (!envSetId) {
+    throw new Error('Env Vault not initialized.');
+  }
+  await upsertEnvVar(RENDER_ENV_VAULT_PROJECT_ID, 'RENDER_API_KEY', value, envSetId);
+  return true;
+}
+
+function getRenderServiceCache() {
+  return renderServiceDiscoveryCache.get('services') || null;
+}
+
+function setRenderServiceCache(services) {
+  renderServiceDiscoveryCache.set('services', {
+    services,
+    fetchedAt: Date.now(),
+  });
+}
+
+async function requestRenderApi({ method, path, body, timeoutMs, apiKey }) {
+  const key = apiKey || (await getRenderApiKeyStatus()).key;
+  if (!key) {
     throw new Error('RENDER_API_KEY not configured.');
   }
   const targetUrl = `${RENDER_API_BASE_URL}${path}`;
@@ -11779,10 +12133,10 @@ async function requestRenderApi({ method, path, body }) {
     method,
     targetUrl,
     headers: {
-      Authorization: `Bearer ${RENDER_API_KEY}`,
+      Authorization: `Bearer ${key}`,
     },
     body,
-    timeoutMs: 15000,
+    timeoutMs: timeoutMs || 15000,
   });
   if (!response || response.status < 200 || response.status >= 300) {
     throw new Error(`Render API failed (${response?.status || 'unknown'}).`);
@@ -11813,6 +12167,150 @@ async function createRenderWebhook({ name, url, events }) {
     },
   });
   return payload;
+}
+
+function buildRenderServicesPath(settings) {
+  const params = new URLSearchParams();
+  params.set('limit', '100');
+  if (settings?.workspaceId) {
+    params.set('ownerId', settings.workspaceId);
+  }
+  const query = params.toString();
+  return `/services${query ? `?${query}` : ''}`;
+}
+
+async function listRenderServices(renderSettings) {
+  const path = buildRenderServicesPath(renderSettings);
+  const payload = await requestRenderApi({ method: 'GET', path, timeoutMs: renderSettings?.pollTimeoutMs });
+  if (Array.isArray(payload)) return payload;
+  if (payload?.data && Array.isArray(payload.data)) return payload.data;
+  return [];
+}
+
+async function listRenderServiceDeploys(serviceId, renderSettings) {
+  if (!serviceId) return [];
+  const path = `/services/${serviceId}/deploys?limit=5`;
+  const payload = await requestRenderApi({ method: 'GET', path, timeoutMs: renderSettings?.pollTimeoutMs });
+  if (Array.isArray(payload)) return payload;
+  if (payload?.data && Array.isArray(payload.data)) return payload.data;
+  return [];
+}
+
+function normalizeRenderDeployPayload(deploy) {
+  if (!deploy) return null;
+  const deployId = deploy.id || deploy.deployId || null;
+  const status = deploy.status || deploy.state || deploy.result || null;
+  const startedAt = deploy.startedAt || deploy.started_at || deploy.createdAt || deploy.created_at || null;
+  const finishedAt = deploy.finishedAt || deploy.finished_at || deploy.updatedAt || deploy.updated_at || null;
+  let durationMs = null;
+  if (startedAt && finishedAt) {
+    const startMs = new Date(startedAt).getTime();
+    const endMs = new Date(finishedAt).getTime();
+    if (Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs) {
+      durationMs = endMs - startMs;
+    }
+  }
+  const dashboardUrl = deploy.url || deploy.dashboardUrl || deploy.dashboard_url || null;
+  return {
+    deployId: deployId ? String(deployId) : null,
+    status: status ? String(status) : null,
+    durationMs,
+    dashboardUrl: dashboardUrl ? String(dashboardUrl) : null,
+  };
+}
+
+async function pollRenderDeploysOnce() {
+  if (renderPollingLocks.has('tick')) return;
+  renderPollingLocks.add('tick');
+  try {
+    const settings = resolveRenderGlobalSettings(await getCachedSettings());
+    if (!settings.pollingEnabledGlobal) {
+      return;
+    }
+    const apiKeyStatus = await getRenderApiKeyStatus();
+    const projects = await loadProjects();
+    const candidates = projects.filter((project) => {
+      const deploySettings = normalizeProjectDeploySettings(project);
+      return (
+        deploySettings.render.enabled &&
+        deploySettings.render.pollingEnabled &&
+        deploySettings.render.serviceId
+      );
+    });
+    if (!apiKeyStatus.key) {
+      let changed = false;
+      candidates.forEach((project) => {
+        if (project.render?.pollingStatus !== 'blocked_missing_api_key') {
+          project.render = {
+            ...(project.render || {}),
+            pollingStatus: 'blocked_missing_api_key',
+          };
+          changed = true;
+        }
+      });
+      if (changed) {
+        await saveProjects(projects);
+      }
+      return;
+    }
+    const limited = candidates.slice(0, settings.pollMaxServicesPerTick);
+    for (const project of limited) {
+      const deploySettings = normalizeProjectDeploySettings(project);
+      const serviceId = deploySettings.render.serviceId;
+      if (!serviceId) continue;
+      try {
+        const deploys = await listRenderServiceDeploys(serviceId, settings);
+        const latestRaw = deploys[0] || null;
+        const normalized = normalizeRenderDeployPayload(latestRaw);
+        if (!normalized) continue;
+        if (project.render?.pollingStatus !== 'ok') {
+          await updateProjectDeploySettings(project.id, (current) => ({
+            ...current,
+            render: { ...current.render, pollingStatus: 'ok' },
+          }));
+        }
+        await handleRenderDeployEvent({
+          project,
+          info: {
+            serviceId,
+            deployId: normalized.deployId,
+            status: normalized.status,
+            durationMs: normalized.durationMs,
+            dashboardUrl: normalized.dashboardUrl,
+          },
+          source: 'polling',
+        });
+      } catch (error) {
+        console.error('[render-poll] failed for service', {
+          projectId: project.id,
+          serviceId,
+          error: error?.message,
+        });
+        await recordAuditLog('render_poll_error', {
+          projectId: project.id,
+          serviceId,
+          error: error?.message,
+        });
+      }
+    }
+  } finally {
+    renderPollingLocks.delete('tick');
+  }
+}
+
+function scheduleRenderPolling() {
+  if (renderPollTimer) {
+    clearInterval(renderPollTimer);
+  }
+  const intervalSec = resolveRenderGlobalSettings(cachedSettings || {}).pollIntervalSec;
+  renderPollTimer = setInterval(() => {
+    pollRenderDeploysOnce().catch((error) => {
+      console.error('[render-poll] tick failed', error);
+    });
+  }, Math.max(15, intervalSec) * 1000);
+  if (typeof renderPollTimer.unref === 'function') {
+    renderPollTimer.unref();
+  }
 }
 
 function buildRenderWebhookTargetUrl() {
@@ -14813,6 +15311,7 @@ function getMiniSitePool(dsn, sslSettings) {
       connectionTimeoutMillis: MINI_SITE_CONNECTION_TIMEOUT_MS,
       idleTimeoutMillis: 30_000,
       max: 4,
+      statement_timeout: MINI_SITE_STATEMENT_TIMEOUT_MS,
     };
     const sslOptions = buildPgSslOptions(sslSettings);
     if (sslOptions) {
@@ -14828,6 +15327,7 @@ async function runMiniSiteQuery(pool, text, values) {
     text,
     values,
     query_timeout: MINI_SITE_QUERY_TIMEOUT_MS,
+    statement_timeout: MINI_SITE_STATEMENT_TIMEOUT_MS,
   });
 }
 
@@ -16069,13 +16569,9 @@ async function renderDatabaseProjectPanel(ctx, projectId, notice) {
   ].filter(Boolean);
   const inline = new InlineKeyboard()
     .text('🌐 Open mini-site', `proj:db_mini_open:${projectId}`)
-    .row()
     .text('🛠️ Edit DB config', `proj:db_config:${projectId}`)
     .row()
     .text('📊 Run DB overview', `proj:db_insights:${projectId}:0:0`)
-    .row()
-    .text('🧾 SQL runner', `proj:sql_menu:${projectId}`)
-    .row()
     .text('⬅️ Back', 'dbmenu:list');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
@@ -16123,21 +16619,65 @@ function formatDeployEventsLine(deploySettings, webhookSettings) {
   const projectEvents = deploySettings.render?.eventsEnabled;
   const events =
     Array.isArray(projectEvents) && projectEvents.length ? projectEvents : webhookSettings.events;
-  return events.length ? events.join(', ') : '-';
+  return `Events: ${events.length ? events.join(', ') : '-'}`;
 }
 
-function formatDeployLastEventLine(lastEvent) {
-  if (!lastEvent) {
+function formatDeployLastEventLine(renderSettings) {
+  if (!renderSettings?.lastDeployStatus) {
     return 'Last deploy: -';
   }
-  const receivedAt = lastEvent.receivedAt ? new Date(lastEvent.receivedAt).toISOString() : '-';
-  const label = lastEvent.outcome || lastEvent.status || lastEvent.eventType || 'event';
+  const receivedAt = renderSettings.lastSeenAt ? new Date(renderSettings.lastSeenAt).toISOString() : '-';
+  const label = renderSettings.lastDeployStatus || 'event';
   return `Last deploy: ${label} (${receivedAt})`;
+}
+
+function formatRenderPollingStatusLine(renderSettings, apiKeyStatus) {
+  if (!renderSettings.pollingEnabledGlobal) {
+    return '✅ Polling: disabled (global)';
+  }
+  if (!apiKeyStatus?.key) {
+    return '⛔ Polling: blocked (missing API key)';
+  }
+  return '✅ Polling: enabled';
+}
+
+function formatRenderWebhookStatusLine(renderSettings, webhookSettings) {
+  if (!renderSettings.webhookEnabledGlobal) {
+    return '🔌 Webhook: disabled (global)';
+  }
+  if (webhookSettings.webhookId) {
+    return '🔌 Webhook: configured';
+  }
+  return '🔌 Webhook: unavailable on free plan (PRO only)';
 }
 
 async function renderDeploysProjectList(ctx, notice) {
   const projects = await loadProjects();
-  const lines = ['🚀 Deploys', notice || null, '', 'Select a project:'].filter(Boolean);
+  const settings = await getCachedSettings();
+  const renderSettings = resolveRenderGlobalSettings(settings);
+  const webhookSettings = normalizeRenderWebhookSettings(settings);
+  const apiKeyStatus = await getRenderApiKeyStatus();
+  const apiKeyLabel = apiKeyStatus.key
+    ? `configured (${apiKeyStatus.source === 'env' ? 'env' : 'vault'})`
+    : 'missing';
+  const unmapped = renderSettings.unmappedEvents || [];
+  const unmappedList = unmapped.length
+    ? `🧭 Needs mapping: ${unmapped
+        .slice(0, 3)
+        .map((entry) => shortenRenderId(entry.serviceId))
+        .join(', ')}${unmapped.length > 3 ? '…' : ''}`
+    : null;
+  const lines = [
+    '🚀 Deploys',
+    notice || null,
+    '',
+    formatRenderPollingStatusLine(renderSettings, apiKeyStatus),
+    formatRenderWebhookStatusLine(renderSettings, webhookSettings),
+    `🔑 Render API key: ${apiKeyLabel}`,
+    unmappedList,
+    '',
+    'Select a project:',
+  ].filter(Boolean);
   const inline = new InlineKeyboard();
   if (!projects.length) {
     lines.push('', 'No projects configured yet.');
@@ -16145,12 +16685,26 @@ async function renderDeploysProjectList(ctx, notice) {
   } else {
     projects.forEach((project) => {
       const deploySettings = normalizeProjectDeploySettings(project);
-      const enabledBadge = deploySettings.notifications.enabled ? '🔔' : '🔕';
+      const enabledBadge = deploySettings.render.enabled ? '🔔' : '🔕';
       const serviceBadge = deploySettings.render.serviceId ? '🟢' : '⚪️';
-      lines.push(`📦 ${project.name || project.id} — ${enabledBadge} alerts · ${serviceBadge} serviceId`);
-      inline.text(`${enabledBadge} ${project.name || project.id}`, `deploy:open:${project.id}`).row();
+      lines.push(
+        `📦 ${project.name || project.id} — ${enabledBadge} alerts · ${serviceBadge} ${
+          deploySettings.render.serviceName || deploySettings.render.serviceId || 'not mapped'
+        }`,
+      );
+      inline.text(`📦 ${project.name || project.id}`, `deploy:open:${project.id}`).row();
+      inline
+        .text('⚙️ Setup/Map service', `deploy:setup:${project.id}`)
+        .text('🔔 Toggle alerts', `deploy:toggle:${project.id}`)
+        .row();
+      inline
+        .text('🧪 Test deploy tracking', `deploy:test:${project.id}`)
+        .text('📜 Recent events', `deploy:recent:${project.id}`)
+        .row();
     });
   }
+  inline.text('🔑 Set Render API key', 'deploy:api_key').row();
+  inline.text('🔎 Discover services', 'deploy:discover').row();
   inline.text('⚙️ Deploy settings', 'deploy:settings').row();
   inline.text('⬅️ Back', 'main:back');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
@@ -16164,41 +16718,59 @@ async function renderDeployProjectPanel(ctx, projectId, notice) {
     return;
   }
   const settings = normalizeProjectDeploySettings(project);
-  const webhookSettings = normalizeRenderWebhookSettings(await getCachedSettings());
+  const cached = await getCachedSettings();
+  const renderSettings = resolveRenderGlobalSettings(cached);
+  const webhookSettings = normalizeRenderWebhookSettings(cached);
   const lines = [
     `🚀 Deploy — ${project.name || project.id}`,
     notice || null,
     '',
     `Provider: ${settings.deployProvider || 'render'}`,
     `Render serviceId: ${settings.render.serviceId || 'missing'}`,
-    `Alerts: ${settings.notifications.enabled ? '🔔 enabled' : '🔕 disabled'}`,
-    `Events: ${formatDeployEventsLine(settings, webhookSettings)}`,
-    `Shared webhook: ${webhookSettings.webhookId ? 'configured' : 'not configured'}`,
-    formatDeployLastEventLine(settings.notifications.lastEvent),
+    `Render service name: ${settings.render.serviceName || '-'}`,
+    `Alerts: ${settings.render.enabled ? '🔔 enabled' : '🔕 disabled'}`,
+    `Start alerts: ${settings.render.notifyOnStart ? '✅' : '❌'}`,
+    `Finish alerts: ${settings.render.notifyOnFinish ? '✅' : '❌'}`,
+    `Fail alerts: ${settings.render.notifyOnFail ? '✅' : '❌'}`,
+    `Polling status: ${settings.render.pollingStatus || 'ok'}`,
+    formatDeployEventsLine(settings, webhookSettings),
+    formatRenderPollingStatusLine(renderSettings, await getRenderApiKeyStatus()),
+    formatRenderWebhookStatusLine(renderSettings, webhookSettings),
+    formatDeployLastEventLine(settings.render),
   ].filter(Boolean);
   const inline = new InlineKeyboard()
-    .text('🔗 Set serviceId', `deploy:set_service:${project.id}`)
-    .text(settings.notifications.enabled ? '🔕 Disable alerts' : '🔔 Enable alerts', `deploy:toggle:${project.id}`)
+    .text('⚙️ Setup/Map service', `deploy:setup:${project.id}`)
+    .text(settings.render.enabled ? '🔕 Disable alerts' : '🔔 Enable alerts', `deploy:toggle:${project.id}`)
     .row()
-    .text('⚙️ Events selection', `deploy:events:${project.id}`)
-    .text('🧪 Test', `deploy:test:${project.id}`)
+    .text('🔔 Toggle alert types', `deploy:alerts:${project.id}`)
+    .text('🧪 Test deploy tracking', `deploy:test:${project.id}`)
+    .row()
+    .text('📜 Recent events', `deploy:recent:${project.id}`)
     .row()
     .text('⬅️ Back', 'deploy:list');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderDeploySettingsMenu(ctx, notice) {
-  const settings = normalizeRenderWebhookSettings(await getCachedSettings());
+  const cached = await getCachedSettings();
+  const settings = normalizeRenderWebhookSettings(cached);
+  const renderSettings = resolveRenderGlobalSettings(cached);
   const lines = [
     '⚙️ Deploy settings',
     notice || null,
     '',
-    'PM uses a shared workspace webhook; only serviceId binding is needed per project.',
+    'PM supports both Render webhooks (PRO) and polling (free).',
+    '',
+    `Polling interval: ${renderSettings.pollIntervalSec}s`,
+    `Polling max services/tick: ${renderSettings.pollMaxServicesPerTick}`,
+    `Polling timeout: ${renderSettings.pollTimeoutMs}ms`,
+    `Polling enabled: ${renderSettings.pollingEnabledGlobal ? '✅' : '❌'}`,
     '',
     `Webhook ID: ${settings.webhookId || '-'}`,
     `Target URL: ${settings.targetUrl || buildRenderWebhookTargetUrl()}`,
     `Events: ${settings.events.join(', ')}`,
     `Last verified: ${settings.lastVerifiedAt || '-'}`,
+    `Webhook enabled: ${renderSettings.webhookEnabledGlobal ? '✅' : '❌'}`,
   ].filter(Boolean);
   const inline = new InlineKeyboard()
     .text('🔄 Verify webhook', 'deploy:verify')
@@ -16233,6 +16805,148 @@ async function renderDeployEventsMenu(ctx, projectId, notice) {
     inline.text(label, `deploy:event_toggle:${project.id}:${eventName}`).row();
   });
   inline.text('⬅️ Back', `deploy:open:${project.id}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDeployAlertTypesMenu(ctx, projectId, notice) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const settings = normalizeProjectDeploySettings(project);
+  const lines = [
+    `🔔 Alert types — ${project.name || project.id}`,
+    notice || null,
+    '',
+    'Toggle which deploy events notify you.',
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text(
+      `${settings.render.notifyOnStart ? '✅' : '❌'} Deploy started`,
+      `deploy:alert_toggle:${project.id}:start`,
+    )
+    .row()
+    .text(
+      `${settings.render.notifyOnFinish ? '✅' : '❌'} Deploy succeeded`,
+      `deploy:alert_toggle:${project.id}:finish`,
+    )
+    .row()
+    .text(
+      `${settings.render.notifyOnFail ? '✅' : '❌'} Deploy failed`,
+      `deploy:alert_toggle:${project.id}:fail`,
+    )
+    .row()
+    .text('⬅️ Back', `deploy:open:${project.id}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDeployServiceSetupMenu(ctx, projectId, notice) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const deploySettings = normalizeProjectDeploySettings(project);
+  const cache = getRenderServiceCache();
+  const hasDiscovery = Array.isArray(cache?.services) && cache.services.length > 0;
+  const lines = [
+    `⚙️ Setup/Map — ${project.name || project.id}`,
+    notice || null,
+    '',
+    `Current serviceId: ${deploySettings.render.serviceId || 'missing'}`,
+    `Current service name: ${deploySettings.render.serviceName || '-'}`,
+    '',
+    'Choose how to map a Render service:',
+  ].filter(Boolean);
+  const inline = new InlineKeyboard();
+  if (hasDiscovery) {
+    inline.text('🔎 Choose from discovered services', `deploy:map_menu:${project.id}`).row();
+  } else {
+    inline.text('🔎 Discover services', 'deploy:discover').row();
+  }
+  inline.text('✍️ Enter serviceId manually', `deploy:set_service:${project.id}`).row();
+  if (deploySettings.render.serviceId) {
+    inline.text('🧹 Clear mapping', `deploy:clear_service:${project.id}`).row();
+  }
+  inline.text('⬅️ Back', `deploy:open:${project.id}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+function normalizeRenderServiceEntry(service) {
+  const id = service?.id || service?.serviceId || service?.service?.id || null;
+  const name = service?.name || service?.service?.name || null;
+  const type = service?.type || service?.service?.type || service?.serviceType || null;
+  return {
+    id: id ? String(id) : null,
+    name: name ? String(name) : null,
+    type: type ? String(type) : null,
+  };
+}
+
+async function renderRenderServicesList(ctx, notice) {
+  const cache = getRenderServiceCache();
+  const services = cache?.services || [];
+  const lines = [
+    '🔎 Render services',
+    notice || null,
+    '',
+    services.length ? 'Discovered services:' : 'No services discovered yet.',
+  ].filter(Boolean);
+  if (services.length) {
+    services.forEach((service) => {
+      lines.push(
+        `• ${service.name || service.id} (${service.type || 'unknown'}) — ${service.id}`,
+      );
+    });
+  }
+  const inline = new InlineKeyboard().text('⬅️ Back', 'deploy:list');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDeployServiceSelectMenu(ctx, projectId, notice) {
+  const cache = getRenderServiceCache();
+  const services = cache?.services || [];
+  if (!services.length) {
+    await renderDeployServiceSetupMenu(ctx, projectId, '⚠️ Discover services first.');
+    return;
+  }
+  const lines = [
+    '🔎 Select Render service',
+    notice || null,
+    '',
+    'Tap a service to map it:',
+  ].filter(Boolean);
+  const inline = new InlineKeyboard();
+  services.forEach((service) => {
+    const label = `${service.name || service.id} (${service.type || 'unknown'})`;
+    inline.text(label, `deploy:map:${projectId}:${service.id}`).row();
+  });
+  inline.text('⬅️ Back', `deploy:setup:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDeployRecentEvents(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const settings = normalizeProjectDeploySettings(project);
+  const events = settings.render.recentEvents || [];
+  const lines = [
+    `📜 Recent deploy events — ${project.name || project.id}`,
+    '',
+  ];
+  if (!events.length) {
+    lines.push('No deploy events tracked yet.');
+  } else {
+    events.slice(0, 8).forEach((event) => {
+      lines.push(
+        `• ${event.eventType || event.status || '-'} (${event.deployId || '-'}) @ ${event.receivedAt || '-'}`,
+      );
+    });
+  }
+  const inline = new InlineKeyboard().text('⬅️ Back', `deploy:open:${projectId}`);
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
@@ -16275,11 +16989,68 @@ async function handleDeployCallback(ctx, data) {
     await renderDeployProjectPanel(ctx, projectId);
     return;
   }
+  if (action === 'api_key') {
+    if (!isEnvVaultAvailable()) {
+      await renderDeploysProjectList(ctx, buildEnvVaultUnavailableMessage('Env Vault unavailable.'));
+      return;
+    }
+    setUserState(ctx.from.id, {
+      type: 'render_api_key',
+      messageContext: getMessageTargetFromCtx(ctx),
+    });
+    await renderOrEdit(ctx, '🔑 Send the Render API key.\n(Or press Cancel)', {
+      reply_markup: buildCancelKeyboard(),
+    });
+    return;
+  }
+  if (action === 'discover') {
+    const progress = createOperationProgress(ctx, '🔎 Discover Render services', 3);
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps: 0,
+      currentStep: 'Validating API key',
+      nextStep: 'Fetching services',
+    });
+    try {
+      const apiKeyStatus = await getRenderApiKeyStatus();
+      if (!apiKeyStatus.key) {
+        throw new Error('Render API key missing.');
+      }
+      const settings = resolveRenderGlobalSettings(await getCachedSettings());
+      const rawServices = await listRenderServices(settings);
+      const services = rawServices
+        .map((service) => normalizeRenderServiceEntry(service))
+        .filter((service) => service.id);
+      setRenderServiceCache(services);
+      await updateProgressMessage(ctx, progress, {
+        status: 'success',
+        completedSteps: 3,
+        currentStep: 'Services discovered',
+        nextStep: null,
+      });
+      await renderRenderServicesList(ctx, `✅ Discovered ${services.length} service(s).`);
+    } catch (error) {
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 1,
+        currentStep: 'Discovery failed',
+        nextStep: null,
+        reason: error.message,
+      });
+      await renderDeploysProjectList(ctx, `❌ Discovery failed.\n${error.message}`);
+    }
+    return;
+  }
   if (action === 'settings') {
     await renderDeploySettingsMenu(ctx);
     return;
   }
   if (action === 'verify') {
+    const globalRenderSettings = resolveRenderGlobalSettings(await getCachedSettings());
+    if (!globalRenderSettings.webhookEnabledGlobal) {
+      await renderDeploySettingsMenu(ctx, '⚠️ Webhook disabled globally.');
+      return;
+    }
     const progress = createOperationProgress(ctx, '🚀 Verify Render webhook', 3);
     await updateProgressMessage(ctx, progress, {
       status: 'progressing',
@@ -16321,6 +17092,65 @@ async function handleDeployCallback(ctx, data) {
     });
     return;
   }
+  if (action === 'setup' && projectId) {
+    await renderDeployServiceSetupMenu(ctx, projectId);
+    return;
+  }
+  if (action === 'map_menu' && projectId) {
+    await renderDeployServiceSelectMenu(ctx, projectId);
+    return;
+  }
+  if (action === 'map' && projectId && extra) {
+    const serviceId = extra;
+    const cache = getRenderServiceCache();
+    const matched = cache?.services?.find((service) => service.id === serviceId) || null;
+    await updateProjectDeploySettings(projectId, (current) => ({
+      ...current,
+      deployProvider: 'render',
+      render: {
+        ...current.render,
+        serviceId,
+        serviceName: matched?.name || current.render.serviceName || null,
+        enabled: true,
+        pollingEnabled: true,
+        pollingStatus: null,
+      },
+    }));
+    await clearUnmappedRenderService(serviceId);
+    await renderDeployProjectPanel(ctx, projectId, '✅ Render service mapped.');
+    return;
+  }
+  if (action === 'clear_service' && projectId) {
+    await updateProjectDeploySettings(projectId, (current) => ({
+      ...current,
+      render: {
+        ...current.render,
+        serviceId: null,
+        serviceName: null,
+        enabled: false,
+      },
+    }));
+    await renderDeployProjectPanel(ctx, projectId, '🧹 Render service mapping cleared.');
+    return;
+  }
+  if (action === 'alerts' && projectId) {
+    await renderDeployAlertTypesMenu(ctx, projectId);
+    return;
+  }
+  if (action === 'alert_toggle' && projectId && extra) {
+    const toggle = extra;
+    await updateProjectDeploySettings(projectId, (current) => ({
+      ...current,
+      render: {
+        ...current.render,
+        notifyOnStart: toggle === 'start' ? !current.render.notifyOnStart : current.render.notifyOnStart,
+        notifyOnFinish: toggle === 'finish' ? !current.render.notifyOnFinish : current.render.notifyOnFinish,
+        notifyOnFail: toggle === 'fail' ? !current.render.notifyOnFail : current.render.notifyOnFail,
+      },
+    }));
+    await renderDeployAlertTypesMenu(ctx, projectId, '✅ Updated.');
+    return;
+  }
   if (action === 'toggle' && projectId) {
     const projects = await loadProjects();
     const project = findProjectById(projects, projectId);
@@ -16347,9 +17177,10 @@ async function handleDeployCallback(ctx, data) {
       await renderDeployProjectPanel(ctx, projectId, '⚠️ Set Render serviceId first.');
       return;
     }
-    if (settings.notifications.enabled) {
+    if (settings.render.enabled) {
       await updateProjectDeploySettings(projectId, (current) => ({
         ...current,
+        render: { ...current.render, enabled: false },
         notifications: { ...current.notifications, enabled: false },
       }));
       await updateProgressMessage(ctx, progress, {
@@ -16361,22 +17192,20 @@ async function handleDeployCallback(ctx, data) {
       await renderDeployProjectPanel(ctx, projectId, '🔕 Deploy alerts disabled.');
       return;
     }
-    try {
-      await ensureRenderWebhookConfigured({ progress });
-    } catch (error) {
-      await updateProgressMessage(ctx, progress, {
-        status: 'failed',
-        completedSteps: 1,
-        currentStep: 'Webhook setup failed',
-        nextStep: null,
-        reason: error.message,
-      });
-      await renderDeployProjectPanel(ctx, projectId, `❌ Webhook setup failed.\n${error.message}`);
-      return;
+    let webhookNotice = null;
+    const globalRenderSettings = resolveRenderGlobalSettings(await getCachedSettings());
+    const apiKeyStatus = await getRenderApiKeyStatus();
+    if (globalRenderSettings.webhookEnabledGlobal && apiKeyStatus.key) {
+      try {
+        await ensureRenderWebhookConfigured({ progress });
+      } catch (error) {
+        webhookNotice = `⚠️ Webhook setup failed.\n${error.message}`;
+      }
     }
     await updateProjectDeploySettings(projectId, (current) => ({
       ...current,
       deployProvider: 'render',
+      render: { ...current.render, enabled: true },
       notifications: { ...current.notifications, enabled: true },
     }));
     await updateProgressMessage(ctx, progress, {
@@ -16385,7 +17214,7 @@ async function handleDeployCallback(ctx, data) {
       currentStep: 'Alerts enabled',
       nextStep: null,
     });
-    await renderDeployProjectPanel(ctx, projectId, '🔔 Deploy alerts enabled.');
+    await renderDeployProjectPanel(ctx, projectId, webhookNotice || '🔔 Deploy alerts enabled.');
     return;
   }
   if (action === 'events' && projectId) {
@@ -16426,20 +17255,68 @@ async function handleDeployCallback(ctx, data) {
     return;
   }
   if (action === 'test' && projectId) {
-    const projects = await loadProjects();
-    const project = findProjectById(projects, projectId);
-    if (!project) {
-      await renderOrEdit(ctx, 'Project not found.');
+    const project = await getProjectById(projectId, ctx);
+    if (!project) return;
+    const deploySettings = normalizeProjectDeploySettings(project);
+    if (!deploySettings.render.serviceId) {
+      await renderDeployProjectPanel(ctx, projectId, '⚠️ Set Render serviceId first.');
       return;
     }
-    const deploySettings = normalizeProjectDeploySettings(project);
-    const message = [
-      `🧪 Deploy notification test`,
-      `Project: ${project.name || project.id}`,
-      `ServiceId: ${deploySettings.render.serviceId || '-'}`,
-    ].join('\n');
-    await bot.api.sendMessage(ADMIN_TELEGRAM_ID, message, { disable_web_page_preview: true });
-    await renderDeployProjectPanel(ctx, projectId, '✅ Test notification sent.');
+    const progress = createOperationProgress(ctx, `🧪 Test deploy tracking — ${project.name || project.id}`, 2);
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps: 0,
+      currentStep: 'Fetching latest deploy',
+      nextStep: 'Reporting result',
+    });
+    try {
+      const renderSettings = resolveRenderGlobalSettings(await getCachedSettings());
+      const deploys = await listRenderServiceDeploys(deploySettings.render.serviceId, renderSettings);
+      const latest = deploys[0] || null;
+      if (!latest) {
+        await updateProgressMessage(ctx, progress, {
+          status: 'failed',
+          completedSteps: 1,
+          currentStep: 'No deploys found',
+          nextStep: null,
+          reason: 'No deploys returned by Render API',
+        });
+        await renderDeployProjectPanel(ctx, projectId, '⚠️ No deploys found for this service.');
+        return;
+      }
+      const deployId = latest.id || latest.deployId || null;
+      const status = latest.status || latest.state || latest.result || null;
+      const timestamp = latest.updatedAt || latest.finishedAt || latest.createdAt || new Date().toISOString();
+      const message = [
+        '🧪 Deploy tracking snapshot',
+        `Project: ${project.name || project.id}`,
+        `Service: ${deploySettings.render.serviceName || deploySettings.render.serviceId || '-'}`,
+        `DeployId: ${shortenRenderId(deployId)}`,
+        `Status: ${status || '-'}`,
+        `Updated: ${timestamp}`,
+      ].join('\n');
+      await bot.api.sendMessage(ADMIN_TELEGRAM_ID, message, { disable_web_page_preview: true });
+      await updateProgressMessage(ctx, progress, {
+        status: 'success',
+        completedSteps: 2,
+        currentStep: 'Snapshot sent',
+        nextStep: null,
+      });
+      await renderDeployProjectPanel(ctx, projectId, '✅ Snapshot sent.');
+    } catch (error) {
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 1,
+        currentStep: 'Test failed',
+        nextStep: null,
+        reason: error.message,
+      });
+      await renderDeployProjectPanel(ctx, projectId, `❌ Test failed.\n${error.message}`);
+    }
+    return;
+  }
+  if (action === 'recent' && projectId) {
+    await renderDeployRecentEvents(ctx, projectId);
     return;
   }
   await renderDeploysProjectList(ctx);
@@ -17916,6 +18793,10 @@ function formatProjectLogMessage(project, event) {
   return lines.join('\n');
 }
 
+async function recordAuditLog(label, context) {
+  await forwardSelfLog('info', `audit:${label}`, { context });
+}
+
 function parseRenderErrorPayload(body) {
   if (!body) {
     return { message: '', level: '' };
@@ -17990,6 +18871,63 @@ function extractRenderWebhookInfo(payload) {
   };
 }
 
+async function handleRenderDeployEvent({ project, info, source }) {
+  const deploySettings = normalizeProjectDeploySettings(project);
+  const eventType = normalizeRenderEventType(info.eventType, info.status);
+  if (!eventType) {
+    return;
+  }
+  const receivedAt = new Date().toISOString();
+  const statusLabel = info.status || eventType;
+  const isDuplicate =
+    info.deployId &&
+    statusLabel &&
+    info.deployId === deploySettings.render.lastDeployId &&
+    statusLabel === deploySettings.render.lastDeployStatus;
+  await recordAuditLog('render_deploy_event', {
+    projectId: project.id,
+    serviceId: info.serviceId,
+    eventType,
+    status: statusLabel,
+    source,
+    deployId: info.deployId,
+  });
+  if (isDuplicate) {
+    return;
+  }
+  await recordRenderDeployState(project.id, {
+    deployId: info.deployId,
+    status: statusLabel,
+    eventType,
+    receivedAt,
+    source,
+  });
+  const settings = resolveRenderGlobalSettings(await getCachedSettings());
+  if (!deploySettings.render.enabled) {
+    return;
+  }
+  if (source === 'webhook' && (!settings.webhookEnabledGlobal || !deploySettings.render.webhookEnabled)) {
+    return;
+  }
+  if (source === 'polling' && (!settings.pollingEnabledGlobal || !deploySettings.render.pollingEnabled)) {
+    return;
+  }
+  if (eventType === 'deploy_started' && !deploySettings.render.notifyOnStart) return;
+  if (eventType === 'deploy_succeeded' && !deploySettings.render.notifyOnFinish) return;
+  if (eventType === 'deploy_failed' && !deploySettings.render.notifyOnFail) return;
+  const message = buildRenderDeployMessage({
+    project,
+    serviceName: deploySettings.render.serviceName,
+    eventType,
+    deployId: info.deployId,
+    status: statusLabel,
+    durationMs: info.durationMs,
+    url: info.dashboardUrl,
+    timestamp: receivedAt,
+  });
+  await bot.api.sendMessage(ADMIN_TELEGRAM_ID, message, { disable_web_page_preview: true });
+}
+
 function formatDeployOutcome(status) {
   if (!status) return 'unknown';
   const normalized = status.toLowerCase();
@@ -17997,6 +18935,75 @@ function formatDeployOutcome(status) {
   if (['failed', 'error', 'errored'].includes(normalized)) return 'failed';
   if (['canceled', 'cancelled', 'aborted'].includes(normalized)) return 'canceled';
   return normalized;
+}
+
+function classifyRenderDeployStatus(status) {
+  if (!status) return { phase: null, outcome: null };
+  const normalized = String(status).toLowerCase();
+  if (
+    ['started', 'starting', 'building', 'deploying', 'in_progress', 'in-progress', 'pending', 'queued'].includes(
+      normalized,
+    )
+  ) {
+    return { phase: 'started', outcome: 'started' };
+  }
+  const outcome = formatDeployOutcome(normalized);
+  if (outcome === 'succeeded') {
+    return { phase: 'finished', outcome: 'succeeded' };
+  }
+  if (['failed', 'canceled'].includes(outcome)) {
+    return { phase: 'finished', outcome: 'failed' };
+  }
+  return { phase: null, outcome: outcome || null };
+}
+
+function normalizeRenderEventType(eventType, status) {
+  const raw = String(eventType || '').toLowerCase();
+  if (raw.includes('deploy_started') || raw.includes('build_started')) {
+    return 'deploy_started';
+  }
+  if (raw.includes('deploy_ended') || raw.includes('deploy_finished') || raw.includes('build_ended')) {
+    const outcome = classifyRenderDeployStatus(status).outcome;
+    return outcome === 'succeeded' ? 'deploy_succeeded' : 'deploy_failed';
+  }
+  const outcome = classifyRenderDeployStatus(status).outcome;
+  if (outcome === 'succeeded') return 'deploy_succeeded';
+  if (outcome === 'failed') return 'deploy_failed';
+  if (raw.includes('deploy')) return 'deploy_started';
+  return null;
+}
+
+function shortenRenderId(value) {
+  if (!value) return '-';
+  const text = String(value);
+  return text.length > 8 ? `${text.slice(0, 8)}…` : text;
+}
+
+function buildRenderDeployMessage({ project, serviceName, eventType, deployId, status, durationMs, url, timestamp }) {
+  const timeLabel = timestamp ? new Date(timestamp).toISOString() : new Date().toISOString();
+  const eventLabel =
+    eventType === 'deploy_started'
+      ? 'Deploy started'
+      : eventType === 'deploy_succeeded'
+        ? 'Deploy succeeded'
+        : 'Deploy failed';
+  const emoji = eventType === 'deploy_succeeded' ? '✅' : eventType === 'deploy_failed' ? '❌' : '🚀';
+  const lines = [
+    `${emoji} ${project.name || project.id} — ${eventLabel}`,
+    `Service: ${serviceName || project.render?.serviceName || project.render?.serviceId || '-'}`,
+    `DeployId: ${shortenRenderId(deployId)}`,
+    `Time: ${timeLabel}`,
+  ];
+  if (durationMs) {
+    lines.push(`Duration: ${Math.round(durationMs / 1000)}s`);
+  }
+  if (status) {
+    lines.push(`Status: ${status}`);
+  }
+  if (url) {
+    lines.push(`Link: ${url}`);
+  }
+  return lines.join('\n');
 }
 
 function downloadTelegramFile(ctx, fileId) {
@@ -18522,6 +19529,242 @@ async function handleMiniSiteRequest(req, res, url) {
       return true;
     }
 
+    if (req.method === 'GET' && pathParts.length === 3 && pathParts[2] === 'sql') {
+      const enableWrite = url.searchParams.get('enable_write') === '1';
+      if (enableWrite) {
+        if (!(await isMiniSiteEditAuthed(req, adminTokenHash))) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(renderMiniSiteEditLogin(url.pathname + url.search));
+          return true;
+        }
+        const body = `
+          <div class="card">
+            <h3>Enable write mode</h3>
+            <p class="muted">Write mode is time-limited. Type ENABLE to confirm (60 seconds).</p>
+            <form method="POST" action="/db-mini/${encodeURIComponent(project.id)}/sql/enable-write">
+              <div class="form-row">
+                <input name="confirm" placeholder="Type ENABLE to proceed" required />
+              </div>
+              <button class="button" type="submit">Enable write mode</button>
+            </form>
+            <p><a href="/db-mini/${encodeURIComponent(project.id)}/sql">⬅ Back</a></p>
+          </div>
+        `;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteLayout('Enable write mode', body));
+        return true;
+      }
+      const writeEnabled = isMiniSiteWriteGrantActive(req, adminTokenHash);
+      const writeBadge = writeEnabled
+        ? `<span class="tag success">Write mode enabled</span>`
+        : `<span class="tag">Read-only</span>`;
+      const body = `
+        <div class="card">
+          <h3>SQL runner — ${escapeHtml(project.name || project.id)}</h3>
+          <p class="muted">Read-only by default. Only SELECT / SHOW / EXPLAIN are allowed.</p>
+          <div class="row-actions">
+            ${writeBadge}
+            <a class="button" href="/db-mini/${encodeURIComponent(project.id)}/sql?enable_write=1">Enable write mode</a>
+          </div>
+        </div>
+        <div class="card">
+          <form method="POST" action="/db-mini/${encodeURIComponent(project.id)}/sql/run">
+            <div class="form-row">
+              <label>Query</label>
+              <textarea name="query" rows="8" placeholder="SELECT * FROM table"></textarea>
+            </div>
+            <div class="form-row">
+              <label>Limit rows</label>
+              <input type="number" name="limit" value="${MINI_SITE_SQL_DEFAULT_LIMIT}" min="1" max="${MINI_SITE_SQL_MAX_LIMIT}" />
+            </div>
+            <input type="hidden" name="page" value="0" />
+            <button class="button" type="submit">Run query</button>
+          </form>
+          <p><a href="/db-mini/${encodeURIComponent(project.id)}">⬅ Back</a></p>
+        </div>
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout('SQL runner', body));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathParts.length === 4 && pathParts[2] === 'sql' && pathParts[3] === 'enable-write') {
+      if (!(await isMiniSiteEditAuthed(req, adminTokenHash))) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteEditLogin(url.pathname.replace(/\/enable-write$/, '')));
+        return true;
+      }
+      const body = await readRequestBody(req);
+      const form = parseFormBody(body);
+      if (form.confirm !== 'ENABLE') {
+        const errorBody = `
+          <div class="card">
+            <h3 class="warning">Write mode not enabled</h3>
+            <p class="muted">Confirmation missing. Type ENABLE to proceed.</p>
+            <p><a href="/db-mini/${encodeURIComponent(project.id)}/sql?enable_write=1">⬅ Back</a></p>
+          </div>
+        `;
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteLayout('Write mode blocked', errorBody));
+        return true;
+      }
+      const expiresAt = enableMiniSiteWriteGrant(req, adminTokenHash);
+      const bodyHtml = `
+        <div class="card">
+          <h3 class="success">Write mode enabled</h3>
+          <p class="muted">Expires at ${new Date(expiresAt).toISOString()}</p>
+          <p><a href="/db-mini/${encodeURIComponent(project.id)}/sql">Continue to SQL runner</a></p>
+        </div>
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout('Write mode enabled', bodyHtml));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathParts.length === 4 && pathParts[2] === 'sql' && pathParts[3] === 'run') {
+      const body = await readRequestBody(req);
+      const form = parseFormBody(body);
+      const normalized = normalizeSqlInput(form.query);
+      const limit = normalizeSqlLimit(form.limit);
+      const page = Math.max(0, Number(form.page || 0));
+      const offset = page * limit;
+      const writeAttempt = normalized.ok ? isSqlWriteAttempt(normalized.sql) : false;
+      const writeEnabled = isMiniSiteWriteGrantActive(req, adminTokenHash);
+      const requestStartedAt = Date.now();
+      if (writeAttempt) {
+        await recordAuditLog('mini_site_sql_write_attempt', {
+          adminId: 'mini-site',
+          projectId: project.id,
+          requestId,
+          queryHash: hashSqlQuery(form.query),
+          writeEnabled,
+        });
+      }
+      if (!normalized.ok) {
+        const bodyHtml = `
+          <div class="card">
+            <h3 class="warning">Invalid query</h3>
+            <p class="muted">${escapeHtml(normalized.error)}</p>
+            <p class="muted">Request ID: ${escapeHtml(requestId)}</p>
+            <p><a href="/db-mini/${encodeURIComponent(project.id)}/sql">⬅ Back</a></p>
+          </div>
+        `;
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteLayout('SQL runner', bodyHtml));
+        return true;
+      }
+      if (writeAttempt && !writeEnabled) {
+        const bodyHtml = `
+          <div class="card">
+            <h3 class="warning">Write blocked</h3>
+            <p class="muted">Query contains write operations. Enable write mode to proceed.</p>
+            <p class="muted">Request ID: ${escapeHtml(requestId)}</p>
+            <p><a href="/db-mini/${encodeURIComponent(project.id)}/sql?enable_write=1">Enable write mode</a></p>
+          </div>
+        `;
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteLayout('SQL runner', bodyHtml));
+        return true;
+      }
+      let rows = [];
+      let columns = [];
+      let hasNext = false;
+      let errorMessage = null;
+      try {
+        let queryText = normalized.sql;
+        const firstWord = queryText.trim().split(/\s+/)[0].toLowerCase();
+        if (firstWord === 'select') {
+          queryText = `SELECT * FROM (${queryText}) AS pm_query LIMIT $1 OFFSET $2`;
+          const result = await runMiniSiteQuery(pool, queryText, [limit + 1, offset]);
+          rows = result.rows || [];
+          hasNext = rows.length > limit;
+          rows = rows.slice(0, limit);
+        } else {
+          const result = await runMiniSiteQuery(pool, queryText, []);
+          rows = result.rows || [];
+        }
+        if (rows.length) {
+          columns = Object.keys(rows[0]);
+        }
+      } catch (error) {
+        const errorCode = error?.code || '';
+        const lowerMessage = String(error?.message || '').toLowerCase();
+        if (errorCode === '57014' || lowerMessage.includes('timeout')) {
+          errorMessage = 'Timed out. Reduce query size or increase timeout.';
+        } else {
+          errorMessage = error?.message || 'Query failed.';
+        }
+        console.error('[mini-site] sql runner error', {
+          requestId,
+          projectId: project.id,
+          error: error?.message,
+        });
+      }
+      const durationMs = Date.now() - requestStartedAt;
+      await recordAuditLog('mini_site_sql_execution', {
+        adminId: 'mini-site',
+        projectId: project.id,
+        requestId,
+        queryHash: hashSqlQuery(normalized.sql),
+        durationMs,
+        mode: writeAttempt ? 'write' : 'read',
+        writeEnabled,
+      });
+      if (errorMessage) {
+        const bodyHtml = `
+          <div class="card">
+            <h3 class="warning">Query failed</h3>
+            <p class="muted">${escapeHtml(errorMessage)}</p>
+            <p class="muted">Request ID: ${escapeHtml(requestId)}</p>
+            <p><a href="/db-mini/${encodeURIComponent(project.id)}/sql">⬅ Back</a></p>
+          </div>
+        `;
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniSiteLayout('SQL runner', bodyHtml));
+        return true;
+      }
+      const headerCells = columns.map((col) => `<th>${escapeHtml(col)}</th>`).join('');
+      const bodyRows = rows
+        .map((row) => {
+          const cells = columns.map((col) => `<td>${escapeHtml(row[col])}</td>`).join('');
+          return `<tr>${cells}</tr>`;
+        })
+        .join('');
+      const pager = `
+        <div class="row-actions">
+          ${page > 0 ? `
+            <form method="POST" action="/db-mini/${encodeURIComponent(project.id)}/sql/run">
+              <input type="hidden" name="query" value="${escapeHtmlAttribute(normalized.sql)}" />
+              <input type="hidden" name="limit" value="${limit}" />
+              <input type="hidden" name="page" value="${page - 1}" />
+              <button class="button" type="submit">⬅ Prev</button>
+            </form>` : ''}
+          ${hasNext ? `
+            <form method="POST" action="/db-mini/${encodeURIComponent(project.id)}/sql/run">
+              <input type="hidden" name="query" value="${escapeHtmlAttribute(normalized.sql)}" />
+              <input type="hidden" name="limit" value="${limit}" />
+              <input type="hidden" name="page" value="${page + 1}" />
+              <button class="button" type="submit">Next ➡</button>
+            </form>` : ''}
+        </div>
+      `;
+      const resultBody = `
+        <div class="card">
+          <h3>Results</h3>
+          <p class="muted">Rows: ${rows.length} · Time: ${durationMs} ms</p>
+          <table>
+            <thead><tr>${headerCells || '<th>(no columns)</th>'}</tr></thead>
+            <tbody>${bodyRows || '<tr><td class="muted">(no rows)</td></tr>'}</tbody>
+          </table>
+          ${pager}
+          <p><a href="/db-mini/${encodeURIComponent(project.id)}/sql">⬅ Back</a></p>
+        </div>
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout('SQL runner', resultBody));
+      return true;
+    }
+
     if (req.method === 'GET' && pathParts.length === 2) {
       const tables = await listMiniSiteTables(pool);
       const body = `
@@ -18531,6 +19774,7 @@ async function handleMiniSiteRequest(req, res, url) {
           <p>Tables: <span class="pill">${tables.length}</span></p>
           <div class="row-actions">
             <a class="button" href="/db-mini/${encodeURIComponent(project.id)}/tables">View tables</a>
+            <a class="button" href="/db-mini/${encodeURIComponent(project.id)}/sql">SQL runner</a>
           </div>
         </div>
       `;
@@ -18950,6 +20194,10 @@ function startHttpServer() {
             serviceId: info.serviceId,
             eventType: info.eventType,
           });
+          await recordUnmappedRenderEvent({
+            serviceId: info.serviceId,
+            eventType: info.eventType,
+          });
           const now = Date.now();
           const lastNotice = renderWebhookUnknownServiceNotices.get(info.serviceId);
           if (!lastNotice || now - lastNotice > 60 * 60 * 1000) {
@@ -18965,66 +20213,13 @@ function startHttpServer() {
         }
 
         const deploySettings = normalizeProjectDeploySettings(project);
-        if (!deploySettings.notifications.enabled) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, skipped: 'notifications_disabled' }));
-          return;
-        }
         const webhookSettings = normalizeRenderWebhookSettings(await getCachedSettings());
         if (!isRenderEventEnabled(deploySettings, webhookSettings, info.eventType)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, skipped: 'event_filtered' }));
           return;
         }
-
-        const projectLabel = project.name || project.id;
-        const lines = [];
-        if (info.eventType === 'deploy_started') {
-          lines.push(`🚀 Deploy started — ${projectLabel}`);
-        } else if (info.eventType === 'deploy_ended') {
-          const outcome = formatDeployOutcome(info.status);
-          const emoji = outcome === 'succeeded' ? '✅' : outcome === 'failed' ? '❌' : '⏹️';
-          lines.push(`${emoji} Deploy ${outcome} — ${projectLabel}`);
-        } else if (info.eventType === 'build_started') {
-          lines.push(`🏗️ Build started — ${projectLabel}`);
-        } else if (info.eventType === 'build_ended') {
-          const outcome = formatDeployOutcome(info.status);
-          const emoji = outcome === 'succeeded' ? '✅' : outcome === 'failed' ? '❌' : '⏹️';
-          lines.push(`${emoji} Build ${outcome} — ${projectLabel}`);
-        } else {
-          lines.push(`ℹ️ Render event ${info.eventType} — ${projectLabel}`);
-        }
-        lines.push(`ServiceId: ${info.serviceId}`);
-        if (info.deployId) lines.push(`DeployId: ${info.deployId}`);
-        if (info.branch) lines.push(`Branch: ${info.branch}`);
-        if (info.commit) lines.push(`Commit: ${info.commit}`);
-        if (info.durationMs) lines.push(`Duration: ${Math.round(info.durationMs / 1000)}s`);
-        if (info.dashboardUrl) lines.push(`Dashboard: ${info.dashboardUrl}`);
-
-        await bot.api.sendMessage(ADMIN_TELEGRAM_ID, lines.join('\n'), {
-          disable_web_page_preview: true,
-        });
-
-        await updateProjectDeploySettings(project.id, (current) => ({
-          ...current,
-          deployProvider: 'render',
-          notifications: {
-            ...current.notifications,
-            lastStatus: info.status || info.eventType,
-            lastEvent: {
-              eventType: info.eventType,
-              status: info.status,
-              outcome: formatDeployOutcome(info.status),
-              receivedAt: new Date().toISOString(),
-              deployId: info.deployId,
-              serviceId: info.serviceId,
-              branch: info.branch,
-              commit: info.commit,
-              dashboardUrl: info.dashboardUrl,
-              durationMs: info.durationMs,
-            },
-          },
-        }));
+        await handleRenderDeployEvent({ project, info, source: 'webhook' });
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
@@ -19313,6 +20508,7 @@ async function startBot() {
   await testConfigDbConnection();
   console.error('[boot] db init ok');
   await initializeConfig();
+  await getCachedSettings(true);
   if (!LOG_API_ENABLED) {
     try {
       await bot.api.sendMessage(
@@ -19331,6 +20527,7 @@ async function startBot() {
   }
   await startBotPolling();
   scheduleLogTestDailyReminder();
+  scheduleRenderPolling();
   console.error('[boot] bot started');
 }
 

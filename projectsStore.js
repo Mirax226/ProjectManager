@@ -98,9 +98,28 @@ function normalizeProject(rawProject) {
 
   const render = project.render || {};
   const resolvedServiceId = render.serviceId || project.renderServiceId || null;
+  const resolvedServiceName = render.serviceName || project.renderServiceName || null;
+  const renderEnabled =
+    typeof render.enabled === 'boolean' ? render.enabled : Boolean(resolvedServiceId);
+  const pollingEnabled =
+    typeof render.pollingEnabled === 'boolean' ? render.pollingEnabled : renderEnabled;
+  const webhookEnabled =
+    typeof render.webhookEnabled === 'boolean' ? render.webhookEnabled : true;
   project.render = {
     ...render,
+    enabled: renderEnabled,
     serviceId: resolvedServiceId,
+    serviceName: resolvedServiceName,
+    pollingEnabled,
+    webhookEnabled,
+    pollingStatus: render.pollingStatus || null,
+    lastDeployId: render.lastDeployId || null,
+    lastDeployStatus: render.lastDeployStatus || null,
+    lastSeenAt: render.lastSeenAt || null,
+    notifyOnStart: typeof render.notifyOnStart === 'boolean' ? render.notifyOnStart : true,
+    notifyOnFinish: typeof render.notifyOnFinish === 'boolean' ? render.notifyOnFinish : true,
+    notifyOnFail: typeof render.notifyOnFail === 'boolean' ? render.notifyOnFail : true,
+    recentEvents: Array.isArray(render.recentEvents) ? render.recentEvents : [],
   };
   if (!project.deployProvider && resolvedServiceId) {
     project.deployProvider = 'render';
