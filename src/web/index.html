@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Project Manager — Dashboard</title>
+    <link rel="stylesheet" href="/web/assets/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell" id="appShell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-icon">📊</span>
+          <div>
+            <div class="brand-title">Project Manager</div>
+            <div class="brand-sub">Web Dashboard</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="nav-link active" data-view="overview">🏠 Overview</button>
+          <button class="nav-link" data-view="projects">📦 Projects</button>
+          <button class="nav-link" data-view="logs">📣 Logs</button>
+          <button class="nav-link" data-view="cronjobs">⏱️ Cronjobs</button>
+          <button class="nav-link" data-view="envvault">🔐 Env Vault</button>
+          <button class="nav-link" data-view="database">🗄️ Database</button>
+          <button class="nav-link" data-view="patches">🧩 Patches</button>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="status-pill" id="sidebarStatus">Loading…</span>
+          <button class="ghost-button" id="logoutButton">Log out</button>
+        </div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <div>
+            <h1 id="viewTitle">Overview</h1>
+            <p id="viewSubtitle">System health and environment status.</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="secondary" id="refreshButton">Refresh</button>
+          </div>
+        </header>
+
+        <section class="view active" id="view-overview">
+          <div class="grid">
+            <div class="card">
+              <h3>System Health</h3>
+              <div id="healthSummary" class="stat-list"></div>
+            </div>
+            <div class="card">
+              <h3>Environment</h3>
+              <div id="envSummary" class="stat-list"></div>
+            </div>
+            <div class="card">
+              <h3>Last Errors</h3>
+              <div id="errorList" class="list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-projects">
+          <div class="grid" id="projectsGrid"></div>
+          <div class="card" id="projectDetail" hidden>
+            <h3>Project Detail</h3>
+            <div id="projectDetailBody" class="stat-list"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-logs">
+          <div class="card">
+            <div class="filters">
+              <select id="logsProject"></select>
+              <select id="logsLevel">
+                <option value="">All levels</option>
+                <option value="error">Error</option>
+                <option value="warn">Warn</option>
+                <option value="info">Info</option>
+                <option value="debug">Debug</option>
+              </select>
+              <button class="secondary" id="logsRefresh">Refresh</button>
+            </div>
+            <div id="logsList" class="list"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-cronjobs">
+          <div class="card">
+            <h3>Cronjobs</h3>
+            <div id="cronList" class="list"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-envvault">
+          <div class="card">
+            <div class="filters">
+              <select id="envProject"></select>
+              <button class="secondary" id="envRefresh">Refresh</button>
+            </div>
+            <div id="envKeys" class="pill-list"></div>
+          </div>
+          <div class="card">
+            <h3>Add / Update Key</h3>
+            <form id="envForm" class="form">
+              <input type="text" id="envKey" placeholder="KEY" required />
+              <input type="password" id="envValue" placeholder="Value" required />
+              <button type="submit">Save</button>
+            </form>
+            <p class="muted">Values are never shown after save.</p>
+          </div>
+        </section>
+
+        <section class="view" id="view-database">
+          <div class="card">
+            <h3>Database Browser</h3>
+            <p>Open the existing DB mini-site (read-only by default).</p>
+            <a class="primary-link" href="/db-mini" target="_blank" rel="noreferrer">Open DB mini-site →</a>
+          </div>
+        </section>
+
+        <section class="view" id="view-patches">
+          <div class="card">
+            <h3>Apply PM Change Spec v1</h3>
+            <div class="filters">
+              <select id="patchProject"></select>
+              <button class="secondary" id="patchPreview">Preview</button>
+              <button class="primary" id="patchApply">Apply</button>
+            </div>
+            <textarea id="patchSpec" rows="10" placeholder="Paste PM Change Spec v1 blocks here..."></textarea>
+            <div id="patchPreviewOutput" class="preview"></div>
+            <div id="patchResult" class="result"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="login-overlay" id="loginOverlay">
+      <div class="login-card">
+        <h2>🔐 Dashboard Login</h2>
+        <p class="muted">Enter the dashboard token provided by the bot or setup screen.</p>
+        <form id="loginForm" class="form">
+          <input type="password" id="loginToken" placeholder="Token" required />
+          <button type="submit">Sign in</button>
+        </form>
+        <div id="loginMessage" class="muted"></div>
+      </div>
+    </div>
+
+    <script src="/web/assets/app.js"></script>
+  </body>
+</html>

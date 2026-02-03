@@ -59,7 +59,7 @@ const {
   updateTelegramTestStatus,
   renameTelegramBotProjectId,
 } = require('./telegramBotStore');
-const { encryptSecret, getMasterKeyStatus, MASTER_KEY_ERROR_MESSAGE } = require('./envVaultCrypto');
+const { encryptSecret, decryptSecret, getMasterKeyStatus, MASTER_KEY_ERROR_MESSAGE } = require('./envVaultCrypto');
 const {
   setWebhook,
   getWebhookInfo,
@@ -151,6 +151,13 @@ const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
 const PROJECT_DB_SSL_DEFAULT_MODE = 'require';
 const PROJECT_DB_SSL_DEFAULT_VERIFY = true;
 const PROJECT_DB_SSL_MODES = new Set(['disable', 'require', 'verify-full']);
+const WEB_DASHBOARD_SETTINGS_KEY = 'webDashboard';
+const WEB_DASHBOARD_SESSION_COOKIE = 'pm_web_session';
+const WEB_DASHBOARD_SESSION_TTL_MINUTES = 20;
+const WEB_DASHBOARD_LOGIN_WINDOW_MS = 60_000;
+const WEB_DASHBOARD_LOGIN_MAX_ATTEMPTS = 5;
+const WEB_DASHBOARD_LOGIN_BLOCK_MS = 5 * 60_000;
+const WEB_DASHBOARD_ASSETS_DIR = path.join(__dirname, 'src', 'web');
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
 const LOG_API_ADMIN_CHAT_ID =
   process.env.TELEGRAM_ADMIN_CHAT_ID ||
@@ -188,6 +195,9 @@ const structuredPatchSessions = new Map();
 const envScanCache = new Map();
 const cronCreateRetryCache = new Map();
 const cronErrorDetailsCache = new Map();
+const lastMenuMessageByChat = new Map();
+const webSessions = new Map();
+const webLoginAttempts = new Map();
 let httpServerPromise = null;
 
 configureSelfLogger({
@@ -354,6 +364,21 @@ function getChatIdFromCtx(ctx) {
   );
 }
 
+async function safeDeleteMessage(ctx, chatId, messageId, reason) {
+  if (!chatId || !messageId) return;
+  const api = ctx?.api || bot.api;
+  try {
+    await api.deleteMessage(chatId, messageId);
+  } catch (error) {
+    console.warn('[cleanup] Failed to delete message', {
+      chatId,
+      messageId,
+      reason,
+      error: error?.message,
+    });
+  }
+}
+
 async function replySafely(ctx, text, extra) {
   if (ctx?.reply) {
     try {
@@ -403,7 +428,28 @@ async function respond(ctx, text, extra) {
       console.error('[UI] editMessageText failed, fallback to reply', err);
     }
   }
-  return replySafely(ctx, text, safeExtra);
+  const chatId = getChatIdFromCtx(ctx);
+  if (safeExtra?.reply_markup && chatId && lastMenuMessageByChat.has(chatId)) {
+    const messageId = lastMenuMessageByChat.get(chatId);
+    try {
+      await bot.api.editMessageText(chatId, messageId, text, safeExtra);
+      return { chat: { id: chatId }, message_id: messageId };
+    } catch (err) {
+      if (isMessageNotModifiedError(err)) {
+        return;
+      }
+      if (isButtonDataInvalidError(err)) {
+        await handleTelegramUiError(ctx, err);
+        return;
+      }
+      console.warn('[UI] editMessageText failed for sticky menu, fallback to reply', err?.message);
+    }
+  }
+  const response = await replySafely(ctx, text, safeExtra);
+  if (response?.chat?.id && response?.message_id && safeExtra?.reply_markup) {
+    lastMenuMessageByChat.set(response.chat.id, response.message_id);
+  }
+  return response;
 }
 
 async function safeRespond(ctx, text, extra, context) {
@@ -1147,6 +1193,7 @@ bot.on('message:text', async (ctx, next) => {
     `Change chunk received (${chunkLength} chars).\nSend more, or press ‘✅ Patch completed’.`,
     { reply_markup: buildPatchSessionKeyboard() },
   );
+  await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'patch_text');
 });
 
 bot.on('message:document', async (ctx, next) => {
@@ -1179,6 +1226,7 @@ bot.on('message:document', async (ctx, next) => {
     `Change file received (${chunkLength} chars).\nPress ‘✅ Patch completed’ when ready.`,
     { reply_markup: buildPatchSessionKeyboard() },
   );
+  await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'patch_document');
 });
 
 bot.on('message:text', async (ctx, next) => {
@@ -1187,12 +1235,14 @@ bot.on('message:text', async (ctx, next) => {
     return next();
   }
   await handleProjectWizardInput(ctx, state);
+  await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'project_wizard');
 });
 
 bot.on('message', async (ctx, next) => {
   const state = getUserState(ctx.from?.id);
   if (state) {
     await handleStatefulMessage(ctx, state);
+    await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'state_input');
     return;
   }
   return next();
@@ -4438,6 +4488,50 @@ function renderMiniSiteLayout(title, body) {
         <main class="fade-in">
           ${body}
         </main>
+      </body>
+    </html>
+  `;
+}
+
+function renderWebLoginPage({ token, mask, message }) {
+  const displayToken = token ? escapeHtml(token) : null;
+  const tokenMask = escapeHtml(mask || '••••');
+  const note = message ? `<p class="muted">${escapeHtml(message)}</p>` : '';
+  const tokenBlock = displayToken
+    ? `<div class="token-box"><strong>New token (shown once):</strong><div class="token">${displayToken}</div></div>`
+    : `<p class="muted">Token on file: ${tokenMask}</p>`;
+  return `
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Project Manager — Web Login</title>
+        <style>
+          body { font-family: Inter, system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 40px; }
+          .card { max-width: 540px; margin: 0 auto; background: #111827; border-radius: 16px; padding: 24px; box-shadow: 0 20px 40px rgba(15, 23, 42, 0.35); }
+          h1 { font-size: 22px; margin-bottom: 8px; }
+          .muted { color: #94a3b8; font-size: 14px; }
+          .token-box { background: #0b1220; border: 1px solid #1f2937; padding: 12px; border-radius: 12px; margin: 16px 0; }
+          .token { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; word-break: break-all; margin-top: 6px; }
+          label { display: block; margin-top: 16px; font-size: 14px; }
+          input { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #1f2937; background: #0b1220; color: #e2e8f0; }
+          button { margin-top: 16px; width: 100%; padding: 12px; border-radius: 10px; border: none; background: #38bdf8; color: #0f172a; font-weight: 600; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>🔐 Project Manager Dashboard</h1>
+          <p class="muted">Enter the dashboard token to continue.</p>
+          ${note}
+          ${tokenBlock}
+          <form method="POST" action="/web/login">
+            <label>Token</label>
+            <input name="token" type="password" required />
+            <button type="submit">Login</button>
+          </form>
+          <p class="muted">After login, return to <a href="/web" style="color:#38bdf8;">/web</a>.</p>
+        </div>
       </body>
     </html>
   `;
@@ -10972,6 +11066,393 @@ function resolveMiniSiteSessionTtlMs(settings) {
   return resolveMiniSiteSessionTtlMinutes(settings) * 60 * 1000;
 }
 
+function hashWebDashboardToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+function maskWebDashboardToken(token) {
+  if (!token) return '••••';
+  const suffix = token.slice(-4);
+  return `••••${suffix}`;
+}
+
+async function getWebDashboardSettingsState() {
+  const settings = (await loadGlobalSettings()) || {};
+  const web = settings[WEB_DASHBOARD_SETTINGS_KEY] || {};
+  return { settings, web };
+}
+
+async function saveWebDashboardSettingsState(settings, web) {
+  const payload = { ...(settings || {}) };
+  payload[WEB_DASHBOARD_SETTINGS_KEY] = web;
+  await saveGlobalSettings(payload);
+  return payload;
+}
+
+async function ensureWebDashboardToken({ rotate = false } = {}) {
+  const { settings, web } = await getWebDashboardSettingsState();
+  if (!rotate && web.adminTokenHash) {
+    return { settings, web, token: null, created: false };
+  }
+  const token = crypto.randomBytes(32).toString('base64url');
+  const encrypted = encryptSecret(token);
+  const nextWeb = {
+    ...web,
+    adminTokenHash: hashWebDashboardToken(token),
+    adminTokenMask: maskWebDashboardToken(token),
+    adminTokenEnc: encrypted,
+    adminTokenCreatedAt: new Date().toISOString(),
+    adminTokenShownAt: null,
+    adminTokenVersion: (web.adminTokenVersion || 0) + 1,
+  };
+  const nextSettings = await saveWebDashboardSettingsState(settings, nextWeb);
+  return { settings: nextSettings, web: nextWeb, token, created: true };
+}
+
+async function markWebDashboardTokenShown(settings) {
+  const web = settings?.[WEB_DASHBOARD_SETTINGS_KEY] || {};
+  const updated = {
+    ...web,
+    adminTokenShownAt: new Date().toISOString(),
+  };
+  return saveWebDashboardSettingsState(settings, updated);
+}
+
+function getWebDashboardTokenMask(settings) {
+  return settings?.[WEB_DASHBOARD_SETTINGS_KEY]?.adminTokenMask || '••••';
+}
+
+function isWebDashboardTokenConfigured(settings) {
+  return Boolean(settings?.[WEB_DASHBOARD_SETTINGS_KEY]?.adminTokenHash);
+}
+
+function isWebDashboardTokenValid(token, settings) {
+  const storedHash = settings?.[WEB_DASHBOARD_SETTINGS_KEY]?.adminTokenHash;
+  if (!token || !storedHash) return false;
+  return compareHashedTokens(hashWebDashboardToken(token), storedHash);
+}
+
+function resolveWebDashboardSessionTtlMs() {
+  return WEB_DASHBOARD_SESSION_TTL_MINUTES * 60 * 1000;
+}
+
+function createWebSession() {
+  const token = crypto.randomBytes(24).toString('base64url');
+  const ttlMs = resolveWebDashboardSessionTtlMs();
+  webSessions.set(token, { createdAt: new Date().toISOString(), expiresAt: Date.now() + ttlMs });
+  return { token, ttlMs };
+}
+
+function validateWebSession(token) {
+  if (!token) return { ok: false, reason: 'missing' };
+  const session = webSessions.get(token);
+  if (!session) return { ok: false, reason: 'missing' };
+  if (Date.now() > session.expiresAt) {
+    webSessions.delete(token);
+    return { ok: false, reason: 'expired' };
+  }
+  return { ok: true, session };
+}
+
+function buildWebSessionCookie(token, ttlMs) {
+  const maxAge = Math.max(1, Math.floor(ttlMs / 1000));
+  return `${WEB_DASHBOARD_SESSION_COOKIE}=${encodeURIComponent(
+    token,
+  )}; Path=/web; HttpOnly; SameSite=Strict; Max-Age=${maxAge}`;
+}
+
+function buildWebClearCookie() {
+  return `${WEB_DASHBOARD_SESSION_COOKIE}=; Path=/web; HttpOnly; SameSite=Strict; Max-Age=0`;
+}
+
+function getClientIp(req) {
+  const header = req.headers['x-forwarded-for'];
+  if (header) {
+    const [first] = header.split(',');
+    if (first) return first.trim();
+  }
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function checkWebLoginRateLimit(ip) {
+  const now = Date.now();
+  const entry = webLoginAttempts.get(ip) || { count: 0, windowStart: now, blockedUntil: 0 };
+  if (entry.blockedUntil && entry.blockedUntil > now) {
+    return { blocked: true, retryAfterMs: entry.blockedUntil - now, entry };
+  }
+  if (now - entry.windowStart > WEB_DASHBOARD_LOGIN_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.blockedUntil = 0;
+  }
+  return { blocked: false, entry };
+}
+
+function registerWebLoginAttempt(ip, success) {
+  const now = Date.now();
+  const entry = webLoginAttempts.get(ip) || { count: 0, windowStart: now, blockedUntil: 0 };
+  if (now - entry.windowStart > WEB_DASHBOARD_LOGIN_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.blockedUntil = 0;
+  }
+  if (!success) {
+    entry.count += 1;
+    if (entry.count >= WEB_DASHBOARD_LOGIN_MAX_ATTEMPTS) {
+      entry.blockedUntil = now + WEB_DASHBOARD_LOGIN_BLOCK_MS;
+      entry.count = 0;
+      entry.windowStart = now;
+    }
+  } else {
+    entry.count = 0;
+    entry.windowStart = now;
+    entry.blockedUntil = 0;
+  }
+  webLoginAttempts.set(ip, entry);
+  return entry;
+}
+
+function getContentTypeForPath(filePath) {
+  if (filePath.endsWith('.css')) return 'text/css; charset=utf-8';
+  if (filePath.endsWith('.js')) return 'application/javascript; charset=utf-8';
+  if (filePath.endsWith('.svg')) return 'image/svg+xml';
+  if (filePath.endsWith('.png')) return 'image/png';
+  if (filePath.endsWith('.jpg') || filePath.endsWith('.jpeg')) return 'image/jpeg';
+  return 'text/plain; charset=utf-8';
+}
+
+function maskSensitiveValue(value) {
+  if (!value) return null;
+  const text = String(value);
+  if (text.length <= 4) return '••••';
+  return `••••${text.slice(-4)}`;
+}
+
+async function buildWebHealthPayload() {
+  const logs = await listSelfLogs(5, 0);
+  return {
+    ok: true,
+    service: 'Project Manager',
+    timestamp: new Date().toISOString(),
+    env: {
+      botTokenConfigured: Boolean(BOT_TOKEN),
+      adminTelegramConfigured: Boolean(ADMIN_TELEGRAM_ID),
+      databaseUrlConfigured: Boolean(process.env.DATABASE_URL),
+    },
+    status: {
+      configDbOk: runtimeStatus.configDbOk,
+      configDbError: runtimeStatus.configDbError,
+      vaultOk: runtimeStatus.vaultOk,
+      vaultError: runtimeStatus.vaultError,
+    },
+    lastErrors: logs.map((entry) => ({
+      id: entry.id,
+      level: entry.level,
+      createdAt: entry.createdAt,
+      message: entry.message,
+    })),
+  };
+}
+
+async function buildWebProjectsPayload() {
+  const projects = await loadProjects();
+  return projects.map((project) => ({
+    id: project.id,
+    name: project.name || project.id,
+    repoSlug: project.repoSlug || null,
+    baseBranch: project.baseBranch || null,
+    renderServiceUrl: maskSensitiveValue(project.renderServiceUrl),
+    renderDeployHookUrl: maskSensitiveValue(project.renderDeployHookUrl),
+    runtime: {
+      hasRepo: Boolean(project.repoSlug),
+      hasRenderUrl: Boolean(project.renderServiceUrl),
+      vaultOk: runtimeStatus.vaultOk,
+    },
+  }));
+}
+
+async function buildWebProjectDetailPayload(projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) return null;
+  const logSettings = await getProjectLogSettingsWithDefaults(projectId);
+  return {
+    id: project.id,
+    name: project.name || project.id,
+    repoSlug: project.repoSlug || null,
+    baseBranch: project.baseBranch || null,
+    renderServiceUrl: maskSensitiveValue(project.renderServiceUrl),
+    renderDeployHookUrl: maskSensitiveValue(project.renderDeployHookUrl),
+    startCommand: project.startCommand || null,
+    testCommand: project.testCommand || null,
+    diagnosticCommand: project.diagnosticCommand || null,
+    logForwarding: logSettings,
+  };
+}
+
+async function buildWebLogsPayload({ projectId, level, page, pageSize }) {
+  const projects = await loadProjects();
+  const levels = level ? [normalizeLogLevel(level)].filter(Boolean) : [];
+  const resolvedPage = Number.isFinite(page) && page >= 0 ? page : 0;
+  const limit = pageSize || 25;
+  const offset = resolvedPage * limit;
+
+  const loadLogsForProject = async (project) => {
+    const logs = await listRecentLogs(project.id, limit + 1, 0);
+    return logs.map((entry) => ({
+      ...entry,
+      projectName: project.name || project.id,
+    }));
+  };
+
+  let entries = [];
+  if (projectId) {
+    const project = findProjectById(projects, projectId);
+    if (!project) {
+      return { entries: [], page: resolvedPage, pageSize: limit, total: 0 };
+    }
+    entries = await loadLogsForProject(project);
+  } else {
+    const bundles = await Promise.all(projects.map(loadLogsForProject));
+    entries = bundles.flat();
+  }
+
+  if (levels.length) {
+    entries = entries.filter((entry) => normalizeLogLevel(entry.level) === levels[0]);
+  }
+
+  entries.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const total = entries.length;
+  const paged = entries.slice(offset, offset + limit);
+  return { entries: paged, page: resolvedPage, pageSize: limit, total };
+}
+
+async function buildWebCronJobsPayload() {
+  const cronSettings = await loadCronSettings();
+  if (!cronSettings.enabled) {
+    return { ok: false, error: 'Cron integration disabled.' };
+  }
+  if (!CRON_API_TOKEN) {
+    return { ok: false, error: 'Cron integration not configured.' };
+  }
+  const { jobs, someFailed } = await listJobs();
+  return {
+    ok: true,
+    someFailed,
+    jobs: jobs.map((job) => ({
+      id: String(job.jobId || job.id || job.job_id || job.jobid || ''),
+      title: job.title || job.name || 'Cron job',
+      enabled: job.enabled !== false,
+      schedule: job.schedule?.description || job.schedule || '',
+      url: maskSensitiveValue(job.url || job.url_to_call || ''),
+      lastStatus: job.lastStatus || job.last_status || null,
+    })),
+  };
+}
+
+async function buildWebEnvVaultPayload(projectId) {
+  const envSetId = await ensureDefaultEnvVarSet(projectId);
+  const keys = await listEnvVarKeys(projectId, envSetId);
+  return {
+    projectId,
+    keys: keys.map((key) => ({
+      key,
+      valueMask: '••••',
+    })),
+  };
+}
+
+async function applyWebPatchSpec({ projectId, specText }) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    return { ok: false, error: 'Project not found.' };
+  }
+
+  const parsed = parseChangeSpecBlocks(specText);
+  if (!parsed.ok) {
+    return { ok: false, error: 'Invalid change spec.', details: parsed.errors || [] };
+  }
+  const validationErrors = validateStructuredSpec(parsed.blocks);
+  if (validationErrors.length) {
+    return { ok: false, error: 'Invalid change spec.', details: validationErrors };
+  }
+
+  const globalSettings = await loadGlobalSettings();
+  const effectiveBaseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+  let repoInfo;
+  try {
+    repoInfo = getRepoInfo(project);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+
+  const startTime = Date.now();
+  const { git, repoDir } = await prepareRepository(project, effectiveBaseBranch);
+  const branchName = makePatchBranchName(project.id);
+  const pathErrors = validateStructuredFilePaths(repoDir, parsed.blocks || []);
+  if (pathErrors.length) {
+    return { ok: false, error: 'Invalid file paths.', details: pathErrors };
+  }
+
+  await createWorkingBranch(git, effectiveBaseBranch, branchName);
+  const structuredResult = await applyStructuredChangePlan(repoDir, parsed.blocks);
+  if (structuredResult.failure) {
+    return {
+      ok: false,
+      error: 'Structured patch failed.',
+      failure: structuredResult.failure,
+      results: structuredResult.results,
+    };
+  }
+
+  const summary = summarizeChangeResults(structuredResult.results);
+  const failureLines = formatChangeFailures(structuredResult.results);
+  const diffPreview = await buildDiffPreview(git);
+
+  const identityResult = await configureGitIdentity(git);
+  if (!identityResult.ok) {
+    const stderr = identityResult.error?.stderr || identityResult.error?.message || 'Unknown error';
+    console.error(`[gitIdentity] Failed to set ${identityResult.step}: ${stderr}`);
+    return { ok: false, error: 'Failed to configure git author identity.' };
+  }
+  const hasChanges = await commitAndPush(git, branchName);
+  if (!hasChanges) {
+    return {
+      ok: true,
+      result: {
+        summary,
+        diffPreview,
+        message: buildChangeSummaryMessage(summary, failureLines, diffPreview),
+        elapsedSec: Math.round((Date.now() - startTime) / 1000),
+      },
+    };
+  }
+
+  const prBody = buildPrBody(diffPreview || specText || '');
+  const [owner, repo] = repoInfo.repoSlug.split('/');
+  const githubToken = getGithubToken(project);
+  const pr = await createPullRequest({
+    owner,
+    repo,
+    baseBranch: effectiveBaseBranch || DEFAULT_BASE_BRANCH,
+    headBranch: branchName,
+    title: `Automated patch: ${project.id}`,
+    body: prBody,
+    token: githubToken,
+  });
+
+  return {
+    ok: true,
+    result: {
+      summary,
+      diffPreview,
+      prUrl: pr.html_url,
+      elapsedSec: Math.round((Date.now() - startTime) / 1000),
+    },
+  };
+}
+
 function base64UrlEncode(value) {
   return Buffer.from(value).toString('base64url');
 }
@@ -13090,6 +13571,274 @@ async function initEnvVault() {
   throw new Error(`Startup aborted: ${reason}`);
 }
 
+async function handleWebRequest(req, res, url) {
+  if (!url.pathname.startsWith('/web')) {
+    return false;
+  }
+
+  const pathParts = url.pathname.split('/').filter(Boolean);
+  const isApi = url.pathname.startsWith('/web/api');
+
+  if (req.method === 'POST' && url.pathname === '/web/login') {
+    const ip = getClientIp(req);
+    const rateStatus = checkWebLoginRateLimit(ip);
+    if (rateStatus.blocked) {
+      res.writeHead(429, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Retry-After': Math.ceil(rateStatus.retryAfterMs / 1000),
+      });
+      res.end(JSON.stringify({ ok: false, error: 'Too many attempts. Try again later.' }));
+      return true;
+    }
+
+    const body = await readRequestBody(req);
+    const contentType = req.headers['content-type'] || '';
+    let payload = {};
+    if (contentType.includes('application/json')) {
+      try {
+        payload = body ? JSON.parse(body) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+    } else {
+      payload = parseFormBody(body);
+    }
+
+    const token = String(payload.token || '').trim();
+    const { settings } = await getWebDashboardSettingsState();
+    if (!isWebDashboardTokenConfigured(settings)) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'Dashboard token not configured.' }));
+      return true;
+    }
+
+    if (!isWebDashboardTokenValid(token, settings)) {
+      registerWebLoginAttempt(ip, false);
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'Invalid token.' }));
+      return true;
+    }
+
+    registerWebLoginAttempt(ip, true);
+    const session = createWebSession();
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Set-Cookie': buildWebSessionCookie(session.token, session.ttlMs),
+    });
+    res.end(JSON.stringify({ ok: true, ttlMinutes: WEB_DASHBOARD_SESSION_TTL_MINUTES }));
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/web/logout') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Set-Cookie': buildWebClearCookie(),
+    });
+    res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
+  if (req.method === 'GET' && (url.pathname === '/web' || url.pathname === '/web/' || url.pathname === '/web/login')) {
+    const { settings, web } = await getWebDashboardSettingsState();
+    let displayToken = null;
+    let shouldShowToken = false;
+
+    if (!web.adminTokenHash) {
+      const ensured = await ensureWebDashboardToken();
+      displayToken = ensured.token;
+      shouldShowToken = true;
+      await markWebDashboardTokenShown(ensured.settings);
+    } else if (!web.adminTokenShownAt && web.adminTokenEnc) {
+      try {
+        displayToken = decryptSecret(web.adminTokenEnc);
+        shouldShowToken = true;
+        await markWebDashboardTokenShown(settings);
+      } catch (error) {
+        console.error('[web] Failed to decrypt stored dashboard token', error);
+      }
+    }
+
+    if (shouldShowToken) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(
+        renderWebLoginPage({
+          token: displayToken,
+          mask: maskWebDashboardToken(displayToken),
+          message: 'Save this token now. It will only be shown once.',
+        }),
+      );
+      return true;
+    }
+
+    try {
+      const html = await fs.readFile(path.join(WEB_DASHBOARD_ASSETS_DIR, 'index.html'), 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Web dashboard assets not available.');
+    }
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/web/assets/')) {
+    const relativePath = url.pathname.replace('/web/assets/', '');
+    const assetPath = path.normalize(path.join(WEB_DASHBOARD_ASSETS_DIR, relativePath));
+    if (!assetPath.startsWith(WEB_DASHBOARD_ASSETS_DIR)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Forbidden');
+      return true;
+    }
+    try {
+      const contents = await fs.readFile(assetPath);
+      res.writeHead(200, { 'Content-Type': getContentTypeForPath(assetPath) });
+      res.end(contents);
+    } catch (error) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
+    }
+    return true;
+  }
+
+  if (isApi) {
+    const cookies = parseCookies(req);
+    const sessionToken = cookies[WEB_DASHBOARD_SESSION_COOKIE];
+    const sessionCheck = validateWebSession(sessionToken);
+    if (!sessionCheck.ok) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+      return true;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/web/api/health') {
+      const payload = await buildWebHealthPayload();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(payload));
+      return true;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/web/api/projects') {
+      const projects = await buildWebProjectsPayload();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, projects }));
+      return true;
+    }
+
+    if (req.method === 'GET' && pathParts.length === 4 && pathParts[2] === 'projects') {
+      const projectId = decodeURIComponent(pathParts[3]);
+      const project = await buildWebProjectDetailPayload(projectId);
+      if (!project) {
+        res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Project not found.' }));
+        return true;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, project }));
+      return true;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/web/api/logs') {
+      const projectId = url.searchParams.get('project') || '';
+      const level = url.searchParams.get('level') || '';
+      const page = Number(url.searchParams.get('page') || 0);
+      const payload = await buildWebLogsPayload({ projectId, level, page });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, ...payload }));
+      return true;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/web/api/cronjobs') {
+      const payload = await buildWebCronJobsPayload();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(payload));
+      return true;
+    }
+
+    if (req.method === 'GET' && pathParts.length === 4 && pathParts[2] === 'envvault') {
+      const projectId = decodeURIComponent(pathParts[3]);
+      const project = await getProjectById(projectId);
+      if (!project) {
+        res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Project not found.' }));
+        return true;
+      }
+      const payload = await buildWebEnvVaultPayload(projectId);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, ...payload }));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathParts.length === 4 && pathParts[2] === 'envvault') {
+      const projectId = decodeURIComponent(pathParts[3]);
+      const project = await getProjectById(projectId);
+      if (!project) {
+        res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Project not found.' }));
+        return true;
+      }
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const key = String(payload.key || '').trim();
+      const value = String(payload.value || '').trim();
+      if (!key || !value) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Key and value are required.' }));
+        return true;
+      }
+      const envSetId = await ensureDefaultEnvVarSet(projectId);
+      await upsertEnvVar(projectId, key, value, envSetId);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, key }));
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/web/api/patch/apply') {
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const projectId = String(payload.projectId || '').trim();
+      const specText = String(payload.specText || '').trim();
+      if (!projectId || !specText) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'projectId and specText are required.' }));
+        return true;
+      }
+      try {
+        const result = await applyWebPatchSpec({ projectId, specText });
+        res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: error.message || 'Failed to apply patch.' }));
+      }
+      return true;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: false, error: 'Not found' }));
+    return true;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Not found');
+  return true;
+}
+
 async function handleMiniSiteRequest(req, res, url) {
   if (!url.pathname.startsWith('/db-mini')) {
     return false;
@@ -13529,6 +14278,9 @@ function startHttpServer() {
   httpServerPromise = new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
+      if (await handleWebRequest(req, res, url)) {
+        return;
+      }
       if (await handleMiniSiteRequest(req, res, url)) {
         return;
       }
