@@ -241,6 +241,7 @@ const envScanCache = new Map();
 const cronCreateRetryCache = new Map();
 const cronErrorDetailsCache = new Map();
 const panelMessageHistoryByChat = new Map();
+const activePanelMessageIdByChat = new Map();
 const ephemeralMessageIdsByChat = new Map();
 const ephemeralTimersByChat = new Map();
 const webSessions = new Map();
@@ -589,6 +590,21 @@ function getPanelHistory(chatId) {
   return panelMessageHistoryByChat.get(chatId);
 }
 
+function getActivePanelMessageId(chatId) {
+  if (!chatId) return null;
+  return activePanelMessageIdByChat.get(chatId) || null;
+}
+
+function setActivePanelMessageId(chatId, messageId) {
+  if (!chatId || !messageId) return;
+  activePanelMessageIdByChat.set(chatId, messageId);
+}
+
+function clearActivePanelMessageId(chatId) {
+  if (!chatId) return;
+  activePanelMessageIdByChat.delete(chatId);
+}
+
 async function deactivatePanelMessage(chatId, messageId, reason) {
   if (!chatId || !messageId) return;
   try {
@@ -611,6 +627,7 @@ async function trackPanelMessage(chatId, messageId, settings) {
   const filtered = history.filter((entry) => entry !== messageId);
   filtered.unshift(messageId);
   panelMessageHistoryByChat.set(chatId, filtered);
+  setActivePanelMessageId(chatId, messageId);
 
   await Promise.all(
     filtered.slice(1).map((oldId) => deactivatePanelMessage(chatId, oldId, 'new_panel')),
@@ -631,6 +648,7 @@ async function clearPanelMessages(ctx, reason) {
   const history = getPanelHistory(chatId);
   await Promise.all(history.map((messageId) => safeDeleteMessage(ctx, chatId, messageId, reason)));
   panelMessageHistoryByChat.set(chatId, []);
+  clearActivePanelMessageId(chatId);
 }
 
 function trackEphemeralMessage(chatId, messageId) {
@@ -694,6 +712,9 @@ async function renderPanel(ctx, text, extra) {
   const settings = await getCachedSettings();
   const cleanup = normalizeUiCleanupSettings(settings);
   let response = null;
+  const chatId = getChatIdFromCtx(ctx);
+  const activePanelMessageId = getActivePanelMessageId(chatId);
+  await clearEphemeralMessages(ctx, 'panel_nav');
   if (ctx.callbackQuery?.message && ctx.editMessageText) {
     try {
       await ctx.editMessageText(text, safeExtra);
@@ -708,6 +729,28 @@ async function renderPanel(ctx, text, extra) {
         return;
       }
       console.warn('[UI] Failed to edit panel message, sending new.', error?.message);
+    }
+  } else if (chatId && activePanelMessageId) {
+    try {
+      await bot.api.editMessageText(chatId, activePanelMessageId, text, safeExtra);
+      response = { chat: { id: chatId }, message_id: activePanelMessageId };
+    } catch (error) {
+      if (isMessageNotModifiedError(error)) {
+        response = { chat: { id: chatId }, message_id: activePanelMessageId };
+      } else {
+        console.warn('[UI] Failed to edit active panel message, sending new.', error?.message);
+      }
+    }
+    if (response && safeExtra?.reply_markup?.inline_keyboard) {
+      try {
+        await bot.api.editMessageReplyMarkup(chatId, activePanelMessageId, {
+          reply_markup: safeExtra.reply_markup,
+        });
+      } catch (error) {
+        if (!isMessageNotModifiedError(error)) {
+          console.warn('[UI] Failed to edit active panel markup.', error?.message);
+        }
+      }
     }
   }
   if (!response) {
@@ -1240,16 +1283,19 @@ function appendChangeChunk(session, chunk, inputType) {
 }
 
 async function renderMainMenu(ctx) {
-  await clearPanelMessages(ctx, 'main_menu');
-  await clearEphemeralMessages(ctx, 'main_menu');
-  await replySafely(ctx, '🧭 Main menu:', { reply_markup: mainKeyboard });
+  await renderPanel(ctx, '🧭 Main menu:', { reply_markup: buildMainMenuInlineKeyboard() });
 }
 
-async function resetToMainMenu(ctx, notice) {
+async function resetToMainMenu(ctx, notice, options = {}) {
   resetUserState(ctx);
   clearPatchSession(ctx.from?.id);
-  await clearPanelMessages(ctx, 'main_menu');
+  if (options.deleteIncomingMessage) {
+    await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'start_command');
+  }
   await clearEphemeralMessages(ctx, 'main_menu');
+  if (options.freshPanel) {
+    await clearPanelMessages(ctx, 'main_menu');
+  }
   if (notice) {
     await replySafely(ctx, notice);
   }
@@ -1258,8 +1304,20 @@ async function resetToMainMenu(ctx, notice) {
 
 async function handleReplyKeyboardNavigation(ctx, handler) {
   resetUserState(ctx);
-  await clearPanelMessages(ctx, 'reply_keyboard_nav');
+  await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'reply_keyboard_nav');
+  await clearEphemeralMessages(ctx, 'reply_keyboard_nav');
   return handler();
+}
+
+function buildMainMenuInlineKeyboard() {
+  return new InlineKeyboard()
+    .text('📦 Projects', 'main:projects')
+    .text('🗄️ Database', 'main:database')
+    .row()
+    .text('⏱️ Cronjobs', 'main:cronjobs')
+    .text('⚙️ Settings', 'main:settings')
+    .row()
+    .text('📣 Logs', 'main:logs');
 }
 
 function buildCancelKeyboard() {
@@ -1429,7 +1487,7 @@ async function handleGlobalCommand(ctx, command) {
   clearPatchSession(ctx.from.id);
   switch (command) {
     case '/start':
-      await resetToMainMenu(ctx);
+      await resetToMainMenu(ctx, null, { freshPanel: true, deleteIncomingMessage: true });
       return true;
     case '/settings':
       await renderGlobalSettings(ctx);
@@ -1556,7 +1614,7 @@ bot.on('message', async (ctx, next) => {
 });
 
 bot.command('start', async (ctx) => {
-  await resetToMainMenu(ctx);
+  await resetToMainMenu(ctx, null, { freshPanel: true, deleteIncomingMessage: true });
 });
 
 bot.hears('📦 Projects', async (ctx) => {
@@ -1956,8 +2014,27 @@ async function renderProjectsList(ctx) {
 async function handleMainCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action] = data.split(':');
-  if (action === 'back') {
-    await resetToMainMenu(ctx);
+  switch (action) {
+    case 'back':
+      await resetToMainMenu(ctx);
+      break;
+    case 'projects':
+      await renderProjectsList(ctx);
+      break;
+    case 'database':
+      await renderDataCenterMenu(ctx);
+      break;
+    case 'cronjobs':
+      await renderCronMenu(ctx);
+      break;
+    case 'settings':
+      await renderGlobalSettings(ctx);
+      break;
+    case 'logs':
+      await renderLogsProjectList(ctx, '📣 Logs');
+      break;
+    default:
+      break;
   }
 }
 
