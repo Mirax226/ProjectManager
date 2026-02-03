@@ -246,9 +246,20 @@ function createLogsRouter(options) {
   const isAllowed = createRateLimiter({ maxPerMinute: rateLimitPerMinute });
 
   async function handle(req, res) {
-    if (!token || !adminChatId) {
+    if (!token) {
+      logger.warn('[LOG_API] disabled: missing PATH_APPLIER_TOKEN');
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'LOG_API_DISABLED',
+          reason: 'PATH_APPLIER_TOKEN not configured on server',
+        }),
+      );
+      return;
+    }
+
+    if (!adminChatId) {
       const missing = [];
-      if (!token) missing.push('PATH_APPLIER_TOKEN');
       if (!adminChatId) {
         if (!process.env.TELEGRAM_ADMIN_CHAT_ID) {
           missing.push('TELEGRAM_ADMIN_CHAT_ID');

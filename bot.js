@@ -163,11 +163,19 @@ const LOG_API_ADMIN_CHAT_ID =
   process.env.TELEGRAM_ADMIN_CHAT_ID ||
   process.env.ADMIN_CHAT_ID ||
   process.env.ADMIN_TELEGRAM_ID;
+const LOG_API_ENABLED = Boolean(LOG_API_TOKEN);
 const LOG_API_ALLOWED_PROJECTS = parseAllowedProjects(process.env.ALLOWED_PROJECTS);
 const LOG_API_ALLOWED_PROJECTS_MODE = LOG_API_ALLOWED_PROJECTS.size ? 'whitelist' : 'allow-all';
+const LOG_API_STATUS_LABEL = LOG_API_ENABLED ? 'ENABLED' : 'DISABLED';
+
+console.error(`[boot] PATH_APPLIER_TOKEN: ${LOG_API_ENABLED ? 'SET' : 'MISSING'}`);
+console.error(`[boot] Log API status: ${LOG_API_STATUS_LABEL}`);
+if (!LOG_API_ENABLED) {
+  console.warn('[WARN] Log API disabled: missing token');
+}
 
 console.error('[log_api]', {
-  tokenConfigured: Boolean(LOG_API_TOKEN),
+  tokenConfigured: LOG_API_ENABLED,
   adminChatIdResolved: Boolean(LOG_API_ADMIN_CHAT_ID),
   allowedProjectsMode: LOG_API_ALLOWED_PROJECTS_MODE,
 });
@@ -243,6 +251,24 @@ const TELEGRAM_WEBHOOK_PATH_PREFIX = '/webhook';
 function normalizeLogLevels(levels) {
   if (!Array.isArray(levels)) return [];
   return levels.map((level) => normalizeLogLevel(level)).filter(Boolean);
+}
+
+function getLogApiHealthStatus() {
+  if (LOG_API_ENABLED) {
+    return { enabled: true };
+  }
+  return { enabled: false, reason: 'missing token' };
+}
+
+function buildLogApiStatusText() {
+  const status = getLogApiHealthStatus();
+  const lines = ['📣 Log API status', `Status: ${status.enabled ? 'enabled' : 'disabled'}`];
+  lines.push(`Token: ${LOG_API_ENABLED ? 'present' : 'missing'}`);
+  if (!status.enabled) {
+    lines.push(`Reason: ${status.reason}`);
+  }
+  lines.push(`Allowed projects: ${LOG_API_ALLOWED_PROJECTS_MODE}`);
+  return lines.join('\n');
 }
 
 function getEffectiveProjectLogForwarding(project) {
@@ -1120,6 +1146,7 @@ const GLOBAL_COMMAND_ALIASES = {
   '/cronjob': '/cronjob',
   '/cronjobs': '/cronjob',
   '/cronjob': '/cronjob',
+  '/logs': '/logs',
   '/start': '/start',
 };
 
@@ -1132,6 +1159,9 @@ async function handleGlobalCommand(ctx, command) {
       return true;
     case '/settings':
       await renderGlobalSettings(ctx);
+      return true;
+    case '/logs':
+      await ctx.reply(buildLogApiStatusText());
       return true;
     case '/projects':
       await renderProjectsList(ctx);
@@ -14293,6 +14323,7 @@ function startHttpServer() {
           configDbError: runtimeStatus.configDbError,
           vaultOk: runtimeStatus.vaultOk,
           vaultError: runtimeStatus.vaultError,
+          logApi: getLogApiHealthStatus(),
         };
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(payload));
@@ -14622,6 +14653,16 @@ async function startBot() {
   await testConfigDbConnection();
   console.error('[boot] db init ok');
   await initializeConfig();
+  if (!LOG_API_ENABLED) {
+    try {
+      await bot.api.sendMessage(
+        ADMIN_TELEGRAM_ID,
+        '⚠️ Log API is disabled — PATH_APPLIER_TOKEN not set',
+      );
+    } catch (error) {
+      console.error('[log_api] Failed to send disabled notification', error);
+    }
+  }
   try {
     await bot.api.deleteWebhook({ drop_pending_updates: false });
     console.log('[Project Manager] Webhook deleted (if any). Using long polling.');
