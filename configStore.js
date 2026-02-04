@@ -1,18 +1,12 @@
 // Persistent storage for projects & globalSettings in Postgres (JSONB)
 
-const { Pool } = require('pg');
+const { getConfigDbPool } = require('./configDb');
+const { classifyDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
 const { forwardSelfLog } = require('./logger');
 const { appState, recordDbError } = require('./appState');
 
-let pool = null;
-let sslWarningEmitted = false;
-
-const DB_POOL_MAX = 5;
-const DB_IDLE_TIMEOUT_MS = 30_000;
-const DB_CONNECTION_TIMEOUT_MS = 5000;
-const DB_STATEMENT_TIMEOUT_MS = 5000;
-const DB_CONNECT_RETRIES = [500, 1000, 2000, 4000, 8000];
 const DB_OPERATION_TIMEOUT_MS = 5000;
+let tableReady = false;
 
 // Simple in-memory cache as fallback
 const memory = {
@@ -21,95 +15,7 @@ const memory = {
 };
 
 async function getPool() {
-  const dsn = process.env.PATH_APPLIER_CONFIG_DSN;
-  if (!dsn) {
-    console.warn(
-      '[configStore] PATH_APPLIER_CONFIG_DSN is not set; using in-memory config only.',
-    );
-    return null;
-  }
-
-  if (!pool) {
-    if (!sslWarningEmitted) {
-      const sslMode = `${dsn} ${process.env.DATABASE_URL || ''}`.toLowerCase();
-      if (sslMode.includes('sslmode=require') && !sslMode.includes('uselibpqcompat=true')) {
-        console.warn(
-          '[configStore] SSL warning: add uselibpqcompat=true or use direct 5432 Supabase host to avoid SSL chain errors.',
-        );
-        sslWarningEmitted = true;
-      }
-    }
-    pool = new Pool({
-      connectionString: dsn,
-      max: DB_POOL_MAX,
-      idleTimeoutMillis: DB_IDLE_TIMEOUT_MS,
-      connectionTimeoutMillis: DB_CONNECTION_TIMEOUT_MS,
-      options: `-c statement_timeout=${DB_STATEMENT_TIMEOUT_MS}`,
-    });
-
-    try {
-      await withDbTimeout(testPoolConnection(pool), 'pool_test');
-      await withDbTimeout(
-        pool.query(`
-        CREATE TABLE IF NOT EXISTS path_config (
-          key        TEXT PRIMARY KEY,
-          data       JSONB NOT NULL,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-      `),
-        'pool_init',
-      );
-    } catch (error) {
-      const category = classifyDbError(error);
-      recordDbError(category, error?.message);
-      console.error('[configStore] Failed to initialize config DB connection', {
-        category: category || 'unknown',
-        message: error?.message,
-      });
-      pool = null;
-      return null;
-    }
-  }
-
-  return pool;
-}
-
-function classifyDbError(error) {
-  const code = error?.code;
-  const message = String(error?.message || '');
-  if (code === 'SELF_SIGNED_CERT_IN_CHAIN' || message.includes('SELF_SIGNED_CERT_IN_CHAIN')) {
-    return 'SELF_SIGNED_CERT_IN_CHAIN';
-  }
-  if (code === 'ETIMEDOUT' || message.includes('ETIMEDOUT')) {
-    return 'ETIMEDOUT';
-  }
-  if (code === 'DB_TIMEOUT' || message.includes('DB_TIMEOUT')) {
-    return 'DB_TIMEOUT';
-  }
-  if (code === 'ECONNRESET' || message.includes('ECONNRESET')) {
-    return 'ECONNRESET';
-  }
-  if (message.toLowerCase().includes('connection terminated unexpectedly')) {
-    return 'CONNECTION_TERMINATED_UNEXPECTEDLY';
-  }
-  return null;
-}
-
-async function testPoolConnection(poolInstance) {
-  let lastError;
-  for (let attempt = 0; attempt < DB_CONNECT_RETRIES.length; attempt += 1) {
-    try {
-      await poolInstance.query('SELECT 1');
-      return true;
-    } catch (error) {
-      lastError = error;
-      const delay = DB_CONNECT_RETRIES[attempt];
-      if (delay) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    }
-  }
-  throw lastError;
+  return getConfigDbPool();
 }
 
 async function withDbTimeout(promise, context) {
@@ -130,11 +36,34 @@ async function withDbTimeout(promise, context) {
   }
 }
 
-async function loadJson(key) {
-  if (appState.degradedMode) {
-    return memory[key] ?? null;
+async function ensureConfigTable(db) {
+  if (!db || tableReady) return;
+  await withDbTimeout(
+    db.query(`
+      CREATE TABLE IF NOT EXISTS path_config (
+        key        TEXT PRIMARY KEY,
+        data       JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `),
+    'pool_init',
+  );
+  tableReady = true;
+}
+
+async function getDb() {
+  if (!appState.dbReady || appState.degradedMode) {
+    return null;
   }
   const db = await getPool();
+  if (db) {
+    await ensureConfigTable(db);
+  }
+  return db;
+}
+
+async function loadJson(key) {
+  const db = await getDb();
   if (!db) {
     return memory[key] ?? null;
   }
@@ -147,8 +76,12 @@ async function loadJson(key) {
     );
   } catch (err) {
     const category = classifyDbError(err);
-    recordDbError(category, err?.message);
-    console.error(`[configStore] Failed to load ${key} from DB`, err);
+    const message = sanitizeDbErrorMessage(err?.message);
+    recordDbError(category, message);
+    console.error(`[configStore] Failed to load ${key} from DB`, {
+      category,
+      message,
+    });
     return memory[key] ?? null;
   }
 
@@ -170,7 +103,7 @@ async function saveJson(key, value) {
 
   if (!appState.dbReady || appState.degradedMode) return;
 
-  const db = await getPool();
+  const db = await getDb();
   if (!db) return;
 
   const jsonText = JSON.stringify(value);
@@ -190,8 +123,12 @@ async function saveJson(key, value) {
     );
   } catch (err) {
     const category = classifyDbError(err);
-    recordDbError(category, err?.message);
-    console.error(`[configStore] Failed to save ${key} to DB`, err);
+    const message = sanitizeDbErrorMessage(err?.message);
+    recordDbError(category, message);
+    console.error(`[configStore] Failed to save ${key} to DB`, {
+      category,
+      message,
+    });
   }
 }
 
@@ -208,10 +145,13 @@ async function saveProjects(projects) {
   try {
     await saveJson('projects', projects);
   } catch (err) {
-    console.error('[configStore] Failed to save projects', err);
+    const message = sanitizeDbErrorMessage(err?.message);
+    console.error('[configStore] Failed to save projects', {
+      message,
+    });
     await forwardSelfLog('error', 'Failed to save projects', {
       stack: err?.stack,
-      context: { error: err?.message },
+      context: { error: message },
     });
   }
 }
@@ -226,16 +166,20 @@ async function saveGlobalSettings(settings) {
   try {
     await saveJson('globalSettings', settings || {});
   } catch (err) {
-    console.error('[configStore] Failed to save globalSettings', err);
+    const message = sanitizeDbErrorMessage(err?.message);
+    console.error('[configStore] Failed to save globalSettings', {
+      message,
+    });
     await forwardSelfLog('error', 'Failed to save global settings', {
       stack: err?.stack,
-      context: { error: err?.message },
+      context: { error: message },
     });
   }
 }
 
 module.exports = {
   classifyDbError,
+  ensureConfigTable,
   loadJson,
   saveJson,
   loadProjects,

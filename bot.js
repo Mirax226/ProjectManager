@@ -12,6 +12,12 @@ const runtimeStatus = {
   fatalError: null,
 };
 const { appState, recordDbError, setDbReady, setDegradedMode } = require('./appState');
+const {
+  recordAttempt: recordConfigDbAttempt,
+  setNextRetryInMs: setConfigDbNextRetry,
+  snapshot: getConfigDbSnapshot,
+} = require('./configDbState');
+const { classifyDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
 
 process.on('unhandledRejection', (reason) => {
   const error = reason instanceof Error ? reason : new Error(String(reason || 'Unhandled rejection'));
@@ -124,7 +130,8 @@ const {
 const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
-const { classifyDbError } = require('./configStore');
+const { ensureConfigTable } = require('./configStore');
+const { getConfigDbPool, testConfigDbConnection: probeConfigDbConnection } = require('./configDb');
 const { listSelfLogs, getSelfLogById } = require('./loggerStore');
 const {
   DEFAULT_SETTINGS: DEFAULT_LOG_ALERT_SETTINGS,
@@ -240,7 +247,6 @@ const supabaseTableAccess = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
 const userState = new Map();
-let configStatusPool = null;
 const patchSessions = new Map();
 const changePreviewSessions = new Map();
 const structuredPatchSessions = new Map();
@@ -258,6 +264,12 @@ const webSessions = new Map();
 const webLoginAttempts = new Map();
 const pendingLogTests = new Map();
 let httpServerPromise = null;
+let configDbWarmupTimer = null;
+let configDbWarmupInFlight = false;
+let configDbFailureStreak = 0;
+let configDbLastLogCategory = null;
+let configDbLastLogAttempt = 0;
+let configDbManualRetryAt = 0;
 let cachedSettings = null;
 let cachedSettingsAt = 0;
 const DB_OPERATION_TIMEOUT_MS = 5000;
@@ -1526,13 +1538,90 @@ function appendChangeChunk(session, chunk, inputType) {
 }
 
 async function renderMainMenu(ctx) {
-  await renderPanel(ctx, `${buildDegradedBanner()}🧭 Main menu:`, {
+  const statusLine = buildConfigDbStatusLine();
+  const banner = buildDegradedBanner();
+  await renderPanel(ctx, `${banner}${statusLine}\n🧭 Main menu:`, {
     reply_markup: buildMainMenuInlineKeyboard(),
   });
 }
 
 function buildDegradedBanner() {
-  return appState.degradedMode ? '⚠️ DB unavailable — running in degraded mode\n\n' : '';
+  if (appState.degradedMode) {
+    return '⚠️ Config DB unavailable — running in degraded mode\n\n';
+  }
+  return '';
+}
+
+function buildConfigDbStatusLine() {
+  const snapshot = getConfigDbSnapshot();
+  if (!process.env.PATH_APPLIER_CONFIG_DSN) {
+    return '⚪️ Config DB: Not configured';
+  }
+  if (snapshot.ready) {
+    return '🟢 Config DB: Ready';
+  }
+  if (snapshot.nextRetryInMs > 0) {
+    return `🟡 Config DB: Not ready (retrying in ${formatRetryWindow(snapshot.nextRetryInMs)})`;
+  }
+  return '🔴 Config DB: Error (tap retry)';
+}
+
+function formatRetryWindow(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return 'soon';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${Math.ceil(ms / 1000)}s`;
+}
+
+function buildConfigDbGateView({ title, notice, backCallback }) {
+  const snapshot = getConfigDbSnapshot();
+  const lines = [
+    title || '🟡 Config DB not ready',
+    '',
+    `Status: ${snapshot.ready ? '🟢 Ready' : '🔴 Not ready'}`,
+    `Last attempt: ${snapshot.lastAttemptAt || '-'}`,
+    `Next retry: ${snapshot.nextRetryInMs ? formatRetryWindow(snapshot.nextRetryInMs) : '-'}`,
+    notice || null,
+    '',
+    'Some features are paused until the config DB is ready.',
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('🔄 Retry now', 'configdb:retry')
+    .row()
+    .text('⬅️ Back', backCallback || 'main:back');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderConfigDbGate(ctx, options = {}) {
+  const view = buildConfigDbGateView(options);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+function buildConfigDbStatusView(notice) {
+  const snapshot = getConfigDbSnapshot();
+  const configured = Boolean(process.env.PATH_APPLIER_CONFIG_DSN);
+  const lines = [
+    '🩺 PM Status',
+    '',
+    `Config DB configured: ${configured ? '✅ yes' : '❌ no'}`,
+    `Config DB ready: ${snapshot.ready ? '✅ yes' : '❌ no'}`,
+    `Last attempt: ${snapshot.lastAttemptAt || '-'}`,
+    `Last success: ${snapshot.lastSuccessAt || '-'}`,
+    `Attempts: ${snapshot.attempts}`,
+    `Next retry: ${snapshot.nextRetryInMs ? formatRetryWindow(snapshot.nextRetryInMs) : '-'}`,
+    `Last error category: ${snapshot.lastErrorCategory || '-'}`,
+    notice || null,
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('🔄 Retry now', 'configdb:retry')
+    .text('🧾 View recent error', 'configdb:error')
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderConfigDbStatus(ctx, notice) {
+  const view = buildConfigDbStatusView(notice);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
 async function resetToMainMenu(ctx, notice, options = {}) {
@@ -1653,32 +1742,6 @@ function wrapCallbackHandler(handler, label) {
   };
 }
 
-async function checkConfigDbStatus() {
-  const dsn = process.env.PATH_APPLIER_CONFIG_DSN;
-  if (!dsn) {
-    return { ok: false, message: 'not configured' };
-  }
-  try {
-    if (!configStatusPool) {
-      configStatusPool = new Pool({
-        connectionString: dsn,
-        max: 1,
-        idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 5000,
-        options: '-c statement_timeout=5000',
-      });
-    }
-    await withDbTimeout(configStatusPool.query('SELECT 1'), 'config_status');
-    return { ok: true, message: 'OK' };
-  } catch (error) {
-    const category = classifyDbError(error);
-    if (category) {
-      recordDbError(category, error?.message);
-    }
-    return { ok: false, message: error.message || 'error' };
-  }
-}
-
 async function getCronStatusLine(ctx, cronSettings) {
   if (!cronSettings?.enabled) {
     return 'Cron: disabled (settings).';
@@ -1703,7 +1766,7 @@ async function getCronStatusLine(ctx, cronSettings) {
 }
 
 async function testConfigDbConnection() {
-  const status = await checkConfigDbStatus();
+  const status = await probeConfigDbConnection();
   if (status.ok) {
     runtimeStatus.configDbOk = true;
     runtimeStatus.configDbError = null;
@@ -1712,7 +1775,7 @@ async function testConfigDbConnection() {
   }
   runtimeStatus.configDbOk = false;
   runtimeStatus.configDbError = status.message || 'see logs';
-  if (status.message === 'not configured') {
+  if (!status.configured) {
     console.error('Config DB is not configured (PATH_APPLIER_CONFIG_DSN missing).');
     await forwardSelfLog('error', 'Config DB missing PATH_APPLIER_CONFIG_DSN', {
       context: { error: status.message },
@@ -1726,13 +1789,139 @@ async function testConfigDbConnection() {
   return status;
 }
 
-async function refreshDbState() {
-  const status = await testConfigDbConnection();
-  const configOk = await initializeConfig();
-  const dbReady = Boolean(status?.ok && configOk);
-  setDbReady(dbReady);
-  setDegradedMode(!dbReady);
-  return dbReady;
+function shouldLogConfigDbFailure(category) {
+  if (!category) return false;
+  if (configDbFailureStreak === 1) return true;
+  if (category !== configDbLastLogCategory) return true;
+  return configDbFailureStreak - configDbLastLogAttempt >= 5;
+}
+
+function scheduleConfigDbWarmup(delayMs, reason) {
+  if (configDbWarmupTimer) {
+    clearTimeout(configDbWarmupTimer);
+    configDbWarmupTimer = null;
+  }
+  setConfigDbNextRetry(delayMs);
+  if (delayMs <= 0) {
+    runConfigDbWarmup(reason).catch((error) => {
+      console.warn('[db] warmup failed to start', error?.message || error);
+    });
+    return;
+  }
+  configDbWarmupTimer = setTimeout(() => {
+    configDbWarmupTimer = null;
+    runConfigDbWarmup(reason).catch((error) => {
+      console.warn('[db] warmup failed', error?.message || error);
+    });
+  }, delayMs);
+  if (typeof configDbWarmupTimer.unref === 'function') {
+    configDbWarmupTimer.unref();
+  }
+}
+
+function computeConfigDbBackoff(attempt) {
+  const base = 500;
+  const max = 60_000;
+  const jitter = Math.floor(Math.random() * 251);
+  const raw = base * Math.pow(2, Math.max(0, attempt - 1));
+  return Math.min(max, raw) + jitter;
+}
+
+async function runConfigDbWarmup(reason = 'scheduled') {
+  if (configDbWarmupInFlight) return;
+  configDbWarmupInFlight = true;
+  recordConfigDbAttempt();
+  const attemptCount = getConfigDbSnapshot().attempts;
+
+  try {
+    const status = await probeConfigDbConnection();
+    if (!status.configured) {
+      const message = sanitizeDbErrorMessage(status.message) || 'not configured';
+      recordDbError('UNKNOWN_DB_ERROR', message);
+      configDbFailureStreak += 1;
+      runtimeStatus.configDbOk = false;
+      runtimeStatus.configDbError = message;
+      if (shouldLogConfigDbFailure('UNKNOWN_DB_ERROR')) {
+        console.warn('[db] Config DB not configured; warmup halted.');
+        configDbLastLogCategory = 'UNKNOWN_DB_ERROR';
+        configDbLastLogAttempt = configDbFailureStreak;
+      }
+      setConfigDbNextRetry(0);
+      return;
+    }
+
+    if (status.ok) {
+      const db = await getConfigDbPool();
+      if (db) {
+        await ensureConfigTable(db);
+      }
+      setDbReady(true);
+      setDegradedMode(false);
+      const configOk = await loadConfig();
+      if (!configOk) {
+        throw new Error('Config load failed');
+      }
+      runtimeStatus.configDbOk = true;
+      runtimeStatus.configDbError = null;
+      configDbFailureStreak = 0;
+      setConfigDbNextRetry(0);
+      return;
+    }
+
+    const category = status.category || 'UNKNOWN_DB_ERROR';
+    const message = sanitizeDbErrorMessage(status.message);
+    recordDbError(category, message);
+    configDbFailureStreak += 1;
+    runtimeStatus.configDbOk = false;
+    runtimeStatus.configDbError = message || 'see logs';
+    if (shouldLogConfigDbFailure(category)) {
+      console.warn('[db] Config DB warmup failed', {
+        category,
+        message,
+        attempt: attemptCount,
+        reason,
+      });
+      configDbLastLogCategory = category;
+      configDbLastLogAttempt = configDbFailureStreak;
+    }
+    const delayMs = computeConfigDbBackoff(configDbFailureStreak);
+    scheduleConfigDbWarmup(delayMs, 'retry');
+  } catch (error) {
+    const category = classifyDbError(error);
+    const message = sanitizeDbErrorMessage(error?.message);
+    recordDbError(category, message);
+    configDbFailureStreak += 1;
+    runtimeStatus.configDbOk = false;
+    runtimeStatus.configDbError = message || 'see logs';
+    if (shouldLogConfigDbFailure(category)) {
+      console.warn('[db] Config DB warmup failed', {
+        category,
+        message,
+        attempt: attemptCount,
+        reason,
+      });
+      configDbLastLogCategory = category;
+      configDbLastLogAttempt = configDbFailureStreak;
+    }
+    const delayMs = computeConfigDbBackoff(configDbFailureStreak);
+    scheduleConfigDbWarmup(delayMs, 'retry');
+  } finally {
+    configDbWarmupInFlight = false;
+  }
+}
+
+function startConfigDbWarmup() {
+  scheduleConfigDbWarmup(0, 'startup');
+}
+
+function triggerConfigDbWarmup(reason = 'manual') {
+  const now = Date.now();
+  if (now - configDbManualRetryAt < 3000) {
+    return false;
+  }
+  configDbManualRetryAt = now;
+  scheduleConfigDbWarmup(0, reason);
+  return true;
 }
 
 const mainKeyboard = new Keyboard()
@@ -1824,9 +2013,10 @@ async function handleStartCommand(ctx, payload) {
     console.warn('[navigation] Start payload ignored in favor of main menu.', { payload: payloadText });
   }
   await renderMainMenu(ctx);
-  refreshDbState().catch((error) => {
-    console.warn('[db] refresh failed after /start', error?.message || error);
-  });
+  const triggered = triggerConfigDbWarmup('start_command');
+  if (!triggered) {
+    console.warn('[db] refresh skipped after /start (retry already running)');
+  }
   return true;
 }
 
@@ -2215,6 +2405,10 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     await handleProjectWizardCallback(ctx, data);
     return;
   }
+  if (data.startsWith('configdb:')) {
+    await handleConfigDbCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('gsettings:')) {
     await handleGlobalSettingsCallback(ctx, data);
     return;
@@ -2401,6 +2595,10 @@ function buildProjectsKeyboard(projects, globalSettings) {
 }
 
 async function renderProjectsList(ctx) {
+  if (!getConfigDbSnapshot().ready) {
+    await renderConfigDbGate(ctx, { title: '📦 Projects', backCallback: 'main:back' });
+    return;
+  }
   const projects = await loadProjects();
   const globalSettings = await loadGlobalSettings();
   const banner = buildDegradedBanner();
@@ -2450,6 +2648,11 @@ async function handleProjectCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action, projectId, extra, ...rest] = data.split(':');
   const source = rest.join(':') || null;
+
+  if (!getConfigDbSnapshot().ready && action !== 'list') {
+    await renderConfigDbGate(ctx, { title: '📦 Projects', backCallback: 'main:back' });
+    return;
+  }
 
   if (action === 'add') {
     await startProjectWizard(ctx);
@@ -3102,6 +3305,10 @@ async function handleGlobalSettingsCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const parts = data.split(':');
   const action = parts[1];
+  if (!getConfigDbSnapshot().ready && action !== 'pm_status' && action !== 'back') {
+    await renderConfigDbGate(ctx, { title: '⚙️ Settings', backCallback: 'main:back' });
+    return;
+  }
   switch (action) {
     case 'ui': {
       const settings = await getCachedSettings();
@@ -3327,6 +3534,9 @@ async function handleGlobalSettingsCallback(ctx, data) {
     case 'bot_log_alerts':
       await renderSelfLogAlerts(ctx);
       break;
+    case 'pm_status':
+      await renderConfigDbStatus(ctx);
+      break;
     case 'bot_log_toggle': {
       const settings = await loadGlobalSettings();
       const current = getEffectiveSelfLogForwarding(settings);
@@ -3425,6 +3635,26 @@ async function handleGlobalSettingsCallback(ctx, data) {
       break;
     default:
       break;
+  }
+}
+
+async function handleConfigDbCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const [, action] = data.split(':');
+  if (action === 'retry') {
+    const triggered = triggerConfigDbWarmup('manual');
+    await ctx.answerCallbackQuery({
+      text: triggered ? '🔄 Retry started.' : '⏳ Retry already in progress.',
+      show_alert: false,
+    });
+    return;
+  }
+  if (action === 'error') {
+    const snapshot = getConfigDbSnapshot();
+    const message = snapshot.lastErrorMessage || 'No recent error recorded.';
+    const category = snapshot.lastErrorCategory || '-';
+    await sendEphemeralMessage(ctx, `🧾 Config DB error\nCategory: ${category}\n${message}`);
+    return;
   }
 }
 
@@ -4414,6 +4644,11 @@ async function handleEnvVaultCallback(ctx, data) {
 
   if (!projectId) {
     await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  if (!getConfigDbSnapshot().ready) {
+    await renderConfigDbGate(ctx, { title: '🔐 Env Vault', backCallback: `proj:open:${projectId}` });
     return;
   }
 
@@ -11093,6 +11328,10 @@ async function getProjectById(projectId, ctx) {
 }
 
 async function renderProjectSettings(ctx, projectId, notice) {
+  if (!getConfigDbSnapshot().ready) {
+    await renderConfigDbGate(ctx, { title: '📦 Project settings', backCallback: 'main:back' });
+    return;
+  }
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
@@ -16747,6 +16986,10 @@ async function toggleProjectCronAlertLevel(ctx, projectId, level) {
 }
 
 async function renderDataCenterMenu(ctx) {
+  if (!getConfigDbSnapshot().ready) {
+    await renderConfigDbGate(ctx, { title: '🗄️ Database', backCallback: 'main:back' });
+    return;
+  }
   const view = await buildDataCenterView();
   const keyboardRows = view.keyboard?.inline_keyboard?.length ?? 0;
   console.debug('[UI] Data center keyboard rows', { rows: keyboardRows, hasButtons: keyboardRows > 0 });
@@ -16938,6 +17181,17 @@ async function renderDataCenterMenuForMessage(messageContext) {
   if (!messageContext) {
     return;
   }
+  if (!getConfigDbSnapshot().ready) {
+    const view = buildConfigDbGateView({ title: '🗄️ Database', backCallback: 'main:back' });
+    try {
+      await bot.api.editMessageText(messageContext.chatId, messageContext.messageId, view.text, {
+        reply_markup: view.keyboard,
+      });
+    } catch (error) {
+      console.error('[UI] Failed to update data center message', error);
+    }
+    return;
+  }
   const view = await buildDataCenterView();
   try {
     await bot.api.editMessageText(
@@ -16952,6 +17206,10 @@ async function renderDataCenterMenuForMessage(messageContext) {
 }
 
 async function renderLogsProjectList(ctx, notice) {
+  if (!getConfigDbSnapshot().ready) {
+    await renderConfigDbGate(ctx, { title: '📣 Logs', backCallback: 'main:back' });
+    return;
+  }
   const projects = await loadProjects();
   const lines = [`${buildDegradedBanner()}📣 Logs`, notice || null, '', 'Select a project:'].filter(Boolean);
   const inline = new InlineKeyboard();
@@ -17010,6 +17268,10 @@ function formatRenderWebhookStatusLine(renderSettings, webhookSettings) {
 }
 
 async function renderDeploysProjectList(ctx, notice) {
+  if (!getConfigDbSnapshot().ready) {
+    await renderConfigDbGate(ctx, { title: '🚀 Deploys', backCallback: 'main:back' });
+    return;
+  }
   const projects = await loadProjects();
   const settings = await getCachedSettings();
   const renderSettings = resolveRenderGlobalSettings(settings);
@@ -17327,6 +17589,10 @@ async function handleDatabaseMenuCallback(ctx, data) {
 async function handleLogsMenuCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action, projectId] = data.split(':');
+  if (!getConfigDbSnapshot().ready && action !== 'list') {
+    await renderConfigDbGate(ctx, { title: '📣 Logs', backCallback: 'main:back' });
+    return;
+  }
   if (action === 'list') {
     await renderLogsProjectList(ctx);
     return;
@@ -17341,6 +17607,10 @@ async function handleLogsMenuCallback(ctx, data) {
 async function handleDeployCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action, projectId, extra] = data.split(':');
+  if (!getConfigDbSnapshot().ready && action !== 'list') {
+    await renderConfigDbGate(ctx, { title: '🚀 Deploys', backCallback: 'main:back' });
+    return;
+  }
   if (action === 'list') {
     await renderDeploysProjectList(ctx);
     return;
@@ -18001,6 +18271,10 @@ function buildGlobalSettingsView(settings, projects, notice) {
 }
 
 async function renderGlobalSettings(ctx, notice) {
+  if (!getConfigDbSnapshot().ready) {
+    await renderConfigDbGate(ctx, { title: '⚙️ Settings', backCallback: 'main:back' });
+    return;
+  }
   const settings = await loadGlobalSettings();
   const projects = await loadProjects();
   const view = buildGlobalSettingsView(settings, projects, notice);
@@ -18009,6 +18283,20 @@ async function renderGlobalSettings(ctx, notice) {
 
 async function renderGlobalSettingsForMessage(messageContext, notice) {
   if (!messageContext) return;
+  if (!getConfigDbSnapshot().ready) {
+    const view = buildConfigDbGateView({ title: '⚙️ Settings', backCallback: 'main:back' });
+    try {
+      await bot.api.editMessageText(
+        messageContext.chatId,
+        messageContext.messageId,
+        view.text,
+        normalizeTelegramExtra({ reply_markup: view.keyboard }),
+      );
+    } catch (error) {
+      console.error('[UI] Failed to update global settings message', error);
+    }
+    return;
+  }
   const settings = await loadGlobalSettings();
   const projects = await loadProjects();
   const view = buildGlobalSettingsView(settings, projects, notice);
@@ -18037,6 +18325,8 @@ function buildSettingsKeyboard() {
     .text('📦 Backups', 'gsettings:backups')
     .row()
     .text('📣 Bot log alerts', 'gsettings:bot_log_alerts')
+    .row()
+    .text('🩺 PM Status', 'gsettings:pm_status')
     .row()
     .text('📶 Ping test', 'gsettings:ping_test')
     .row()
@@ -20471,6 +20761,7 @@ function startHttpServer() {
           dbReady: appState.dbReady,
           degradedMode: appState.degradedMode,
           lastDbError: appState.lastDbError,
+          configDbState: getConfigDbSnapshot(),
         };
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(payload));
@@ -20875,8 +21166,8 @@ async function startBotPolling() {
 async function startBot() {
   console.error('[boot] starting bot init');
   await startHttpServer();
-  await refreshDbState();
-  console.error('[boot] db init ok');
+  startConfigDbWarmup();
+  console.error('[boot] db warmup started');
   await getCachedSettings(true);
   if (!LOG_API_ENABLED) {
     try {
