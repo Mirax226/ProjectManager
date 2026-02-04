@@ -1533,11 +1533,10 @@ async function resetToMainMenu(ctx, notice, options = {}) {
 
 async function handleReplyKeyboardNavigation(ctx, route) {
   resetUserState(ctx);
-  await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'reply_keyboard_nav');
   await clearEphemeralMessages(ctx, 'reply_keyboard_nav');
   const chatId = getChatIdFromCtx(ctx);
   const userId = ctx.from?.id;
-  return navigateTo(chatId, userId, route, { ctx });
+  return navigateTo(chatId, userId, route, { ctx, resetMenus: false, deleteIncomingMessage: true });
 }
 
 function buildMainMenuInlineKeyboard() {
@@ -1703,15 +1702,16 @@ const mainKeyboard = new Keyboard()
   .resized();
 
 const GLOBAL_COMMANDS = [
-  { command: 'project', description: '📦 Projects (Manage projects)' },
-  { command: 'database', description: '🗄️ Database (Project databases & env vault)' },
-  { command: 'cronjobs', description: '⏱ Cronjobs (Scheduled jobs)' },
-  { command: 'setting', description: '⚙️ Settings (Bot & workspace settings)' },
-  { command: 'logs', description: '📣 Logs (Logs & log tests)' },
-  { command: 'deploy', description: '🚀 Deploys (Deploy status & alerts)' },
+  { command: 'start', description: '🧭 Main menu' },
+  { command: 'project', description: '📦 Projects' },
+  { command: 'database', description: '🗄️ Database' },
+  { command: 'cronjobs', description: '⏱ Cronjobs' },
+  { command: 'setting', description: '⚙️ Settings' },
+  { command: 'logs', description: '📣 Logs' },
+  { command: 'deploy', description: '🚀 Deploys' },
 ];
 
-const GLOBAL_COMMAND_SCOPE = { type: 'all_private_chats' };
+const GLOBAL_COMMAND_SCOPES = [{ type: 'default' }, { type: 'all_private_chats' }];
 
 const GLOBAL_COMMAND_ALIASES = {
   '/setting': '/settings',
@@ -1771,8 +1771,14 @@ async function handleStartCommand(ctx, payload) {
   }
   await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'start_command');
   const chatId = getChatIdFromCtx(ctx);
-  const userId = ctx.from?.id;
-  await navigateTo(chatId, userId, route, { ctx, resetMenus: true });
+  resetUserState(ctx);
+  clearPatchSession(ctx.from?.id);
+  await clearPanelMessages(ctx, 'start_reset');
+  await clearEphemeralMessages(ctx, 'start_reset');
+  if (route !== 'main') {
+    console.warn('[navigation] Start payload ignored in favor of main menu.', { payload: payloadText });
+  }
+  await renderMainMenu(ctx);
   return true;
 }
 
@@ -1816,12 +1822,21 @@ function commandsMatch(current, desired) {
 
 async function registerGlobalCommands() {
   try {
-    const existing = await bot.api.getMyCommands({ scope: GLOBAL_COMMAND_SCOPE });
-    if (commandsMatch(existing, GLOBAL_COMMANDS)) {
+    let allConfigured = true;
+    for (const scope of GLOBAL_COMMAND_SCOPES) {
+      const existing = await bot.api.getMyCommands({ scope });
+      if (!commandsMatch(existing, GLOBAL_COMMANDS)) {
+        allConfigured = false;
+        break;
+      }
+    }
+    if (allConfigured) {
       console.log('[boot] Global commands already configured.');
       return;
     }
-    await bot.api.setMyCommands(GLOBAL_COMMANDS, { scope: GLOBAL_COMMAND_SCOPE });
+    for (const scope of GLOBAL_COMMAND_SCOPES) {
+      await bot.api.setMyCommands(GLOBAL_COMMANDS, { scope });
+    }
     console.log('[boot] Global commands registered.');
   } catch (error) {
     console.error('[boot] Failed to register global commands', error?.message || error);
@@ -3346,7 +3361,18 @@ async function handleGlobalSettingsCallback(ctx, data) {
       await renderGlobalSettings(ctx);
       break;
     case 'back':
-      await resetToMainMenu(ctx);
+      resetUserState(ctx);
+      clearPatchSession(ctx.from?.id);
+      try {
+        await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'main', {
+          ctx,
+          resetMenus: false,
+          deleteIncomingMessage: false,
+        });
+      } catch (error) {
+        console.warn('[navigation] Failed to return to main menu from settings', error?.message);
+        await renderMainMenu(ctx);
+      }
       break;
     default:
       break;
