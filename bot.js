@@ -260,6 +260,7 @@ const pendingLogTests = new Map();
 let httpServerPromise = null;
 let cachedSettings = null;
 let cachedSettingsAt = 0;
+const DB_OPERATION_TIMEOUT_MS = 5000;
 
 configureSelfLogger({
   bot,
@@ -359,9 +360,30 @@ function normalizeLogLevels(levels) {
   return levels.map((level) => normalizeLogLevel(level)).filter(Boolean);
 }
 
+async function withDbTimeout(promise, context) {
+  if (!promise || typeof promise.then !== 'function') return promise;
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error('DB_TIMEOUT');
+      error.code = 'DB_TIMEOUT';
+      error.context = context;
+      reject(error);
+    }, DB_OPERATION_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getCachedSettings(force = false) {
   const now = Date.now();
   if (!force && cachedSettings && now - cachedSettingsAt < 30_000) {
+    return cachedSettings;
+  }
+  if (!appState.dbReady || appState.degradedMode) {
     return cachedSettings;
   }
   cachedSettings = await loadGlobalSettings();
@@ -1504,7 +1526,13 @@ function appendChangeChunk(session, chunk, inputType) {
 }
 
 async function renderMainMenu(ctx) {
-  await renderPanel(ctx, '🧭 Main menu:', { reply_markup: buildMainMenuInlineKeyboard() });
+  await renderPanel(ctx, `${buildDegradedBanner()}🧭 Main menu:`, {
+    reply_markup: buildMainMenuInlineKeyboard(),
+  });
+}
+
+function buildDegradedBanner() {
+  return appState.degradedMode ? '⚠️ DB unavailable — running in degraded mode\n\n' : '';
 }
 
 async function resetToMainMenu(ctx, notice, options = {}) {
@@ -1636,16 +1664,16 @@ async function checkConfigDbStatus() {
         connectionString: dsn,
         max: 1,
         idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 10_000,
-        options: '-c statement_timeout=10000',
+        connectionTimeoutMillis: 5000,
+        options: '-c statement_timeout=5000',
       });
     }
-    await configStatusPool.query('SELECT 1');
+    await withDbTimeout(configStatusPool.query('SELECT 1'), 'config_status');
     return { ok: true, message: 'OK' };
   } catch (error) {
     const category = classifyDbError(error);
     if (category) {
-      recordDbError(category);
+      recordDbError(category, error?.message);
     }
     return { ok: false, message: error.message || 'error' };
   }
@@ -1679,13 +1707,11 @@ async function testConfigDbConnection() {
   if (status.ok) {
     runtimeStatus.configDbOk = true;
     runtimeStatus.configDbError = null;
-    setDbReady(true);
     console.log('Config DB: OK');
     return status;
   }
   runtimeStatus.configDbOk = false;
   runtimeStatus.configDbError = status.message || 'see logs';
-  setDbReady(false);
   if (status.message === 'not configured') {
     console.error('Config DB is not configured (PATH_APPLIER_CONFIG_DSN missing).');
     await forwardSelfLog('error', 'Config DB missing PATH_APPLIER_CONFIG_DSN', {
@@ -1698,6 +1724,15 @@ async function testConfigDbConnection() {
     context: { error: status.message },
   });
   return status;
+}
+
+async function refreshDbState() {
+  const status = await testConfigDbConnection();
+  const configOk = await initializeConfig();
+  const dbReady = Boolean(status?.ok && configOk);
+  setDbReady(dbReady);
+  setDegradedMode(!dbReady);
+  return dbReady;
 }
 
 const mainKeyboard = new Keyboard()
@@ -1789,6 +1824,9 @@ async function handleStartCommand(ctx, payload) {
     console.warn('[navigation] Start payload ignored in favor of main menu.', { payload: payloadText });
   }
   await renderMainMenu(ctx);
+  refreshDbState().catch((error) => {
+    console.warn('[db] refresh failed after /start', error?.message || error);
+  });
   return true;
 }
 
@@ -2365,14 +2403,15 @@ function buildProjectsKeyboard(projects, globalSettings) {
 async function renderProjectsList(ctx) {
   const projects = await loadProjects();
   const globalSettings = await loadGlobalSettings();
+  const banner = buildDegradedBanner();
   if (!projects.length) {
-    await renderOrEdit(ctx, 'No projects configured yet.', {
+    await renderOrEdit(ctx, `${banner}No projects configured yet.`, {
       reply_markup: buildProjectsKeyboard([], globalSettings),
     });
     return;
   }
 
-  await renderOrEdit(ctx, 'Select a project:', {
+  await renderOrEdit(ctx, `${banner}Select a project:`, {
     reply_markup: buildProjectsKeyboard(projects, globalSettings),
   });
 }
@@ -12574,7 +12613,7 @@ async function pollRenderDeploysOnce() {
       } catch (error) {
         const category = classifyDbError(error);
         if (category) {
-          recordDbError(category);
+          recordDbError(category, error?.message);
         }
         console.error('[render-poll] failed for service', {
           projectId: project.id,
@@ -12591,7 +12630,7 @@ async function pollRenderDeploysOnce() {
   } catch (error) {
     const category = classifyDbError(error);
     if (category) {
-      recordDbError(category);
+      recordDbError(category, error?.message);
     }
     console.error('[render-poll] tick failed', {
       category: category || 'unknown',
@@ -16858,7 +16897,7 @@ async function resolveProjectDbCardInfo(project) {
 
 async function buildDataCenterView() {
   const projects = await loadProjects();
-  const lines = ['🗄️ Database', `Status: ${appState.dbReady ? '✅ UP' : '🔴 DOWN'}`];
+  const lines = [`${buildDegradedBanner()}🗄️ Database`, `Status: ${appState.dbReady ? '✅ UP' : '🔴 DOWN'}`];
   if (appState.degradedMode) {
     lines.push('Mode: ⚠️ Degraded (config DB unavailable)');
   }
@@ -16914,7 +16953,7 @@ async function renderDataCenterMenuForMessage(messageContext) {
 
 async function renderLogsProjectList(ctx, notice) {
   const projects = await loadProjects();
-  const lines = ['📣 Logs', notice || null, '', 'Select a project:'].filter(Boolean);
+  const lines = [`${buildDegradedBanner()}📣 Logs`, notice || null, '', 'Select a project:'].filter(Boolean);
   const inline = new InlineKeyboard();
   inline.text('🧾 Projects needing log test', 'logtest:reminders').row();
   if (!projects.length) {
@@ -16975,7 +17014,9 @@ async function renderDeploysProjectList(ctx, notice) {
   const settings = await getCachedSettings();
   const renderSettings = resolveRenderGlobalSettings(settings);
   const webhookSettings = normalizeRenderWebhookSettings(settings);
-  const apiKeyStatus = await getRenderApiKeyStatus();
+  const apiKeyStatus = appState.degradedMode
+    ? { key: null, source: 'degraded' }
+    : await getRenderApiKeyStatus();
   const apiKeyLabel = apiKeyStatus.key
     ? `configured (${apiKeyStatus.source === 'env' ? 'env' : 'vault'})`
     : 'missing';
@@ -16987,7 +17028,7 @@ async function renderDeploysProjectList(ctx, notice) {
         .join(', ')}${unmapped.length > 3 ? '…' : ''}`
     : null;
   const lines = [
-    '🚀 Deploys',
+    `${buildDegradedBanner()}🚀 Deploys`,
     notice || null,
     '',
     formatRenderPollingStatusLine(renderSettings, apiKeyStatus),
@@ -19390,7 +19431,7 @@ async function initializeConfig() {
     console.error('Failed to load initial configuration', error);
     const category = classifyDbError(error);
     if (category) {
-      recordDbError(category);
+      recordDbError(category, error?.message);
     }
     setDbReady(false);
     return false;
@@ -20834,11 +20875,7 @@ async function startBotPolling() {
 async function startBot() {
   console.error('[boot] starting bot init');
   await startHttpServer();
-  const dbStatus = await testConfigDbConnection();
-  const configOk = await initializeConfig();
-  const dbReady = Boolean(dbStatus?.ok && configOk);
-  setDbReady(dbReady);
-  setDegradedMode(!dbReady);
+  await refreshDbState();
   console.error('[boot] db init ok');
   await getCachedSettings(true);
   if (!LOG_API_ENABLED) {

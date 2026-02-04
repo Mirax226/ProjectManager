@@ -1,9 +1,12 @@
 const { normalizeLogLevel } = require('./logLevels');
 const { addSelfLog } = require('./loggerStore');
+const { appState } = require('./appState');
 
 let botInstance = null;
 let adminTelegramId = null;
 let loadGlobalSettings = null;
+const SELF_LOG_FORWARDING = String(process.env.SELF_LOG_FORWARDING || 'enabled').toLowerCase();
+const SELF_LOG_FALLBACK = String(process.env.SELF_LOG_FALLBACK || 'console').toLowerCase();
 
 function configureSelfLogger({ bot, adminId, loadSettings }) {
   botInstance = bot;
@@ -34,27 +37,18 @@ function formatContext(context, limit) {
 
 async function forwardSelfLog(level, message, options = {}) {
   try {
-    await addSelfLog({
-      level,
-      message,
-      stack: options.stack,
-      context: options.context,
-    });
-    if (!botInstance || !loadGlobalSettings) return;
-    const settings = await loadGlobalSettings();
-    const forwarding = settings?.selfLogForwarding || {};
-    if (forwarding.enabled !== true) return;
+    if (appState.dbReady && !appState.degradedMode) {
+      await addSelfLog({
+        level,
+        message,
+        stack: options.stack,
+        context: options.context,
+      });
+    }
+
+    if (SELF_LOG_FORWARDING === 'disabled') return;
 
     const normalizedLevel = normalizeLogLevel(level) || 'error';
-    let allowedLevels = normalizeLogLevels(forwarding.levels);
-    if (!allowedLevels.length) {
-      allowedLevels = ['error'];
-    }
-    if (!allowedLevels.includes(normalizedLevel)) return;
-
-    const targetChatId = forwarding.targetChatId || adminTelegramId;
-    if (!targetChatId) return;
-
     const timestamp = new Date().toISOString();
     const lines = [
       `⚠️ [${normalizedLevel.toUpperCase()}] Project Manager`,
@@ -70,6 +64,31 @@ async function forwardSelfLog(level, message, options = {}) {
     if (contextText) {
       lines.push(`Context: ${contextText}`);
     }
+
+    if (!appState.dbReady || appState.degradedMode) {
+      if (SELF_LOG_FALLBACK === 'telegram' && botInstance && adminTelegramId) {
+        await botInstance.api.sendMessage(adminTelegramId, lines.join('\n'), {
+          disable_web_page_preview: true,
+        });
+        return;
+      }
+      console.error(lines.join('\n'));
+      return;
+    }
+
+    if (!botInstance || !loadGlobalSettings) return;
+    const settings = await loadGlobalSettings();
+    const forwarding = settings?.selfLogForwarding || {};
+    if (forwarding.enabled !== true) return;
+
+    let allowedLevels = normalizeLogLevels(forwarding.levels);
+    if (!allowedLevels.length) {
+      allowedLevels = ['error'];
+    }
+    if (!allowedLevels.includes(normalizedLevel)) return;
+
+    const targetChatId = forwarding.targetChatId || adminTelegramId;
+    if (!targetChatId) return;
 
     await botInstance.api.sendMessage(targetChatId, lines.join('\n'), {
       disable_web_page_preview: true,

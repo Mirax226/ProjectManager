@@ -2,16 +2,17 @@
 
 const { Pool } = require('pg');
 const { forwardSelfLog } = require('./logger');
-const { recordDbError, setDbReady } = require('./appState');
+const { appState, recordDbError } = require('./appState');
 
 let pool = null;
 let sslWarningEmitted = false;
 
 const DB_POOL_MAX = 5;
 const DB_IDLE_TIMEOUT_MS = 30_000;
-const DB_CONNECTION_TIMEOUT_MS = 10_000;
-const DB_STATEMENT_TIMEOUT_MS = 10_000;
+const DB_CONNECTION_TIMEOUT_MS = 5000;
+const DB_STATEMENT_TIMEOUT_MS = 5000;
 const DB_CONNECT_RETRIES = [500, 1000, 2000, 4000, 8000];
+const DB_OPERATION_TIMEOUT_MS = 5000;
 
 // Simple in-memory cache as fallback
 const memory = {
@@ -47,18 +48,20 @@ async function getPool() {
     });
 
     try {
-      await testPoolConnection(pool);
-      setDbReady(true);
-      await pool.query(`
+      await withDbTimeout(testPoolConnection(pool), 'pool_test');
+      await withDbTimeout(
+        pool.query(`
         CREATE TABLE IF NOT EXISTS path_config (
           key        TEXT PRIMARY KEY,
           data       JSONB NOT NULL,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-      `);
+      `),
+        'pool_init',
+      );
     } catch (error) {
       const category = classifyDbError(error);
-      recordDbError(category);
+      recordDbError(category, error?.message);
       console.error('[configStore] Failed to initialize config DB connection', {
         category: category || 'unknown',
         message: error?.message,
@@ -79,6 +82,9 @@ function classifyDbError(error) {
   }
   if (code === 'ETIMEDOUT' || message.includes('ETIMEDOUT')) {
     return 'ETIMEDOUT';
+  }
+  if (code === 'DB_TIMEOUT' || message.includes('DB_TIMEOUT')) {
+    return 'DB_TIMEOUT';
   }
   if (code === 'ECONNRESET' || message.includes('ECONNRESET')) {
     return 'ECONNRESET';
@@ -106,7 +112,28 @@ async function testPoolConnection(poolInstance) {
   throw lastError;
 }
 
+async function withDbTimeout(promise, context) {
+  if (!promise || typeof promise.then !== 'function') return promise;
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error('DB_TIMEOUT');
+      error.code = 'DB_TIMEOUT';
+      error.context = context;
+      reject(error);
+    }, DB_OPERATION_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function loadJson(key) {
+  if (appState.degradedMode) {
+    return memory[key] ?? null;
+  }
   const db = await getPool();
   if (!db) {
     return memory[key] ?? null;
@@ -114,10 +141,13 @@ async function loadJson(key) {
 
   let res;
   try {
-    res = await db.query('SELECT data FROM path_config WHERE key = $1', [key]);
+    res = await withDbTimeout(
+      db.query('SELECT data FROM path_config WHERE key = $1', [key]),
+      `load:${key}`,
+    );
   } catch (err) {
     const category = classifyDbError(err);
-    recordDbError(category);
+    recordDbError(category, err?.message);
     console.error(`[configStore] Failed to load ${key} from DB`, err);
     return memory[key] ?? null;
   }
@@ -138,25 +168,29 @@ async function loadJson(key) {
 async function saveJson(key, value) {
   memory[key] = value;
 
+  if (!appState.dbReady || appState.degradedMode) return;
+
   const db = await getPool();
   if (!db) return;
 
   const jsonText = JSON.stringify(value);
 
   try {
-    await db.query(
-      `
+    await withDbTimeout(
+      db.query(
+        `
         INSERT INTO path_config (key, data)
         VALUES ($1, $2::jsonb)
         ON CONFLICT (key)
         DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
       `,
-      [key, jsonText],
+        [key, jsonText],
+      ),
+      `save:${key}`,
     );
-    setDbReady(true);
   } catch (err) {
     const category = classifyDbError(err);
-    recordDbError(category);
+    recordDbError(category, err?.message);
     console.error(`[configStore] Failed to save ${key} to DB`, err);
   }
 }

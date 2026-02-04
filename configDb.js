@@ -1,6 +1,8 @@
 const { Pool } = require('pg');
 
 let pool = null;
+const DB_CONNECTION_TIMEOUT_MS = 5000;
+const DB_STATEMENT_TIMEOUT_MS = 5000;
 
 async function getConfigDbPool() {
   const dsn = process.env.PATH_APPLIER_CONFIG_DSN;
@@ -14,6 +16,8 @@ async function getConfigDbPool() {
       connectionString: dsn,
       max: 3,
       idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: DB_CONNECTION_TIMEOUT_MS,
+      options: `-c statement_timeout=${DB_STATEMENT_TIMEOUT_MS}`,
     });
   }
 

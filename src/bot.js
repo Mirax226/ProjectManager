@@ -49,13 +49,13 @@ async function main() {
       if (dbStatus?.message) {
         const category = classifyDbError(new Error(dbStatus.message));
         if (category) {
-          recordDbError(category);
+          recordDbError(category, dbStatus.message);
         }
       }
     } catch (error) {
       const category = classifyDbError(error);
       if (category) {
-        recordDbError(category);
+        recordDbError(category, error?.message);
       }
       console.warn('[boot] config init attempt failed', {
         attempt: attemptNumber,
