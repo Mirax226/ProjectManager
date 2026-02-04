@@ -11,6 +11,7 @@ const runtimeStatus = {
   vaultError: null,
   fatalError: null,
 };
+const { appState, recordDbError, setDbReady, setDegradedMode } = require('./appState');
 
 process.on('unhandledRejection', (reason) => {
   const error = reason instanceof Error ? reason : new Error(String(reason || 'Unhandled rejection'));
@@ -123,6 +124,7 @@ const {
 const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
+const { classifyDbError } = require('./configStore');
 const { listSelfLogs, getSelfLogById } = require('./loggerStore');
 const {
   DEFAULT_SETTINGS: DEFAULT_LOG_ALERT_SETTINGS,
@@ -350,6 +352,7 @@ const renderWebhookUnknownServiceNotices = new Map();
 const renderServiceDiscoveryCache = new Map();
 const renderPollingLocks = new Set();
 let renderPollTimer = null;
+let renderPollSkipLogAt = 0;
 
 function normalizeLogLevels(levels) {
   if (!Array.isArray(levels)) return [];
@@ -1633,11 +1636,17 @@ async function checkConfigDbStatus() {
         connectionString: dsn,
         max: 1,
         idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 10_000,
+        options: '-c statement_timeout=10000',
       });
     }
     await configStatusPool.query('SELECT 1');
     return { ok: true, message: 'OK' };
   } catch (error) {
+    const category = classifyDbError(error);
+    if (category) {
+      recordDbError(category);
+    }
     return { ok: false, message: error.message || 'error' };
   }
 }
@@ -1670,24 +1679,25 @@ async function testConfigDbConnection() {
   if (status.ok) {
     runtimeStatus.configDbOk = true;
     runtimeStatus.configDbError = null;
+    setDbReady(true);
     console.log('Config DB: OK');
     return status;
   }
   runtimeStatus.configDbOk = false;
   runtimeStatus.configDbError = status.message || 'see logs';
+  setDbReady(false);
   if (status.message === 'not configured') {
-    const errorMessage = 'Startup aborted: PATH_APPLIER_CONFIG_DSN not set.';
-    console.error(errorMessage);
+    console.error('Config DB is not configured (PATH_APPLIER_CONFIG_DSN missing).');
     await forwardSelfLog('error', 'Config DB missing PATH_APPLIER_CONFIG_DSN', {
       context: { error: status.message },
     });
-    throw new Error(errorMessage);
+    return status;
   }
   console.error('Config DB connection failed', status.message);
   await forwardSelfLog('error', 'Config DB connection failed', {
     context: { error: status.message },
   });
-  throw new Error(`Startup aborted: Config DB connection failed (${status.message})`);
+  return status;
 }
 
 const mainKeyboard = new Keyboard()
@@ -4595,6 +4605,9 @@ async function renderEnvVaultMenu(ctx, projectId) {
   const warnings = [];
   if (!process.env.PATH_APPLIER_CONFIG_DSN) {
     warnings.push('⚠️ Config DB is not configured; Env Vault is in-memory only.');
+  }
+  if (!appState.dbReady) {
+    warnings.push('⚠️ Config DB status: DOWN (degraded mode).');
   }
   const lines = [
     `🔐 Env Vault — ${project.name || project.id}`,
@@ -12493,6 +12506,14 @@ async function pollRenderDeploysOnce() {
   if (renderPollingLocks.has('tick')) return;
   renderPollingLocks.add('tick');
   try {
+    if (!appState.dbReady) {
+      const now = Date.now();
+      if (!renderPollSkipLogAt || now - renderPollSkipLogAt > 60_000) {
+        renderPollSkipLogAt = now;
+        console.warn('[render-poll] skipped: DB not ready');
+      }
+      return;
+    }
     const settings = resolveRenderGlobalSettings(await getCachedSettings());
     if (!settings.pollingEnabledGlobal) {
       return;
@@ -12551,6 +12572,10 @@ async function pollRenderDeploysOnce() {
           source: 'polling',
         });
       } catch (error) {
+        const category = classifyDbError(error);
+        if (category) {
+          recordDbError(category);
+        }
         console.error('[render-poll] failed for service', {
           projectId: project.id,
           serviceId,
@@ -12563,6 +12588,15 @@ async function pollRenderDeploysOnce() {
         });
       }
     }
+  } catch (error) {
+    const category = classifyDbError(error);
+    if (category) {
+      recordDbError(category);
+    }
+    console.error('[render-poll] tick failed', {
+      category: category || 'unknown',
+      error: error?.message || 'unknown error',
+    });
   } finally {
     renderPollingLocks.delete('tick');
   }
@@ -16824,7 +16858,11 @@ async function resolveProjectDbCardInfo(project) {
 
 async function buildDataCenterView() {
   const projects = await loadProjects();
-  const lines = ['🗄️ Database', '', 'Select a project:'];
+  const lines = ['🗄️ Database', `Status: ${appState.dbReady ? '✅ UP' : '🔴 DOWN'}`];
+  if (appState.degradedMode) {
+    lines.push('Mode: ⚠️ Degraded (config DB unavailable)');
+  }
+  lines.push('', 'Select a project:');
   const inline = new InlineKeyboard();
   if (!projects.length) {
     lines.push('', 'No projects configured yet.');
@@ -19350,18 +19388,25 @@ async function initializeConfig() {
     await loadCronSettings();
   } catch (error) {
     console.error('Failed to load initial configuration', error);
-    throw new Error('Startup aborted: failed to load initial configuration.');
+    const category = classifyDbError(error);
+    if (category) {
+      recordDbError(category);
+    }
+    setDbReady(false);
+    return false;
   }
+  return true;
 }
 
 async function loadConfig() {
-  await initializeConfig();
+  const ok = await initializeConfig();
   cachedSettings = await loadGlobalSettings();
   cachedSettingsAt = Date.now();
+  return ok;
 }
 
 async function initDb() {
-  await testConfigDbConnection();
+  return testConfigDbConnection();
 }
 
 async function initEnvVault() {
@@ -20382,6 +20427,9 @@ function startHttpServer() {
           vaultOk: runtimeStatus.vaultOk,
           vaultError: runtimeStatus.vaultError,
           logApi: getLogApiHealthStatus(),
+          dbReady: appState.dbReady,
+          degradedMode: appState.degradedMode,
+          lastDbError: appState.lastDbError,
         };
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(payload));
@@ -20786,9 +20834,12 @@ async function startBotPolling() {
 async function startBot() {
   console.error('[boot] starting bot init');
   await startHttpServer();
-  await testConfigDbConnection();
+  const dbStatus = await testConfigDbConnection();
+  const configOk = await initializeConfig();
+  const dbReady = Boolean(dbStatus?.ok && configOk);
+  setDbReady(dbReady);
+  setDegradedMode(!dbReady);
   console.error('[boot] db init ok');
-  await initializeConfig();
   await getCachedSettings(true);
   if (!LOG_API_ENABLED) {
     try {
@@ -20819,6 +20870,11 @@ module.exports = {
   loadConfig,
   initDb,
   initEnvVault,
+  appState,
+  setDbReady,
+  setDegradedMode,
+  recordDbError,
+  classifyDbError,
   respond,
   ensureAnswerCallback,
   validateWorkingDir,
