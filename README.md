@@ -103,3 +103,12 @@ If JSON is not convenient, send a plain text body; it will be treated as an erro
 4) Set `DATABASE_URL_PM` (preferred) or `PATH_APPLIER_CONFIG_DSN` on the PM service.
 5) Deploy PM with the new `DATABASE_URL_PM`.
 6) Verify counts and run a smoke check (mini-site + /healthz).
+
+## Ops & Reliability
+- **Config DB status UX:** main menu no longer shows `Config DB: Ready`; only degraded/down/misconfigured states are shown.
+- **Internal ops event log:** PM stores bounded internal reliability events (`ops_event_log`) with secret masking and uses those events for alert routing.
+- **Alert routing controls:** per-user alert preferences (`ops_user_alert_prefs`) support severity threshold, muted categories, and destination toggles (`admin_inbox`, `admin_room`, `admin_rob`) with rate limits/debounce.
+- **Muted categories by default:** `INVALID_URL`, `ENV_MISCONFIG`, and `MISSING_DSN` are internal-only and are never routed to Telegram alerts.
+- **DB health snapshot:** PM tracks `HEALTHY | DEGRADED | DOWN | MISCONFIG` and outage/recovery IDs (`ops_db_health_snapshot`).
+- **Recovery notice debounce:** on DB recovery, PM sends exactly one `✅ Config DB is back online.` per outage with a `✅ Readed` action for acknowledgment.
+- **Ping test upgrade:** Ping includes Config DB health, latency, and last error category hint.

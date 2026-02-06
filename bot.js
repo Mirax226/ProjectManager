@@ -18,6 +18,15 @@ const {
   snapshot: getConfigDbSnapshot,
 } = require('./configDbState');
 const { classifyDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
+const {
+  loadOpsState,
+  appendEvent,
+  getDbHealthSnapshot,
+  setDbHealthSnapshot,
+  getUserAlertPrefs,
+  shouldRouteEvent,
+  computeDestinations,
+} = require('./opsReliability');
 
 process.on('unhandledRejection', (reason) => {
   const error = reason instanceof Error ? reason : new Error(String(reason || 'Unhandled rejection'));
@@ -175,6 +184,8 @@ const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbac
 const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const ADMIN_TELEGRAM_ID = ADMIN_CHAT_ID || process.env.ADMIN_TELEGRAM_ID;
+const ADMIN_ROOM_CHAT_ID = process.env.ADMIN_ROOM_CHAT_ID || null;
+const ADMIN_ROB_CHAT_ID = process.env.ADMIN_ROB_CHAT_ID || null;
 const PORT = Number(process.env.PORT || 3000);
 const SUPABASE_ENV_VAULT_PROJECT_ID = 'supabase_connections';
 const SUPABASE_MESSAGE_LIMIT = 3500;
@@ -258,6 +269,8 @@ if (!ADMIN_TELEGRAM_ID) {
 }
 
 const bot = new Bot(BOT_TOKEN);
+const opsRecoveryMessages = new Map();
+let opsScannerTimer = null;
 const supabasePools = new Map();
 const envVaultPools = new Map();
 const miniSitePools = new Map();
@@ -1567,7 +1580,8 @@ function appendChangeChunk(session, chunk, inputType) {
 async function renderMainMenu(ctx) {
   const statusLine = buildConfigDbStatusLine();
   const banner = buildDegradedBanner();
-  await renderPanel(ctx, `${banner}${statusLine}\n🧭 Main menu:`, {
+  const prefix = statusLine ? `${statusLine}\n` : '';
+  await renderPanel(ctx, `${banner}${prefix}🧭 Main menu:`, {
     reply_markup: buildMainMenuInlineKeyboard(),
   });
 }
@@ -1581,16 +1595,11 @@ function buildDegradedBanner() {
 
 function buildConfigDbStatusLine() {
   const snapshot = getConfigDbSnapshot();
-  if (!process.env.DATABASE_URL_PM && !process.env.PATH_APPLIER_CONFIG_DSN) {
-    return '⚪️ Config DB: Not configured';
-  }
-  if (snapshot.ready) {
-    return '🟢 Config DB: Ready';
-  }
-  if (snapshot.nextRetryInMs > 0) {
-    return `🟡 Config DB: Not ready (retrying in ${formatRetryWindow(snapshot.nextRetryInMs)})`;
-  }
-  return '🔴 Config DB: Error (tap retry)';
+  if (snapshot.ready) return '';
+  if (!process.env.DATABASE_URL_PM && !process.env.PATH_APPLIER_CONFIG_DSN) return '🟡 Config DB: Misconfigured';
+  if (snapshot.lastErrorCategory === 'INVALID_URL') return '🟡 Config DB: Misconfigured';
+  if (snapshot.nextRetryInMs > 0) return '🟠 Config DB: Degraded';
+  return '🔴 Config DB: Down';
 }
 
 function formatRetryWindow(ms) {
@@ -1818,16 +1827,15 @@ async function testConfigDbConnection() {
   runtimeStatus.configDbOk = false;
   runtimeStatus.configDbError = status.message || 'see logs';
   if (!status.configured) {
-    console.error('Config DB is not configured (DATABASE_URL_PM/PATH_APPLIER_CONFIG_DSN missing).');
-    await forwardSelfLog('error', 'Config DB missing DATABASE_URL_PM/PATH_APPLIER_CONFIG_DSN', {
-      context: { error: status.message },
-    });
+    console.warn('Config DB is not configured (DATABASE_URL_PM/PATH_APPLIER_CONFIG_DSN missing).');
     return status;
   }
   console.error('Config DB connection failed', status.message);
-  await forwardSelfLog('error', 'Config DB connection failed', {
-    context: { error: status.message },
-  });
+  if (status.category !== 'INVALID_URL') {
+    await forwardSelfLog('error', 'Config DB connection failed', {
+      context: { error: status.message, category: status.category },
+    });
+  }
   return status;
 }
 
@@ -1888,6 +1896,12 @@ async function runConfigDbWarmup(reason = 'scheduled') {
         configDbLastLogCategory = 'UNKNOWN_DB_ERROR';
         configDbLastLogAttempt = configDbFailureStreak;
       }
+      await setDbHealthSnapshot({
+        status: 'MISCONFIG',
+        lastErrorCategory: 'MISSING_DSN',
+        lastErrorMessageMasked: message,
+      });
+      await emitOpsEvent('warn', 'ENV_MISCONFIG', 'Config DB DSN missing; running in memory mode.', { reason });
       setConfigDbNextRetry(0);
       return;
     }
@@ -1899,6 +1913,11 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       }
       setDbReady(true);
       setDegradedMode(false);
+      await setDbHealthSnapshot({
+        status: 'HEALTHY',
+        lastErrorCategory: null,
+        lastErrorMessageMasked: null,
+      });
       const configOk = await loadConfig();
       if (!configOk) {
         throw new Error('Config load failed');
@@ -1927,6 +1946,12 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       configDbLastLogCategory = category;
       configDbLastLogAttempt = configDbFailureStreak;
     }
+    await setDbHealthSnapshot({
+      status: category === 'INVALID_URL' ? 'MISCONFIG' : 'DOWN',
+      lastErrorCategory: category,
+      lastErrorMessageMasked: message,
+    });
+    await emitOpsEvent('warn', category, `Config DB warmup failed: ${message || 'unknown error'}`, { attempt: attemptCount, reason });
     const isDsnIssue = category === 'INVALID_URL' || isDsnAutoFixApplied();
     if (isDsnIssue) {
       configDbDsnIssueAttempts += 1;
@@ -1956,6 +1981,12 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       configDbLastLogCategory = category;
       configDbLastLogAttempt = configDbFailureStreak;
     }
+    await setDbHealthSnapshot({
+      status: category === 'INVALID_URL' ? 'MISCONFIG' : 'DOWN',
+      lastErrorCategory: category,
+      lastErrorMessageMasked: message,
+    });
+    await emitOpsEvent('error', category, `Config DB warmup exception: ${message || 'unknown error'}`, { attempt: attemptCount, reason });
     const isDsnIssue = category === 'INVALID_URL' || isDsnAutoFixApplied();
     if (isDsnIssue) {
       configDbDsnIssueAttempts += 1;
@@ -1988,6 +2019,69 @@ function triggerConfigDbWarmup(reason = 'manual') {
   configDbManualRetryAt = now;
   scheduleConfigDbWarmup(0, reason);
   return true;
+}
+
+
+async function sendOpsAlertByDestinations(destinations, text, extra = {}) {
+  const sends = [];
+  if (destinations.admin_inbox && ADMIN_TELEGRAM_ID) {
+    sends.push(bot.api.sendMessage(ADMIN_TELEGRAM_ID, text, extra));
+  }
+  if (destinations.admin_room && ADMIN_ROOM_CHAT_ID) {
+    sends.push(bot.api.sendMessage(ADMIN_ROOM_CHAT_ID, text, extra));
+  }
+  if (destinations.admin_rob && ADMIN_ROB_CHAT_ID) {
+    sends.push(bot.api.sendMessage(ADMIN_ROB_CHAT_ID, text, extra));
+  }
+  if (!sends.length) return [];
+  return Promise.allSettled(sends);
+}
+
+async function routeOpsAlert(event) {
+  const prefs = await getUserAlertPrefs(ADMIN_TELEGRAM_ID || 'admin');
+  if (!shouldRouteEvent(prefs, event)) return;
+  const destinations = computeDestinations(prefs, event.level);
+  const text = `⚠️ [${String(event.level || 'warn').toUpperCase()}] ${event.category}\n${event.message_short}`;
+  await sendOpsAlertByDestinations(destinations, text, { disable_web_page_preview: true });
+}
+
+async function emitOpsEvent(level, category, message, meta) {
+  const event = await appendEvent({ level, category, messageShort: message, source: 'config-db', meta });
+  await routeOpsAlert(event);
+}
+
+async function sendRecoveryNotificationOnce() {
+  const snapshot = getDbHealthSnapshot();
+  if (!snapshot.lastOutageId) return;
+  if (snapshot.lastRecoveryNotifiedOutageId >= snapshot.lastOutageId) return;
+  const prefs = await getUserAlertPrefs(ADMIN_TELEGRAM_ID || 'admin');
+  const destinations = computeDestinations(prefs, 'critical');
+  const key = `ops:recover:${snapshot.lastOutageId}`;
+  const inline = new InlineKeyboard().text('✅ Readed', key);
+  const targets = [];
+  if (destinations.admin_inbox && ADMIN_TELEGRAM_ID) targets.push(ADMIN_TELEGRAM_ID);
+  if (destinations.admin_room && ADMIN_ROOM_CHAT_ID) targets.push(ADMIN_ROOM_CHAT_ID);
+  if (destinations.admin_rob && ADMIN_ROB_CHAT_ID) targets.push(ADMIN_ROB_CHAT_ID);
+  for (const chatId of targets) {
+    try {
+      const msg = await bot.api.sendMessage(chatId, '✅ Config DB is back online.', { reply_markup: inline });
+      opsRecoveryMessages.set(`${snapshot.lastOutageId}:${chatId}`, { chatId, messageId: msg.message_id });
+    } catch (error) {
+      console.warn('[ops] failed to send recovery notification', error?.message || error);
+    }
+  }
+  await setDbHealthSnapshot({ lastRecoveryNotifiedOutageId: snapshot.lastOutageId });
+}
+
+async function startOpsScanner() {
+  if (opsScannerTimer) return;
+  opsScannerTimer = setInterval(() => {
+    const snap = getDbHealthSnapshot();
+    if (snap.status === 'HEALTHY') {
+      sendRecoveryNotificationOnce().catch((error) => console.warn('[ops] recovery notify failed', error?.message || error));
+    }
+  }, 15_000);
+  if (typeof opsScannerTimer.unref === 'function') opsScannerTimer.unref();
 }
 
 const mainKeyboard = new Keyboard()
@@ -2427,6 +2521,20 @@ bot.callbackQuery('change:apply', wrapCallbackHandler(async (ctx) => {
   await ensureAnswerCallback(ctx);
   await applyChangesInRepo(ctx, session.projectId, { mode: 'unstructured', plan: session.plan });
 }, 'change_apply'));
+
+bot.callbackQuery(/ops:recover:(.+)/, wrapCallbackHandler(async (ctx) => {
+  await ensureAnswerCallback(ctx);
+  const outageId = String(ctx.match[1] || '');
+  const chatId = String(ctx.callbackQuery?.message?.chat?.id || '');
+  const msgId = ctx.callbackQuery?.message?.message_id;
+  try {
+    await bot.api.deleteMessage(chatId, msgId);
+  } catch (_error) {
+    await bot.api.editMessageReplyMarkup(chatId, msgId, { reply_markup: undefined }).catch(() => null);
+    await bot.api.editMessageText(chatId, msgId, '✅ Config DB is back online. Acknowledged').catch(() => null);
+  }
+  opsRecoveryMessages.delete(`${outageId}:${chatId}`);
+}, 'ops_recover_ack'));
 
 bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
   const resolved = await resolveCallbackData(ctx.callbackQuery.data);
@@ -19144,6 +19252,9 @@ async function runPingTest(ctx) {
   const cronCheck = await checkCronApi();
   addCheck(cronCheck.status, 'Cron API', cronCheck.detail, cronCheck.hint);
 
+  const configDbCheck = await checkConfigDbHealthForPing();
+  addCheck(configDbCheck.status, 'Config DB', configDbCheck.detail, configDbCheck.hint);
+
   const telegramCheck = await checkTelegramSetup(defaultProject);
   addCheck(telegramCheck.status, 'Telegram', telegramCheck.detail, telegramCheck.hint);
 
@@ -19157,6 +19268,22 @@ async function runPingTest(ctx) {
   }
   inline.row().text('⬅️ Back', 'gsettings:menu');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function checkConfigDbHealthForPing() {
+  const startedAt = Date.now();
+  const status = await probeConfigDbConnection();
+  const latencyMs = Date.now() - startedAt;
+  const health = getDbHealthSnapshot();
+  if (status.ok) {
+    return { status: 'ok', detail: `OK (${latencyMs}ms)` };
+  }
+  const category = status.category || health.lastErrorCategory || 'unknown';
+  return {
+    status: 'warn',
+    detail: `DOWN (${latencyMs}ms)`,
+    hint: `Last error: ${category}`,
+  };
 }
 
 async function checkGitBinary() {
@@ -21687,8 +21814,10 @@ async function startBotPolling() {
 
 async function startBot() {
   console.error('[boot] starting bot init');
+  await loadOpsState();
   await startHttpServer();
   startConfigDbWarmup();
+  await startOpsScanner();
   console.error('[boot] db warmup started');
   await getCachedSettings(true);
   if (!LOG_API_ENABLED) {
