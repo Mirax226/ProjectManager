@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { maskDsn, tryFixPostgresDsn } = require('../configDb');
-const { shouldRouteEvent, computeDestinations } = require('../opsReliability');
+const { shouldRouteEvent, computeDestinations, shouldNotifyRecovery } = require('../opsReliability');
 
 test('maskDsn masks password and preserves host/db', () => {
   const input = 'postgres://user:SuperSecret1234@db.example.com:5432/appdb?sslmode=require';
@@ -36,4 +36,11 @@ test('critical destination mapping includes admin_rob when enabled', () => {
   const prefs = { destinations: { admin_inbox: true, admin_room: true, admin_rob: true } };
   const destinations = computeDestinations(prefs, 'critical');
   assert.deepEqual(destinations, { admin_inbox: true, admin_room: true, admin_rob: true });
+});
+
+
+test('recovery notification debounce allows only one notification per outage', () => {
+  assert.equal(shouldNotifyRecovery({ status: 'HEALTHY', lastOutageId: 2, lastRecoveryNotifiedOutageId: 1 }), true);
+  assert.equal(shouldNotifyRecovery({ status: 'HEALTHY', lastOutageId: 2, lastRecoveryNotifiedOutageId: 2 }), false);
+  assert.equal(shouldNotifyRecovery({ status: 'DOWN', lastOutageId: 2, lastRecoveryNotifiedOutageId: 1 }), false);
 });

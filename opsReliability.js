@@ -142,6 +142,12 @@ function computeDestinations(prefs, eventLevel) {
   };
 }
 
+function shouldNotifyRecovery(snapshot) {
+  if (!snapshot?.lastOutageId) return false;
+  if (snapshot.status !== 'HEALTHY') return false;
+  return (snapshot.lastRecoveryNotifiedOutageId || 0) < snapshot.lastOutageId;
+}
+
 module.exports = {
   NON_REPORTABLE,
   loadOpsState,
@@ -153,4 +159,5 @@ module.exports = {
   getUserAlertPrefs,
   shouldRouteEvent,
   computeDestinations,
+  shouldNotifyRecovery,
 };

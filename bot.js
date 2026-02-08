@@ -26,6 +26,7 @@ const {
   getUserAlertPrefs,
   shouldRouteEvent,
   computeDestinations,
+  shouldNotifyRecovery,
 } = require('./opsReliability');
 
 process.on('unhandledRejection', (reason) => {
@@ -78,6 +79,7 @@ const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 const { Bot, InlineKeyboard, Keyboard, InputFile } = require('grammy');
 const { Pool } = require('pg');
+const { ProgressReporter } = require('./progressReporter');
 
 const { loadProjects, saveProjects, findProjectById } = require('./projectsStore');
 const { setUserState, getUserState, clearUserState } = require('./state');
@@ -233,6 +235,7 @@ const WEB_DASHBOARD_SESSION_TTL_MINUTES = 20;
 const WEB_DASHBOARD_LOGIN_WINDOW_MS = 60_000;
 const WEB_DASHBOARD_LOGIN_MAX_ATTEMPTS = 5;
 const WEB_DASHBOARD_LOGIN_BLOCK_MS = 5 * 60_000;
+const CONFIG_DB_MAX_RETRIES_PER_BOOT = Number(process.env.CONFIG_DB_MAX_RETRIES_PER_BOOT || 20);
 const WEB_DASHBOARD_ASSETS_DIR = path.join(__dirname, 'src', 'web');
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
 const LOG_API_ADMIN_CHAT_ID =
@@ -1877,6 +1880,11 @@ function computeConfigDbBackoff(attempt) {
   return Math.min(max, raw) + jitter;
 }
 
+function shouldHaltConfigDbRetries() {
+  if (!Number.isFinite(CONFIG_DB_MAX_RETRIES_PER_BOOT) || CONFIG_DB_MAX_RETRIES_PER_BOOT <= 0) return false;
+  return configDbFailureStreak >= CONFIG_DB_MAX_RETRIES_PER_BOOT;
+}
+
 async function runConfigDbWarmup(reason = 'scheduled') {
   if (configDbWarmupInFlight || configDbWarmupHaltedForBoot) return;
   configDbWarmupInFlight = true;
@@ -1962,6 +1970,15 @@ async function runConfigDbWarmup(reason = 'scheduled') {
         return;
       }
     }
+    if (shouldHaltConfigDbRetries()) {
+      configDbWarmupHaltedForBoot = true;
+      setConfigDbNextRetry(0);
+      await emitOpsEvent('error', 'DB_RETRY_EXHAUSTED', 'Config DB warmup retries exhausted for this boot.', {
+        attempts: configDbFailureStreak,
+      });
+      console.warn('[db] Config DB retries exhausted for this boot; continuing in degraded mode.');
+      return;
+    }
     const delayMs = computeConfigDbBackoff(configDbFailureStreak);
     scheduleConfigDbWarmup(delayMs, 'retry');
   } catch (error) {
@@ -1996,6 +2013,15 @@ async function runConfigDbWarmup(reason = 'scheduled') {
         console.warn('[db] Config DB unavailable after DSN auto-fix attempt; running in-memory config mode for this boot.');
         return;
       }
+    }
+    if (shouldHaltConfigDbRetries()) {
+      configDbWarmupHaltedForBoot = true;
+      setConfigDbNextRetry(0);
+      await emitOpsEvent('error', 'DB_RETRY_EXHAUSTED', 'Config DB warmup retries exhausted for this boot.', {
+        attempts: configDbFailureStreak,
+      });
+      console.warn('[db] Config DB retries exhausted for this boot; continuing in degraded mode.');
+      return;
     }
     const delayMs = computeConfigDbBackoff(configDbFailureStreak);
     scheduleConfigDbWarmup(delayMs, 'retry');
@@ -2052,8 +2078,7 @@ async function emitOpsEvent(level, category, message, meta) {
 
 async function sendRecoveryNotificationOnce() {
   const snapshot = getDbHealthSnapshot();
-  if (!snapshot.lastOutageId) return;
-  if (snapshot.lastRecoveryNotifiedOutageId >= snapshot.lastOutageId) return;
+  if (!shouldNotifyRecovery(snapshot)) return;
   const prefs = await getUserAlertPrefs(ADMIN_TELEGRAM_ID || 'admin');
   const destinations = computeDestinations(prefs, 'critical');
   const key = `ops:recover:${snapshot.lastOutageId}`;
@@ -19182,92 +19207,164 @@ async function renderSelfLogDetail(ctx, logId, page) {
 
 async function runPingTest(ctx) {
   const checks = [];
-  const projects = await loadProjects();
-  const globalSettings = await loadGlobalSettings();
-  const defaultProject =
-    (globalSettings.defaultProjectId && findProjectById(projects, globalSettings.defaultProjectId)) ||
-    projects[0];
+  const progress = new ProgressReporter({
+    bot,
+    chatId: ctx.chat?.id,
+    initialText: '⏳ Running Ping test…',
+    totalSteps: 9,
+  });
+  await progress.start();
+  try {
+    const projects = await loadProjects();
+    const globalSettings = await loadGlobalSettings();
+    const defaultProject =
+      (globalSettings.defaultProjectId && findProjectById(projects, globalSettings.defaultProjectId)) ||
+      projects[0];
 
-  const addCheck = (status, label, detail, hint) => {
-    checks.push({ status, label, detail, hint });
-  };
+    const addCheck = (status, label, detail, hint) => {
+      checks.push({ status, label, detail, hint });
+    };
 
-  const formatCheck = (check) => {
-    const icon = check.status === 'ok' ? '✅' : check.status === 'warn' ? '⚠️' : '❌';
-    const detail = check.detail ? ` — ${check.detail}` : '';
-    const hint = check.hint ? `\n   ↳ ${check.hint}` : '';
-    return `${icon} ${check.label}${detail}${hint}`;
-  };
+    const formatCheck = (check) => {
+      const icon = check.status === 'ok' ? '✅' : check.status === 'warn' ? '⚠️' : '❌';
+      const detail = check.detail ? ` — ${check.detail}` : '';
+      const hint = check.hint ? `
+   ↳ ${check.hint}` : '';
+      return `${icon} ${check.label}${detail}${hint}`;
+    };
 
-  const gitVersion = await checkGitBinary();
-  if (gitVersion.ok) {
-    addCheck('ok', 'Git binary', gitVersion.detail);
-  } else {
-    addCheck('fail', 'Git binary', gitVersion.detail, 'Install git in the runtime environment.');
+    await progress.step('Checking Git binary');
+    const gitVersion = await checkGitBinary();
+    if (gitVersion.ok) {
+      addCheck('ok', 'Git binary', gitVersion.detail);
+    } else {
+      addCheck('fail', 'Git binary', gitVersion.detail, 'Install git in the runtime environment.');
+    }
+
+    if (!defaultProject) {
+      addCheck('fail', 'Project', 'No project configured', 'Add a project and set repo slug.');
+    } else {
+      addCheck('ok', 'Project', `${defaultProject.name || defaultProject.id}`);
+    }
+
+    let repoInfo = null;
+    if (defaultProject) {
+      try {
+        repoInfo = getRepoInfo(defaultProject);
+        addCheck('ok', 'Repo configured', repoInfo.repoSlug);
+      } catch (error) {
+        addCheck('fail', 'Repo configured', error.message, 'Set owner/repo in project settings.');
+      }
+    }
+
+    await progress.step('Resolving GitHub token and API');
+    const tokenInfo = defaultProject
+      ? await resolveGithubToken(defaultProject)
+      : { token: null, source: null, error: 'no project' };
+    if (!tokenInfo.token) {
+      addCheck('fail', 'GitHub token', tokenInfo.error || 'missing', 'Set GITHUB_TOKEN or configure env vault.');
+    } else {
+      addCheck('ok', 'GitHub token', `${tokenInfo.source} (${tokenInfo.key})`);
+    }
+
+    if (repoInfo) {
+      const apiCheck = await checkGithubApi(repoInfo, tokenInfo.token);
+      addCheck(apiCheck.status, 'GitHub API', apiCheck.detail, apiCheck.hint);
+
+      const workingDirCheck = await checkWorkingDir(defaultProject, repoInfo.workingDir);
+      addCheck(workingDirCheck.status, 'Working dir', workingDirCheck.detail, workingDirCheck.hint);
+
+      const baseBranch = defaultProject?.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+      const branchCheck = await checkRemoteBranch(repoInfo.repoUrl, tokenInfo.token, baseBranch);
+      addCheck(branchCheck.status, 'Base branch', branchCheck.detail, branchCheck.hint);
+
+      const fetchCheck = await checkGitFetch(repoInfo.repoUrl, tokenInfo.token, baseBranch);
+      addCheck(fetchCheck.status, 'Git fetch', fetchCheck.detail, fetchCheck.hint);
+    }
+
+    await progress.step('Checking Supabase links');
+    const supabaseCheck = await checkSupabaseConnections();
+    supabaseCheck.forEach((entry) => addCheck(entry.status, entry.label, entry.detail, entry.hint));
+
+    await progress.step('Checking Cron API');
+    const cronCheck = await checkCronApi();
+    addCheck(cronCheck.status, 'Cron API', cronCheck.detail, cronCheck.hint);
+
+    await progress.step('Checking Config DB health');
+    const configDbCheck = await checkConfigDbHealthForPing();
+    addCheck(configDbCheck.status, 'Config DB (primary)', configDbCheck.detail, configDbCheck.hint);
+    if (configDbCheck.secondary) {
+      addCheck(
+        configDbCheck.secondary.status,
+        'Config DB (secondary)',
+        configDbCheck.secondary.detail,
+        configDbCheck.secondary.hint,
+      );
+    }
+
+    await progress.step('Checking Telegram setup');
+    const telegramCheck = await checkTelegramSetup(defaultProject);
+    addCheck(telegramCheck.status, 'Telegram', telegramCheck.detail, telegramCheck.hint);
+
+    await progress.step('Building report');
+    const lines = ['📶 Ping test', '', ...checks.map(formatCheck)];
+    const inline = new InlineKeyboard().text('🔁 Retry', 'gsettings:ping_test');
+    if (defaultProject?.id) {
+      inline
+        .row()
+        .text('📝 Fix repo', `proj:edit_repo:${defaultProject.id}`)
+        .text('🔑 Fix token', `proj:edit_github_token:${defaultProject.id}`);
+    }
+    inline.row().text('⬅️ Back', 'gsettings:menu');
+    await renderOrEdit(ctx, lines.join('\\n'), { reply_markup: inline });
+  } finally {
+    await progress.done();
   }
+}
 
-  if (!defaultProject) {
-    addCheck('fail', 'Project', 'No project configured', 'Add a project and set repo slug.');
-  } else {
-    addCheck('ok', 'Project', `${defaultProject.name || defaultProject.id}`);
-  }
 
-  let repoInfo = null;
-  if (defaultProject) {
+async function probeAdhocDbHealth(dsn) {
+  if (!dsn) return null;
+  const startedAt = Date.now();
+  let pool;
+  try {
+    pool = new Pool({
+      connectionString: dsn,
+      max: 1,
+      idleTimeoutMillis: 2_000,
+      connectionTimeoutMillis: 5_000,
+      options: '-c statement_timeout=4000',
+      keepAlive: true,
+    });
+    let timer;
     try {
-      repoInfo = getRepoInfo(defaultProject);
-      addCheck('ok', 'Repo configured', repoInfo.repoSlug);
-    } catch (error) {
-      addCheck('fail', 'Repo configured', error.message, 'Set owner/repo in project settings.');
+      await Promise.race([
+        pool.query('SELECT 1'),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const err = new Error('DB_TIMEOUT');
+            err.code = 'DB_TIMEOUT';
+            reject(err);
+          }, 5000);
+          if (typeof timer.unref === 'function') timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    return { ok: true, latencyMs: Date.now() - startedAt, category: null };
+  } catch (error) {
+    return {
+      ok: false,
+      latencyMs: Date.now() - startedAt,
+      category: classifyDbError(error),
+      message: sanitizeDbErrorMessage(error?.message) || 'connection failed',
+    };
+  } finally {
+    if (pool) {
+      await pool.end().catch(() => null);
     }
   }
-
-  const tokenInfo = defaultProject
-    ? await resolveGithubToken(defaultProject)
-    : { token: null, source: null, error: 'no project' };
-  if (!tokenInfo.token) {
-    addCheck('fail', 'GitHub token', tokenInfo.error || 'missing', 'Set GITHUB_TOKEN or configure env vault.');
-  } else {
-    addCheck('ok', 'GitHub token', `${tokenInfo.source} (${tokenInfo.key})`);
-  }
-
-  if (repoInfo) {
-    const apiCheck = await checkGithubApi(repoInfo, tokenInfo.token);
-    addCheck(apiCheck.status, 'GitHub API', apiCheck.detail, apiCheck.hint);
-
-    const workingDirCheck = await checkWorkingDir(defaultProject, repoInfo.workingDir);
-    addCheck(workingDirCheck.status, 'Working dir', workingDirCheck.detail, workingDirCheck.hint);
-
-    const baseBranch = defaultProject?.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
-    const branchCheck = await checkRemoteBranch(repoInfo.repoUrl, tokenInfo.token, baseBranch);
-    addCheck(branchCheck.status, 'Base branch', branchCheck.detail, branchCheck.hint);
-
-    const fetchCheck = await checkGitFetch(repoInfo.repoUrl, tokenInfo.token, baseBranch);
-    addCheck(fetchCheck.status, 'Git fetch', fetchCheck.detail, fetchCheck.hint);
-  }
-
-  const supabaseCheck = await checkSupabaseConnections();
-  supabaseCheck.forEach((entry) => addCheck(entry.status, entry.label, entry.detail, entry.hint));
-
-  const cronCheck = await checkCronApi();
-  addCheck(cronCheck.status, 'Cron API', cronCheck.detail, cronCheck.hint);
-
-  const configDbCheck = await checkConfigDbHealthForPing();
-  addCheck(configDbCheck.status, 'Config DB', configDbCheck.detail, configDbCheck.hint);
-
-  const telegramCheck = await checkTelegramSetup(defaultProject);
-  addCheck(telegramCheck.status, 'Telegram', telegramCheck.detail, telegramCheck.hint);
-
-  const lines = ['📶 Ping test', '', ...checks.map(formatCheck)];
-  const inline = new InlineKeyboard().text('🔁 Retry', 'gsettings:ping_test');
-  if (defaultProject?.id) {
-    inline
-      .row()
-      .text('📝 Fix repo', `proj:edit_repo:${defaultProject.id}`)
-      .text('🔑 Fix token', `proj:edit_github_token:${defaultProject.id}`);
-  }
-  inline.row().text('⬅️ Back', 'gsettings:menu');
-  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function checkConfigDbHealthForPing() {
@@ -19275,16 +19372,28 @@ async function checkConfigDbHealthForPing() {
   const status = await probeConfigDbConnection();
   const latencyMs = Date.now() - startedAt;
   const health = getDbHealthSnapshot();
-  if (status.ok) {
-    return { status: 'ok', detail: `OK (${latencyMs}ms)` };
+  const response = status.ok
+    ? { status: 'ok', detail: `OK (${latencyMs}ms)` }
+    : {
+      status: 'warn',
+      detail: `DOWN (${latencyMs}ms)`,
+      hint: `Last error: ${status.category || health.lastErrorCategory || 'unknown'}`,
+    };
+
+  const secondaryDsn = process.env.DATABASE_URL_PM_SECONDARY || process.env.PATH_APPLIER_CONFIG_DSN_SECONDARY;
+  if (secondaryDsn) {
+    const secondary = await probeAdhocDbHealth(secondaryDsn);
+    response.secondary = secondary?.ok
+      ? { status: 'ok', detail: `OK (${secondary.latencyMs}ms)` }
+      : {
+        status: 'warn',
+        detail: `DOWN (${secondary?.latencyMs || '-'}ms)`,
+        hint: `Last error: ${secondary?.category || 'unknown'}`,
+      };
   }
-  const category = status.category || health.lastErrorCategory || 'unknown';
-  return {
-    status: 'warn',
-    detail: `DOWN (${latencyMs}ms)`,
-    hint: `Last error: ${category}`,
-  };
+  return response;
 }
+
 
 async function checkGitBinary() {
   try {
@@ -21873,6 +21982,11 @@ module.exports = {
     getActivePanelMessageId,
     clearActivePanelMessageId,
     setPanelHistoryForChat,
+    setConfigDbFailureStreakForTests: (value) => {
+      configDbFailureStreak = Number(value) || 0;
+    },
+    shouldHaltConfigDbRetries,
+    configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
   },
 };
 
