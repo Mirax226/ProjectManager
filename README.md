@@ -120,3 +120,24 @@ If JSON is not convenient, send a plain text body; it will be treated as an erro
 - **Safety checks:** secret redaction tests expanded for DSN/password/token masking; recovery debounce explicitly unit-tested so outage recovery alert is sent once per outage cycle.
 - **How to verify:** run `npm test`, run Ping Test from Settings (observe progress + DB lines), and boot without `DATABASE_URL_PM` to confirm degraded mode without crash loops.
 
+
+## Telegram UX updates
+- Main menu panels are tracked per `chatId:userId` with a persistent registry (`menuMessageRegistry`) when Config DB is available; stale old menus are deleted or keyboard-disabled.
+- Secondary confirmation messages now include a `🗑 Delete` action that is owner-scoped.
+- Project creation confirmation format now uses:
+  - `✅ Project created.`
+  - `🏷️ Name: ...`
+  - `🆔 ID: ...`
+
+## Repo picker (token-first)
+- Create Project flow now asks for GitHub PAT first.
+- After validation, repos are listed as inline buttons with pagination (`Prev/Next`).
+- Repo is selected by button click; manual `owner/repo` typing is no longer required in that step.
+- Every wizard step includes `◀️ Back` + `❌ Cancel`.
+
+## Multi-DB sync/migration engine primitives
+- Added core sync/migration utilities in `src/dbSyncEngine.js`:
+  - Last-write-wins conflict resolver (`updated_at`)
+  - Batch partitioning for large-copy operations
+  - Pair sync diff helper
+- These functions are covered by unit tests and are ready to be wired into project DB UI actions (`Sync now`, `Migrate DB`).

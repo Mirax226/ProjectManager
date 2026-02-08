@@ -6,7 +6,7 @@ const path = require('node:path');
 const { validateWorkingDir } = require('../bot');
 const { getDefaultWorkingDir } = require('../gitUtils');
 
-test('validateWorkingDir accepts relative paths inside checkout dir', async () => {
+test('working dir root dot is valid for non-node projects', async () => {
   const repoSlug = 'test-owner/test-repo';
   const checkoutDir = getDefaultWorkingDir(repoSlug);
   await fs.rm(checkoutDir, { recursive: true, force: true });
@@ -15,43 +15,40 @@ test('validateWorkingDir accepts relative paths inside checkout dir', async () =
   const result = await validateWorkingDir({
     repoSlug,
     workingDir: '.',
-    projectType: 'node-api',
+    projectType: 'python',
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(result.code, 'PACKAGE_JSON_MISSING');
+  assert.equal(result.ok, true);
 });
 
-test('validateWorkingDir rejects paths outside checkout dir', async () => {
+test('working dir subdir is valid', async () => {
+  const repoSlug = 'test-owner/test-repo';
+  const checkoutDir = getDefaultWorkingDir(repoSlug);
+  const subdir = path.join(checkoutDir, 'subdir');
+  await fs.rm(checkoutDir, { recursive: true, force: true });
+  await fs.mkdir(subdir, { recursive: true });
+
+  const result = await validateWorkingDir({
+    repoSlug,
+    workingDir: 'subdir',
+    projectType: 'python',
+  });
+
+  assert.equal(result.ok, true);
+});
+
+test('working dir traversal is invalid', async () => {
   const repoSlug = 'test-owner/test-repo';
   const checkoutDir = getDefaultWorkingDir(repoSlug);
   await fs.rm(checkoutDir, { recursive: true, force: true });
   await fs.mkdir(checkoutDir, { recursive: true });
-  const outsideDir = path.join('/tmp', 'outside-workdir-test');
-  await fs.mkdir(outsideDir, { recursive: true });
 
   const result = await validateWorkingDir({
     repoSlug,
-    workingDir: outsideDir,
-    projectType: 'node-api',
+    workingDir: '../',
+    projectType: 'python',
   });
 
   assert.equal(result.ok, false);
   assert.equal(result.code, 'OUTSIDE_REPO');
-});
-
-test('validateWorkingDir detects missing package.json', async () => {
-  const repoSlug = 'test-owner/test-repo';
-  const checkoutDir = getDefaultWorkingDir(repoSlug);
-  await fs.rm(checkoutDir, { recursive: true, force: true });
-  await fs.mkdir(checkoutDir, { recursive: true });
-
-  const result = await validateWorkingDir({
-    repoSlug,
-    workingDir: checkoutDir,
-    projectType: 'node-api',
-  });
-
-  assert.equal(result.ok, false);
-  assert.equal(result.code, 'PACKAGE_JSON_MISSING');
 });

@@ -144,7 +144,7 @@ const {
 const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
-const { ensureConfigTable } = require('./configStore');
+const { ensureConfigTable, loadJson: loadConfigJson, saveJson: saveConfigJson } = require('./configStore');
 const {
   getConfigDbPool,
   testConfigDbConnection: probeConfigDbConnection,
@@ -182,6 +182,7 @@ const {
   deleteJob,
 } = require('./src/cronClient');
 const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbackData');
+const { paginateRepos, mapRepoButton, listAllGithubRepos } = require('./src/repoPicker');
 
 const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
@@ -292,6 +293,8 @@ const cronCreateRetryCache = new Map();
 const cronErrorDetailsCache = new Map();
 const panelMessageHistoryByChat = new Map();
 const activePanelMessageIdByChat = new Map();
+const menuMessageRegistryMemory = new Map();
+let menuMessageRegistryLoaded = false;
 const navigationQueueByChat = new Map();
 const navigationLocksByChat = new Map();
 const navigationOperationByChat = new Map();
@@ -785,6 +788,68 @@ function clearActivePanelMessageId(chatId) {
   activePanelMessageIdByChat.delete(chatId);
 }
 
+function getMenuRegistryKey(chatId, userId) {
+  return `${chatId}:${userId || '0'}`;
+}
+
+async function loadMenuRegistry() {
+  if (menuMessageRegistryLoaded) return;
+  menuMessageRegistryLoaded = true;
+  try {
+    const stored = await loadConfigJson('menuMessageRegistry');
+    if (!stored || typeof stored !== 'object') return;
+    Object.entries(stored).forEach(([key, value]) => {
+      if (Array.isArray(value)) {
+        menuMessageRegistryMemory.set(key, value.filter((id) => Number.isInteger(id)));
+      }
+    });
+  } catch (error) {
+    console.warn('[menu-registry] failed to load from config db', error?.message);
+  }
+}
+
+async function persistMenuRegistry() {
+  try {
+    const payload = {};
+    menuMessageRegistryMemory.forEach((ids, key) => {
+      payload[key] = ids;
+    });
+    await saveConfigJson('menuMessageRegistry', payload);
+  } catch (error) {
+    console.warn('[menu-registry] failed to persist to config db', error?.message);
+  }
+}
+
+async function markMessageStale(chatId, messageId) {
+  try {
+    await bot.api.editMessageText(chatId, messageId, '(stale)', {
+      reply_markup: { inline_keyboard: [] },
+    });
+    return;
+  } catch (error) {
+    if (!isMessageNotModifiedError(error)) {
+      console.warn('[menu-registry] failed to mark stale text', { chatId, messageId, error: error?.message });
+    }
+  }
+  try {
+    await bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
+  } catch (error) {
+    if (!isMessageNotModifiedError(error)) {
+      console.warn('[menu-registry] failed to disable stale keyboard', { chatId, messageId, error: error?.message });
+    }
+  }
+}
+
+async function deleteOrStaleMenuMessage(chatId, messageId) {
+  try {
+    await bot.api.deleteMessage(chatId, messageId);
+    return true;
+  } catch (error) {
+    await markMessageStale(chatId, messageId);
+    return false;
+  }
+}
+
 async function deactivatePanelMessage(chatId, messageId, reason) {
   if (!chatId || !messageId) return;
   try {
@@ -801,8 +866,9 @@ async function deactivatePanelMessage(chatId, messageId, reason) {
   }
 }
 
-async function trackPanelMessage(chatId, messageId, settings) {
+async function trackPanelMessage(chatId, messageId, settings, userId) {
   if (!chatId || !messageId) return;
+  await loadMenuRegistry();
   const history = getPanelHistory(chatId);
   const filtered = history.filter((entry) => entry !== messageId);
   filtered.unshift(messageId);
@@ -812,6 +878,17 @@ async function trackPanelMessage(chatId, messageId, settings) {
   await Promise.all(
     filtered.slice(1).map((oldId) => deactivatePanelMessage(chatId, oldId, 'new_panel')),
   );
+
+  const key = getMenuRegistryKey(chatId, userId);
+  const persisted = menuMessageRegistryMemory.get(key) || [];
+  const merged = [messageId, ...persisted.filter((id) => id !== messageId)].slice(0, 5);
+  menuMessageRegistryMemory.set(key, merged);
+  await persistMenuRegistry();
+
+  const staleTargets = merged.slice(1);
+  for (const oldId of staleTargets) {
+    await deleteOrStaleMenuMessage(chatId, oldId);
+  }
 
   if (!settings.autoCleanMenus) {
     return;
@@ -891,6 +968,54 @@ async function sendEphemeralMessage(ctx, text, extra) {
   return response;
 }
 
+async function sendDismissibleMessage(ctx, text, extra = {}) {
+  const ownerId = ctx?.from?.id;
+  const chatId = getChatIdFromCtx(ctx);
+  const response = await replySafely(ctx, text, {
+    ...extra,
+    reply_markup: new InlineKeyboard().text('🗑 Delete', 'msgdel:pending'),
+  });
+  if (response?.message_id && chatId && ownerId) {
+    const callback = buildCb('msgdel', [ownerId, chatId, response.message_id]);
+    try {
+      await bot.api.editMessageReplyMarkup(chatId, response.message_id, {
+        reply_markup: new InlineKeyboard().text('🗑 Delete', callback),
+      });
+    } catch (error) {
+      console.warn('[msgdel] failed to attach final delete callback', error?.message);
+    }
+  }
+  return response;
+}
+
+async function handleDeleteMessageCallback(ctx, data) {
+  const [, ownerIdRaw, chatIdRaw, messageIdRaw] = String(data).split(':');
+  const ownerId = Number(ownerIdRaw);
+  const chatId = Number(chatIdRaw);
+  const messageId = Number(messageIdRaw);
+  if (!ownerId || ownerId !== Number(ctx.from?.id)) {
+    await ensureAnswerCallback(ctx, { text: 'Not allowed', show_alert: true });
+    return { ok: false, reason: 'unauthorized' };
+  }
+
+  const api = ctx?.api || bot.api;
+  try {
+    await api.deleteMessage(chatId, messageId);
+    await ensureAnswerCallback(ctx);
+    return { ok: true, mode: 'deleted' };
+  } catch (error) {
+    try {
+      await api.editMessageText(chatId, messageId, '(Deleted)', {
+        reply_markup: { inline_keyboard: [] },
+      });
+    } catch (editError) {
+      await api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } }).catch(() => null);
+    }
+    await ensureAnswerCallback(ctx);
+    return { ok: true, mode: 'edited' };
+  }
+}
+
 async function renderPanel(ctx, text, extra) {
   const safeExtra = normalizeTelegramExtra(extra);
   const settings = await getCachedSettings();
@@ -941,7 +1066,7 @@ async function renderPanel(ctx, text, extra) {
     response = await replySafely(ctx, text, safeExtra);
   }
   if (response?.chat?.id && response?.message_id) {
-    await trackPanelMessage(response.chat.id, response.message_id, cleanup);
+    await trackPanelMessage(response.chat.id, response.message_id, cleanup, ctx?.from?.id);
   }
   return response;
 }
@@ -2453,25 +2578,22 @@ bot.callbackQuery(
       const nextSession =
         session && session.mode === 'create-project'
           ? session
-          : { mode: 'create-project', step: 'repoSlug', draft: {}, backCallback: 'proj:list' };
-      nextSession.step = 'repoSlug';
+          : { mode: 'create-project', step: 'githubToken', draft: {}, backCallback: 'proj:list' };
+      nextSession.step = 'githubToken';
       userState.set(ctx.from.id, nextSession);
-      await respond(ctx, '⚠️ Session expired. Please send repo again.');
+      await respond(ctx, '⚠️ Session expired. Please send GitHub token again.');
       return;
     }
 
     const currentRepo = session.repo;
-    const repoRoot = getDefaultWorkingDir(currentRepo);
-    const currentWorkingDir = session.draft?.workingDir || repoRoot;
-    const resolvedRepoRoot = repoRoot ? path.resolve(repoRoot) : null;
-    const resolvedWorkingDir = currentWorkingDir ? path.resolve(currentWorkingDir) : null;
-    const isWithinRepo =
-      resolvedRepoRoot &&
-      resolvedWorkingDir &&
-      (resolvedWorkingDir === resolvedRepoRoot ||
-        resolvedWorkingDir.startsWith(`${resolvedRepoRoot}${path.sep}`));
+    const currentWorkingDir = session.draft?.workingDir || '.';
+    const validation = await validateWorkingDir({
+      repoSlug: currentRepo,
+      workingDir: currentWorkingDir,
+      projectType: 'other',
+    });
 
-    if (!isWithinRepo) {
+    if (!validation.ok && validation.code !== 'CHECKOUT_PENDING') {
       session.step = 'workingDirConfirm';
       await replySafely(
         ctx,
@@ -2568,6 +2690,10 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     return;
   }
   const data = resolved.data;
+  if (data.startsWith('msgdel:')) {
+    await handleDeleteMessageCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('main:')) {
     await handleMainCallback(ctx, data);
     return;
@@ -8412,7 +8538,8 @@ function getWizardSteps() {
   return [
     'name',
     'id',
-    'repoSlug',
+    'githubToken',
+    'repoSelect',
     'workingDirConfirm',
     'workingDirCustom',
     'githubTokenEnvKey',
@@ -8444,10 +8571,10 @@ function isWizardStepSkippable(step) {
 
 function getWizardKeyboard(step) {
   const inline = new InlineKeyboard();
+  inline.text('◀️ Back', 'projwiz:back').text('❌ Cancel', 'cancel_input').row();
   if (isWizardStepSkippable(step)) {
     inline.text('⏭ Skip', 'projwiz:skip').row();
   }
-  inline.text('❌ Cancel', 'cancel_input');
   return inline;
 }
 
@@ -8456,6 +8583,7 @@ function getWorkingDirChoiceKeyboard() {
     .text('✅ Keep default', 'KEEP_DEFAULT_WORKDIR')
     .text('✏️ Change working dir', 'projwiz:change_workdir')
     .row()
+    .text('◀️ Back', 'projwiz:back')
     .text('❌ Cancel', 'cancel_input');
 }
 
@@ -8476,6 +8604,64 @@ function parseRepoSlug(value) {
   return `${owner}/${repo}`;
 }
 
+
+async function fetchGithubReposWithToken(token) {
+  const headers = {
+    'User-Agent': 'project-manager-bot',
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${token}`,
+  };
+  const repos = await listAllGithubRepos(async (page) => {
+    const response = await requestUrlWithHeaders(
+      'GET',
+      `https://api.github.com/user/repos?per_page=100&page=${page}&sort=updated`,
+      headers,
+    );
+    if (response.status === 401) {
+      const error = new Error('invalid_token');
+      error.code = 'INVALID_TOKEN';
+      throw error;
+    }
+    if (response.status === 403) {
+      const error = new Error('rate_limited');
+      error.code = 'RATE_LIMIT';
+      throw error;
+    }
+    if (response.status >= 400) {
+      const error = new Error(`github_http_${response.status}`);
+      error.code = 'GITHUB_HTTP';
+      throw error;
+    }
+    return Array.isArray(response.body) ? response.body : [];
+  });
+  return repos;
+}
+
+function buildRepoPickerKeyboard(state) {
+  const pagination = paginateRepos(state.repoCandidates || [], state.repoPage || 0, 8);
+  const inline = new InlineKeyboard();
+  pagination.items.forEach((repo) => {
+    inline.text(mapRepoButton(repo), buildCb('projwiz:repo_pick', [repo.full_name || mapRepoButton(repo)])).row();
+  });
+  if (pagination.hasPrev) {
+    inline.text('⬅️ Prev', buildCb('projwiz:repo_page', [pagination.page - 1]));
+  }
+  if (pagination.hasNext) {
+    inline.text('Next ➡️', buildCb('projwiz:repo_page', [pagination.page + 1]));
+  }
+  if (pagination.hasPrev || pagination.hasNext) inline.row();
+  inline.text('◀️ Back', 'projwiz:back').text('❌ Cancel', 'cancel_input');
+  return inline;
+}
+
+async function renderRepoSelectionStep(ctx, state) {
+  await renderOrEdit(
+    ctx,
+    `Select repository (${(state.repoCandidates || []).length} found):`,
+    { reply_markup: buildRepoPickerKeyboard(state) },
+  );
+}
+
 async function startProjectWizard(ctx) {
   userState.set(ctx.from.id, {
     mode: 'create-project',
@@ -8489,9 +8675,22 @@ async function startProjectWizard(ctx) {
 
 async function handleProjectWizardCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
-  const [, action] = data.split(':');
+  const parts = String(data).split(':');
+  const action = parts[1];
   const state = userState.get(ctx.from.id);
   if (!state || state.mode !== 'create-project') {
+    return;
+  }
+
+  if (action === 'back') {
+    const steps = getWizardSteps();
+    const idx = steps.indexOf(state.step);
+    state.step = steps[Math.max(0, idx - 1)] || 'name';
+    if (state.step === 'repoSelect') {
+      await renderRepoSelectionStep(ctx, state);
+      return;
+    }
+    await promptNextProjectField(ctx, state);
     return;
   }
 
@@ -8501,6 +8700,24 @@ async function handleProjectWizardCallback(ctx, data) {
       return;
     }
     state.step = getNextWizardStep(state.step);
+    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (action === 'repo_page') {
+    state.repoPage = Number(parts[2]) || 0;
+    await renderRepoSelectionStep(ctx, state);
+    return;
+  }
+
+  if (action === 'repo_pick') {
+    const repoSlug = parts.slice(2).join(':');
+    state.draft.repoSlug = repoSlug;
+    state.repo = repoSlug;
+    state.draft.repoUrl = `https://github.com/${repoSlug}`;
+    state.draft.workingDir = '.';
+    state.draft.isWorkingDirCustom = false;
+    state.step = 'workingDirConfirm';
     await promptNextProjectField(ctx, state);
     return;
   }
@@ -8541,27 +8758,44 @@ async function handleProjectWizardInput(ctx, state) {
 
   if (state.step === 'id') {
     state.draft.id = value;
-    state.step = 'repoSlug';
+    state.step = 'githubToken';
     await promptNextProjectField(ctx, state);
     return;
   }
 
-  if (state.step === 'repoSlug') {
-    const repoSlug = parseRepoSlug(value);
-    if (!repoSlug) {
-      await ctx.reply('Please send a valid repo in the format owner/repo.');
-      return;
+  if (state.step === 'githubToken') {
+    try {
+      const repos = await fetchGithubReposWithToken(value);
+      if (!repos.length) {
+        await ctx.reply('No repositories found for this token. Try another token.', { reply_markup: getWizardKeyboard(state.step) });
+        return;
+      }
+      state.draft.githubToken = value;
+      state.repoCandidates = repos;
+      state.repoPage = 0;
+      state.step = 'repoSelect';
+      await renderRepoSelectionStep(ctx, state);
+    } catch (error) {
+      if (error.code === 'INVALID_TOKEN') {
+        await ctx.reply('Invalid GitHub token. Please send a valid PAT.', { reply_markup: getWizardKeyboard(state.step) });
+        return;
+      }
+      if (error.code === 'RATE_LIMIT') {
+        await ctx.reply('GitHub API rate limited. Wait a minute and try again.', { reply_markup: getWizardKeyboard(state.step) });
+        return;
+      }
+      await ctx.reply('Failed to fetch repositories. Please try again.', { reply_markup: getWizardKeyboard(state.step) });
     }
-    state.draft.repoSlug = repoSlug;
-    state.repo = repoSlug;
-    state.draft.repoUrl = `https://github.com/${repoSlug}`;
-    const defaultWorkingDir = getDefaultWorkingDir(repoSlug);
-    if (defaultWorkingDir) {
-      state.draft.workingDir = '.';
-      state.draft.isWorkingDirCustom = false;
-    }
-    state.step = 'workingDirConfirm';
-    await promptNextProjectField(ctx, state);
+    return;
+  }
+
+  if (state.step === 'repoSelect') {
+    await ctx.reply('Use the repo buttons below to select a repository.');
+    return;
+  }
+
+  if (state.step === 'repoSelect') {
+    await renderRepoSelectionStep(ctx, state);
     return;
   }
 
@@ -8638,8 +8872,9 @@ async function promptNextProjectField(ctx, state) {
   const prompts = {
     name: '🆕 New project\n\nSend project *name* or press Skip.\n(Or press Cancel)',
     id: 'Send project *ID* (unique short handle) or press Skip.\n(Or press Cancel)',
-    repoSlug:
-      'Send GitHub repo as `owner/repo` (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
+    githubToken:
+      'Send GitHub personal access token (PAT) to load repository list.\n(Or press Cancel)',
+    repoSelect: null,
     workingDirConfirm: null,
     workingDirCustom:
       'Send working directory path (repo-relative preferred, e.g. "." or "apps/api"). Absolute paths are allowed but discouraged.\n(Or press Cancel)',
@@ -8707,9 +8942,9 @@ async function finalizeProjectWizard(ctx, state) {
   }
   userState.delete(ctx.from.id);
 
-  await renderOrEdit(
+  await sendDismissibleMessage(
     ctx,
-    `✅ Project created.\nName: ${project.name}\nID: ${project.id}`,
+    `✅ Project created.\n🏷️ Name: ${project.name}\n🆔 ID: ${project.id}`,
   );
   await renderProjectsList(ctx);
 }
@@ -19484,21 +19719,23 @@ async function validateWorkingDir(project) {
   const workingDir = project?.workingDir;
   const repoSlug = project?.repoSlug;
   const checkoutDir = repoSlug ? getDefaultWorkingDir(repoSlug) : null;
-  const expectedCheckoutDir = checkoutDir ? path.resolve(checkoutDir) : null;
 
   if (!workingDir) {
     return {
       ok: false,
       code: 'DIR_MISSING',
       details: 'workingDir missing',
-      expectedCheckoutDir,
+      expectedCheckoutDir: checkoutDir ? path.resolve(checkoutDir) : null,
       suggestedWorkingDir: checkoutDir || null,
     };
   }
 
+  const expectedCheckoutDir = checkoutDir ? path.resolve(checkoutDir) : null;
+  let canonicalRepoRoot = expectedCheckoutDir;
   if (expectedCheckoutDir) {
     try {
       await fs.stat(expectedCheckoutDir);
+      canonicalRepoRoot = await fs.realpath(expectedCheckoutDir);
     } catch (error) {
       return {
         ok: true,
@@ -19510,23 +19747,26 @@ async function validateWorkingDir(project) {
     }
   }
 
-  const resolvedWorkingDir = path.isAbsolute(workingDir)
-    ? path.resolve(workingDir)
-    : expectedCheckoutDir
-      ? path.resolve(expectedCheckoutDir, workingDir)
-      : path.resolve(workingDir);
-  const isWithinRepo =
-    expectedCheckoutDir &&
-    (resolvedWorkingDir === expectedCheckoutDir ||
-      resolvedWorkingDir.startsWith(`${expectedCheckoutDir}${path.sep}`));
-  if (expectedCheckoutDir && !isWithinRepo) {
-    return {
-      ok: false,
-      code: 'OUTSIDE_REPO',
-      details: `workingDir is outside repo checkout (${expectedCheckoutDir})`,
-      expectedCheckoutDir,
-      suggestedWorkingDir: checkoutDir || null,
-    };
+  const normalizedInput = workingDir === '.' ? '.' : String(workingDir).trim();
+  const joinedCandidate = path.isAbsolute(normalizedInput)
+    ? path.resolve(normalizedInput)
+    : canonicalRepoRoot
+      ? path.resolve(canonicalRepoRoot, normalizedInput)
+      : path.resolve(normalizedInput);
+
+  const resolvedWorkingDir = joinedCandidate;
+  if (canonicalRepoRoot) {
+    const relative = path.relative(canonicalRepoRoot, resolvedWorkingDir);
+    const isWithinRepo = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+    if (!isWithinRepo) {
+      return {
+        ok: false,
+        code: 'OUTSIDE_REPO',
+        details: `workingDir is outside repo checkout (${canonicalRepoRoot})`,
+        expectedCheckoutDir: canonicalRepoRoot,
+        suggestedWorkingDir: checkoutDir || '.',
+      };
+    }
   }
 
   try {
@@ -19537,7 +19777,7 @@ async function validateWorkingDir(project) {
         ok: false,
         code: 'DIR_MISSING',
         details: 'workingDir does not exist',
-        expectedCheckoutDir,
+        expectedCheckoutDir: canonicalRepoRoot,
         suggestedWorkingDir: checkoutDir || null,
       };
     }
@@ -19545,7 +19785,7 @@ async function validateWorkingDir(project) {
       ok: false,
       code: 'UNKNOWN',
       details: truncateText(error.message || 'unknown error', 120),
-      expectedCheckoutDir,
+      expectedCheckoutDir: canonicalRepoRoot,
       suggestedWorkingDir: checkoutDir || null,
     };
   }
@@ -19558,7 +19798,7 @@ async function validateWorkingDir(project) {
         ok: false,
         code: 'PACKAGE_JSON_MISSING',
         details: 'package.json not found under workingDir',
-        expectedCheckoutDir,
+        expectedCheckoutDir: canonicalRepoRoot,
         suggestedWorkingDir: suggestedWorkingDir || checkoutDir || null,
       };
     }
@@ -19568,7 +19808,7 @@ async function validateWorkingDir(project) {
     ok: true,
     code: 'OK',
     details: resolvedWorkingDir,
-    expectedCheckoutDir,
+    expectedCheckoutDir: canonicalRepoRoot,
     suggestedWorkingDir: checkoutDir || null,
   };
 }
@@ -21986,6 +22226,9 @@ module.exports = {
       configDbFailureStreak = Number(value) || 0;
     },
     shouldHaltConfigDbRetries,
+    handleDeleteMessageCallback,
+    fetchGithubReposWithToken,
+    buildRepoPickerKeyboard,
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
   },
 };
