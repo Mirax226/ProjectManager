@@ -112,3 +112,11 @@ If JSON is not convenient, send a plain text body; it will be treated as an erro
 - **DB health snapshot:** PM tracks `HEALTHY | DEGRADED | DOWN | MISCONFIG` and outage/recovery IDs (`ops_db_health_snapshot`).
 - **Recovery notice debounce:** on DB recovery, PM sends exactly one `✅ Config DB is back online.` per outage with a `✅ Readed` action for acknowledgment.
 - **Ping test upgrade:** Ping includes Config DB health, latency, and last error category hint.
+
+
+### Audit report (stability + DB + UX + safety)
+- **Found:** potential endless Config DB retry loop during long outages, missing explicit secondary DB ping output, and no progress indicator during longer ping checks.
+- **Fixed:** added capped Config DB retries per boot (`CONFIG_DB_MAX_RETRIES_PER_BOOT`, default 20) with degraded-mode halt + internal event; Ping test now reports primary DB health/latency and optional secondary DB health when `DATABASE_URL_PM_SECONDARY` or `PATH_APPLIER_CONFIG_DSN_SECONDARY` is set; added progress reporter that updates one message during Ping test.
+- **Safety checks:** secret redaction tests expanded for DSN/password/token masking; recovery debounce explicitly unit-tested so outage recovery alert is sent once per outage cycle.
+- **How to verify:** run `npm test`, run Ping Test from Settings (observe progress + DB lines), and boot without `DATABASE_URL_PM` to confirm degraded mode without crash loops.
+
