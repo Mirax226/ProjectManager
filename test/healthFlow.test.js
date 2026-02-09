@@ -28,6 +28,6 @@ test('global /health command sends endpoint guidance with button', async () => {
   const handled = await handleGlobalCommand(ctx, '/health', '');
   assert.equal(handled, true);
   const textPayload = calls.reply[0]?.[0] || calls.sendMessage[0]?.[1] || '';
-  assert.match(textPayload, /This is a web endpoint\. Open:/);
+  assert.match(textPayload, /Open DB Console Mini App/);
   assert.equal(calls.editMessageReplyMarkup.length, 1);
 });
