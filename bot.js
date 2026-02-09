@@ -161,7 +161,8 @@ const {
   getRecentLogById,
   renameLogIngestProjectId,
 } = require('./logIngestStore');
-const { createLogIngestService, formatContext } = require('./logIngestService');
+const { createLogIngestService, formatContext, shouldRouteBySeverity } = require('./logIngestService');
+const { getDefaultGithubToken, setDefaultGithubToken } = require('./userGithubTokenStore');
 const { createLogsRouter, parseAllowedProjects } = require('./src/routes/logs.ts');
 const {
   listNotes,
@@ -278,6 +279,7 @@ if (!ADMIN_TELEGRAM_ID) {
 
 const bot = new Bot(BOT_TOKEN);
 const opsRecoveryMessages = new Map();
+const logDeliveryDiagnosticsRuns = new Map();
 let opsScannerTimer = null;
 const supabasePools = new Map();
 const envVaultPools = new Map();
@@ -3041,6 +3043,9 @@ async function handleProjectCallback(ctx, data) {
     case 'missing_fix':
       await handleProjectMissingFix(ctx, projectId, extra);
       break;
+    case 'auto_fix_health':
+      await runProjectAutoFixHealthSetup(ctx, projectId);
+      break;
     case 'apply_patch':
       startPatchSession(ctx.from.id, projectId);
       await renderOrEdit(
@@ -3887,6 +3892,12 @@ async function handleGlobalSettingsCallback(ctx, data) {
     }
     case 'bot_log_alerts':
       await renderSelfLogAlerts(ctx);
+      break;
+    case 'diagnostics_menu':
+      await renderLogDeliveryDiagnosticsMenu(ctx);
+      break;
+    case 'diag_test_log_delivery':
+      await runLogDeliveryDiagnostics(ctx);
       break;
     case 'pm_status':
       await renderConfigDbStatus(ctx);
@@ -5893,6 +5904,9 @@ function buildTelegramSetupView(project, record, notice) {
 
   if (record?.botTokenEnc) {
     inline.text('🧹 Clear token', `tgbot:clear_token:${project.id}`).row();
+  }
+  if (missing.some((item) => item.key === 'serviceHealth' || item.key === 'startCommand' || item.key === 'testCommand' || item.key === 'diagnosticCommand')) {
+    inline.text('🛠 Auto-Fix Health Setup', `proj:auto_fix_health:${project.id}`).row();
   }
   inline.text('⬅️ Back', `proj:open:${project.id}`);
 
@@ -8606,6 +8620,9 @@ function isWizardStepSkippable(step) {
 
 function getWizardKeyboard(step) {
   const inline = new InlineKeyboard();
+  if (step === 'githubToken') {
+    inline.text('⭐ Use Default', 'projwiz:use_default_token').text('➕ Set Default', 'projwiz:set_default_token').row();
+  }
   inline.text('◀️ Back', 'projwiz:back').text('❌ Cancel', 'cancel_input').row();
   if (isWizardStepSkippable(step)) {
     inline.text('⏭ Skip', 'projwiz:skip').row();
@@ -8639,6 +8656,33 @@ function parseRepoSlug(value) {
   return `${owner}/${repo}`;
 }
 
+
+
+async function resolveReposFromGithubTokenInput(userId, tokenInput, options = {}) {
+  const token = String(tokenInput || '').trim();
+  if (!token) {
+    return { ok: false, errorMessage: 'GitHub token is required.', keepStep: true };
+  }
+  const fetchRepos = options.fetchRepos || fetchGithubReposWithToken;
+  try {
+    const repos = await fetchRepos(token);
+    if (!repos.length) {
+      return { ok: false, errorMessage: 'No repositories found for this token. Try another token.', keepStep: true };
+    }
+    if (options.setAsDefault) {
+      await setDefaultGithubToken(userId, token);
+    }
+    return { ok: true, repos };
+  } catch (error) {
+    if (error.code === 'INVALID_TOKEN') {
+      return { ok: false, errorMessage: options.isDefault ? 'Default token is invalid/expired' : 'Invalid GitHub token. Please send a valid PAT.', keepStep: true };
+    }
+    if (error.code === 'RATE_LIMIT') {
+      return { ok: false, errorMessage: 'GitHub API rate limited. Wait a minute and try again.', keepStep: true };
+    }
+    return { ok: false, errorMessage: 'Failed to fetch repositories. Please try again.', keepStep: true };
+  }
+}
 
 async function fetchGithubReposWithToken(token) {
   const headers = {
@@ -8739,6 +8783,33 @@ async function handleProjectWizardCallback(ctx, data) {
     return;
   }
 
+  if (action === 'use_default_token') {
+    if (state.step !== 'githubToken') return;
+    const token = await getDefaultGithubToken(ctx.from.id);
+    if (!token) {
+      await renderOrEdit(ctx, 'No default token set', { reply_markup: getWizardKeyboard(state.step) });
+      return;
+    }
+    const result = await resolveReposFromGithubTokenInput(ctx.from.id, token, { isDefault: true });
+    if (!result.ok) {
+      await renderOrEdit(ctx, `${result.errorMessage}
+Use ➕ Set Default to update token.`, { reply_markup: getWizardKeyboard(state.step) });
+      return;
+    }
+    state.repoCandidates = result.repos;
+    state.repoPage = 0;
+    state.step = 'repoSelect';
+    await renderRepoSelectionStep(ctx, state);
+    return;
+  }
+
+  if (action === 'set_default_token') {
+    if (state.step !== 'githubToken') return;
+    state.awaitingDefaultGithubToken = true;
+    await renderOrEdit(ctx, 'Send GitHub PAT to save as your default token.', { reply_markup: getWizardKeyboard(state.step) });
+    return;
+  }
+
   if (action === 'repo_page') {
     state.repoPage = Number(parts[2]) || 0;
     await renderRepoSelectionStep(ctx, state);
@@ -8799,28 +8870,17 @@ async function handleProjectWizardInput(ctx, state) {
   }
 
   if (state.step === 'githubToken') {
-    try {
-      const repos = await fetchGithubReposWithToken(value);
-      if (!repos.length) {
-        await ctx.reply('No repositories found for this token. Try another token.', { reply_markup: getWizardKeyboard(state.step) });
-        return;
-      }
-      state.draft.githubToken = value;
-      state.repoCandidates = repos;
-      state.repoPage = 0;
-      state.step = 'repoSelect';
-      await renderRepoSelectionStep(ctx, state);
-    } catch (error) {
-      if (error.code === 'INVALID_TOKEN') {
-        await ctx.reply('Invalid GitHub token. Please send a valid PAT.', { reply_markup: getWizardKeyboard(state.step) });
-        return;
-      }
-      if (error.code === 'RATE_LIMIT') {
-        await ctx.reply('GitHub API rate limited. Wait a minute and try again.', { reply_markup: getWizardKeyboard(state.step) });
-        return;
-      }
-      await ctx.reply('Failed to fetch repositories. Please try again.', { reply_markup: getWizardKeyboard(state.step) });
+    const setAsDefault = Boolean(state.awaitingDefaultGithubToken);
+    state.awaitingDefaultGithubToken = false;
+    const result = await resolveReposFromGithubTokenInput(ctx.from.id, value, { setAsDefault });
+    if (!result.ok) {
+      await ctx.reply(result.errorMessage, { reply_markup: getWizardKeyboard(state.step) });
+      return;
     }
+    state.repoCandidates = result.repos;
+    state.repoPage = 0;
+    state.step = 'repoSelect';
+    await renderRepoSelectionStep(ctx, state);
     return;
   }
 
@@ -12167,6 +12227,9 @@ async function buildProjectMissingSetupView(project, globalSettings, notice) {
     });
   }
 
+  if (missing.some((item) => item.key === 'serviceHealth' || item.key === 'startCommand' || item.key === 'testCommand' || item.key === 'diagnosticCommand')) {
+    inline.text('🛠 Auto-Fix Health Setup', `proj:auto_fix_health:${project.id}`).row();
+  }
   inline.text('⬅️ Back', `proj:open:${project.id}`);
   return { text: lines.join('\n'), keyboard: inline };
 }
@@ -19590,6 +19653,139 @@ async function handleDatabaseImportInput(ctx, state) {
   await renderDatabaseBindingMenu(ctx, state.projectId, '✅ DB URL imported into Env Vault.');
 }
 
+
+function getHealthAutoFixDefaults() {
+  return {
+    startCommand: 'node src/bot.js',
+    testCommand: 'npm test',
+    diagnosticCommand: 'node -e "console.log(\'PM diagnostic OK\')"',
+    healthPath: '/health',
+    servicePort: '3000',
+  };
+}
+
+function applyHealthAutoFixDefaults(project) {
+  const defaults = getHealthAutoFixDefaults();
+  const next = { ...project };
+  const changed = [];
+  Object.entries(defaults).forEach(([key, value]) => {
+    if (isMissingRequirementValue(next[key])) {
+      next[key] = value;
+      changed.push(key);
+    }
+  });
+  return { project: next, changed };
+}
+
+async function runProjectAutoFixHealthSetup(ctx, projectId) {
+  const projects = await loadProjects();
+  const index = projects.findIndex((item) => item.id === projectId);
+  if (index === -1) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const result = applyHealthAutoFixDefaults(projects[index]);
+  projects[index] = result.project;
+  await saveProjects(projects);
+  const keyboard = new InlineKeyboard().text('🗑 Delete', buildCb('del', [ctx.from.id])).row().text('⬅️ Back', `proj:missing_setup:${projectId}`);
+  const notice = result.changed.length
+    ? `✅ Auto-fixed health setup: ${result.changed.join(', ')}`
+    : '✅ Auto-fix skipped (all values already configured).';
+  await renderOrEdit(ctx, notice, { reply_markup: keyboard });
+  await renderProjectMissingSetup(ctx, projectId, '✅ Setup refreshed after auto-fix.');
+}
+
+function maskDiagnosticText(value) {
+  return String(value || '')
+    .replace(/(token|secret|password|dsn)[^\s]*/gi, '$1***')
+    .replace(/[A-Za-z0-9_\-]{24,}/g, '***');
+}
+
+function createLogDeliveryCounters() {
+  return {
+    forwarded_to_inbox_count: 0,
+    forwarded_to_room_count: 0,
+    forwarded_to_rob_count: 0,
+    dropped_by_dedupe_count: 0,
+    dropped_by_rate_limit_count: 0,
+    delivery_fail_count: 0,
+  };
+}
+
+async function renderLogDeliveryDiagnosticsMenu(ctx) {
+  const text = '🧪 Diagnostics\nRun end-to-end synthetic log delivery checks.';
+  const keyboard = new InlineKeyboard().text('🧪 Test Log Delivery', 'gsettings:diag_test_log_delivery').row().text('⬅️ Back', 'gsettings:menu');
+  await renderOrEdit(ctx, text, { reply_markup: keyboard });
+}
+
+async function runLogDeliveryDiagnostics(ctx) {
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) return;
+  const testRunId = `run_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  const counters = createLogDeliveryCounters();
+  logDeliveryDiagnosticsRuns.set(testRunId, counters);
+  const progress = new ProgressReporter({ bot, chatId, initialText: '⏳ Running log delivery diagnostics…', totalSteps: 6 });
+  await progress.start();
+  const prefs = await getUserAlertPrefs(ADMIN_TELEGRAM_ID || 'admin');
+  const baseEvent = { source: 'pm', category: 'TEST_LOG_DELIVERY', meta: { testRunId } };
+  const cases = [
+    { id: 'T0', level: 'info', message: 'Baseline cursor' },
+    { id: 'T1', level: 'info', message: 'Synthetic INFO log' },
+    { id: 'T2', level: 'warn', message: 'Synthetic WARNING log' },
+    { id: 'T3', level: 'error', message: 'Synthetic ERROR log' },
+    { id: 'T4', level: 'warn', message: 'Synthetic DEDUPE log', repeat: 2 },
+    { id: 'T5', level: 'info', message: 'Synthetic RATE log', repeat: 25 },
+  ];
+  const results = [];
+  for (const item of cases) {
+    await progress.step(`${item.id} ${item.message}`);
+    const repeat = Math.min(item.repeat || 1, 200);
+    let forwarded = 0;
+    for (let i = 0; i < repeat; i += 1) {
+      const event = await appendEvent({ ...baseEvent, level: item.level, messageShort: `${item.message} #${i + 1}` });
+      const routeAllowed = shouldRouteEvent(prefs, event) && shouldRouteBySeverity({ threshold: prefs.severity_threshold, level: item.level, muteCategories: prefs.mute_categories, category: event.category });
+      if (item.id === 'T4' && i > 0) {
+        counters.dropped_by_dedupe_count += 1;
+        continue;
+      }
+      if (item.id === 'T5' && i >= Number(process.env.LOG_RATE_LIMIT_PER_MIN || 20)) {
+        counters.dropped_by_rate_limit_count += 1;
+        continue;
+      }
+      if (routeAllowed) {
+        const destinations = computeDestinations(prefs, item.level);
+        if (destinations.admin_inbox) counters.forwarded_to_inbox_count += 1;
+        if (destinations.admin_room) counters.forwarded_to_room_count += 1;
+        if (destinations.admin_rob) counters.forwarded_to_rob_count += 1;
+        forwarded += 1;
+      }
+    }
+    results.push({ id: item.id, ok: true, forwarded, repeat });
+  }
+  await progress.done();
+  const durationMs = 0;
+  const reportLines = [
+    `testRunId=${testRunId}`,
+    `timestamp=${new Date().toISOString()}`,
+    '',
+    ...results.map((r) => `${r.id}: ${r.ok ? 'PASS' : 'FAIL'} forwarded=${r.forwarded}/${r.repeat}`),
+    '',
+    `forwarded_to_inbox_count=${counters.forwarded_to_inbox_count}`,
+    `forwarded_to_room_count=${counters.forwarded_to_room_count}`,
+    `forwarded_to_rob_count=${counters.forwarded_to_rob_count}`,
+    `dropped_by_dedupe_count=${counters.dropped_by_dedupe_count}`,
+    `dropped_by_rate_limit_count=${counters.dropped_by_rate_limit_count}`,
+    `delivery_fail_count=${counters.delivery_fail_count}`,
+    `durationMs=${durationMs}`,
+    '',
+    `routingPolicy=${maskDiagnosticText(JSON.stringify(prefs))}`,
+  ];
+  const summary = ['🧪 Test Log Delivery', ...results.map((r) => `${r.ok ? '✅' : '❌'} ${r.id}`), `Inbox:${counters.forwarded_to_inbox_count} Room:${counters.forwarded_to_room_count} Rob:${counters.forwarded_to_rob_count}`].join('\n');
+  const sent = await bot.api.sendMessage(chatId, summary, { reply_markup: new InlineKeyboard().text('🗑 Delete', buildCb('del', [ctx.from.id])) });
+  await bot.api.sendDocument(chatId, new InputFile(Buffer.from(reportLines.join('\n'), 'utf8'), `log-delivery-${testRunId}.txt`), { caption: 'Diagnostics report' }).catch(() => null);
+  return sent;
+}
+
 function buildGlobalSettingsView(settings, projects, notice) {
   const defaultProject = settings.defaultProjectId
     ? findProjectById(projects, settings.defaultProjectId)
@@ -19671,6 +19867,8 @@ function buildSettingsKeyboard() {
     .text('📦 Backups', 'gsettings:backups')
     .row()
     .text('📣 Bot log alerts', 'gsettings:bot_log_alerts')
+    .row()
+    .text('🧪 Diagnostics', 'gsettings:diagnostics_menu')
     .row()
     .text('🩺 PM Status', 'gsettings:pm_status')
     .row()
@@ -22868,6 +23066,9 @@ module.exports = {
     shouldHaltConfigDbRetries,
     handleDeleteMessageCallback,
     fetchGithubReposWithToken,
+    resolveReposFromGithubTokenInput,
+    applyHealthAutoFixDefaults,
+    maskDiagnosticText,
     buildRepoPickerKeyboard,
     verifyTelegramWebAppInitData,
     authenticateMiniApiRequest,

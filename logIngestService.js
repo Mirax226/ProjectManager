@@ -91,6 +91,15 @@ function createRateLimiter({ limitPerMinute, burst }) {
   };
 }
 
+
+function shouldRouteBySeverity({ threshold = 'warn', level = 'info', muteCategories = [], category = null }) {
+  const weights = { info: 1, warn: 2, error: 3, critical: 4 };
+  if (category && Array.isArray(muteCategories) && muteCategories.includes(category)) return false;
+  const min = weights[String(threshold || 'warn').toLowerCase()] || weights.warn;
+  const current = weights[String(level || 'info').toLowerCase()] || weights.info;
+  return current >= min;
+}
+
 function createLogIngestService(options) {
   const {
     getProjectById,
@@ -99,6 +108,7 @@ function createLogIngestService(options) {
     sendTelegramMessage,
     logger = console,
     now = () => Date.now(),
+    onMetrics = null,
   } = options;
 
   const dedupeWindowMs =
@@ -194,6 +204,7 @@ function createLogIngestService(options) {
     const deduped = isDedupeHit(hash, nowMs);
     if (deduped) {
       logger.info('[log-ingest] dedupe hit', { projectId: entry.projectId, hash });
+      if (onMetrics) onMetrics('dropped_by_dedupe_count');
       return { ok: true, status: 'deduped' };
     }
 
@@ -220,6 +231,7 @@ function createLogIngestService(options) {
         });
       }
       logger.info('[log-ingest] rate limited', { projectId: entry.projectId });
+      if (onMetrics) onMetrics('dropped_by_rate_limit_count');
       return { ok: true, status: 'rate_limited' };
     }
 
@@ -276,12 +288,14 @@ function createLogIngestService(options) {
     try {
       const message = buildTelegramMessage(entry);
       await Promise.all(resolvedTargets.map((chatId) => sendTelegramMessage(chatId, message)));
+      if (onMetrics) onMetrics('forwarded_total_count', resolvedTargets.length);
       return { ok: true, status: 'forwarded' };
     } catch (error) {
       logger.error('[log-ingest] Failed to forward to Telegram', {
         projectId: entry.projectId,
         error: error?.message,
       });
+      if (onMetrics) onMetrics('delivery_fail_count');
       return { ok: true, status: 'forward_failed' };
     }
   }
@@ -297,4 +311,6 @@ module.exports = {
   validatePayload,
   truncateText,
   formatContext,
+  createRateLimiter,
+  shouldRouteBySeverity,
 };
