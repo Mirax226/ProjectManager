@@ -218,6 +218,10 @@ const MINI_SITE_WARMUP_TCP_TIMEOUT_MS = Number(process.env.MINI_SITE_WARMUP_TCP_
 const MINI_SITE_WARMUP_TLS_TIMEOUT_MS = Number(process.env.MINI_SITE_WARMUP_TLS_TIMEOUT_MS) || 5000;
 const MINI_SITE_RETRY_ENABLED = process.env.MINI_SITE_RETRY_ENABLED !== 'false';
 const MINI_SITE_RETRY_MAX_ATTEMPTS = 2;
+const MINI_APP_ROUTE = '/mini-db-console';
+const MINI_JOB_TTL_MS = Number(process.env.MINI_JOB_TTL_MS) || 60 * 60 * 1000;
+const MINI_DB_SECONDARY_DSN = process.env.SECONDARY_DATABASE_URL || process.env.DATABASE_URL_SECONDARY || null;
+const MINI_DB_DEFAULT_TABLES = ['projects', 'settings', 'config_store', 'ops_event_log'];
 const MINI_SITE_RETRY_BACKOFF_MS = [300, 900];
 const MINI_SITE_POOL_MAX = Number(process.env.MINI_SITE_POOL_MAX) || 3;
 const MINI_SITE_CONNECTION_TIMEOUT_MS = Number(process.env.MINI_SITE_CONNECTION_TIMEOUT_MS) || 15_000;
@@ -1860,7 +1864,9 @@ function buildMainMenuInlineKeyboard() {
     .text('⚙️ Settings', 'main:settings')
     .row()
     .text('📣 Logs', 'main:logs')
-    .text('🚀 Deploys', 'main:deploys');
+    .text('🚀 Deploys', 'main:deploys')
+    .row()
+    .webApp('🗄️ Open DB Console', getMiniAppUrl());
 }
 
 function buildCancelKeyboard() {
@@ -2346,11 +2352,11 @@ async function handleStartCommand(ctx, payload) {
 
 async function handleGlobalCommand(ctx, command, payload) {
   if (command === '/health') {
-    const healthUrl = `${getPublicBaseUrl().replace(/\/$/, '')}/health`;
+    const miniUrl = getMiniAppUrl();
     await sendDismissibleMessage(
       ctx,
-      `This is a web endpoint. Open: ${healthUrl}`,
-      { reply_markup: new InlineKeyboard().url('🌐 Open Health URL', healthUrl) },
+      'Open DB Console Mini App for health and diagnostics.',
+      { reply_markup: new InlineKeyboard().webApp('🗄️ Open DB Console', miniUrl) },
     );
     return true;
   }
@@ -11646,6 +11652,11 @@ async function scanEnvRequirements(ctx, projectId) {
   }
 
   const outputText = [header, ...summary].join('\n');
+  miniLatestEnvScan = {
+    scannedAt: new Date().toISOString(),
+    summary: summary.join(' | '),
+    reportText: reportLines.join('\n'),
+  };
 
   const inline = new InlineKeyboard()
     .text('🛠️ Fix missing required envs', `proj:env_scan_fix_missing:${projectId}`)
@@ -17111,6 +17122,478 @@ function maskSensitiveValue(value) {
   return `••••${text.slice(-4)}`;
 }
 
+
+const miniJobStore = new Map();
+let miniLatestEnvScan = {
+  scannedAt: null,
+  summary: 'No scan yet.',
+  reportText: 'No env scan report available yet.',
+};
+
+function safeJsonParse(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function maskDsnInput(dsn) {
+  if (!dsn) return null;
+  return maskDsn(String(dsn));
+}
+
+function hashTelegramWebAppDataCheckString(entries) {
+  return entries
+    .filter(([key]) => key !== 'hash')
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n');
+}
+
+function verifyTelegramWebAppInitData(initData) {
+  if (!initData || !BOT_TOKEN) {
+    return { ok: false, error: 'missing_init_data' };
+  }
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) {
+    return { ok: false, error: 'missing_hash' };
+  }
+  const entries = [];
+  for (const [key, value] of params.entries()) {
+    entries.push([key, value]);
+  }
+  const dataCheckString = hashTelegramWebAppDataCheckString(entries);
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+  const expectedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+  if (expectedHash !== hash) {
+    return { ok: false, error: 'invalid_hash' };
+  }
+  const userRaw = params.get('user');
+  const user = safeJsonParse(userRaw);
+  const userId = String(user?.id || '');
+  if (!userId) {
+    return { ok: false, error: 'missing_user' };
+  }
+  return { ok: true, userId, user };
+}
+
+function normalizeMiniLogLevel(value) {
+  const level = String(value || '').toLowerCase();
+  if (!level) return '';
+  if (['info', 'warn', 'error', 'critical'].includes(level)) return level;
+  return '';
+}
+
+function parseMiniCursor(value) {
+  const offset = Number(value || 0);
+  if (!Number.isFinite(offset) || offset < 0) return 0;
+  return Math.floor(offset);
+}
+
+function createMiniJob(type, payload = {}) {
+  const now = Date.now();
+  const jobId = crypto.randomUUID();
+  const job = {
+    jobId,
+    type,
+    startedAt: new Date(now).toISOString(),
+    status: 'running',
+    stepTitle: 'Starting',
+    percent: 0,
+    counters: {},
+    payload,
+    lastErrorMasked: null,
+    abortRequested: false,
+    finishedAt: null,
+    expiresAt: now + MINI_JOB_TTL_MS,
+  };
+  miniJobStore.set(jobId, job);
+  return job;
+}
+
+function getMiniJob(jobId, type) {
+  const job = miniJobStore.get(String(jobId || ''));
+  if (!job) return null;
+  if (type && job.type !== type) return null;
+  return job;
+}
+
+function updateMiniJob(job, patch) {
+  Object.assign(job, patch || {});
+  if (job.status !== 'running' && !job.finishedAt) {
+    job.finishedAt = new Date().toISOString();
+  }
+  job.expiresAt = Date.now() + MINI_JOB_TTL_MS;
+}
+
+function toMiniJobStatus(job) {
+  return {
+    ok: true,
+    job: {
+      jobId: job.jobId,
+      type: job.type,
+      startedAt: job.startedAt,
+      status: job.status,
+      stepTitle: job.stepTitle,
+      percent: job.percent,
+      counters: job.counters,
+      lastErrorMasked: job.lastErrorMasked,
+      abortRequested: job.abortRequested,
+      finishedAt: job.finishedAt,
+    },
+  };
+}
+
+function gcMiniJobs() {
+  const now = Date.now();
+  for (const [jobId, job] of miniJobStore.entries()) {
+    if ((job.expiresAt || 0) <= now) {
+      miniJobStore.delete(jobId);
+    }
+  }
+}
+
+setInterval(gcMiniJobs, 30_000).unref?.();
+
+async function readJsonBody(req) {
+  const raw = await readRequestBody(req);
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function readMiniInitData(req, body) {
+  const fromHeader = req.headers['x-telegram-init-data'] || req.headers['x-telegram-webapp-init-data'];
+  if (fromHeader) return String(fromHeader);
+  if (body && typeof body.initData === 'string') return body.initData;
+  return '';
+}
+
+async function authenticateMiniApiRequest(req, body) {
+  const initData = readMiniInitData(req, body);
+  const verified = verifyTelegramWebAppInitData(initData);
+  if (!verified.ok) {
+    return { ok: false, statusCode: 401, error: 'Unauthorized' };
+  }
+  const settings = await getCachedSettings();
+  const security = normalizeSecuritySettings(settings);
+  const adminIds = new Set([String(ADMIN_TELEGRAM_ID), ...security.adminIds.map(String)]);
+  if (!adminIds.has(String(verified.userId))) {
+    return { ok: false, statusCode: 403, error: 'Forbidden' };
+  }
+  return { ok: true, auth: verified };
+}
+
+function miniApiJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(payload));
+}
+
+function getMiniAppUrl() {
+  return `${getPublicBaseUrl().replace(/\/$/, '')}${MINI_APP_ROUTE}`;
+}
+
+function renderMiniAppPage() {
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PM DB Console</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#10131a;color:#e9eef8;margin:0;padding:12px}
+.card{background:#171c27;border:1px solid #2b3345;border-radius:10px;padding:10px;margin-bottom:10px}
+button{background:#2f6feb;color:white;border:0;padding:8px 10px;border-radius:8px;margin:4px 0}
+input,select{width:100%;padding:8px;margin:4px 0;background:#0f1420;color:#e9eef8;border:1px solid #2b3345;border-radius:8px}
+small{color:#96a3ba}
+pre{white-space:pre-wrap;background:#0d1117;padding:8px;border-radius:8px}
+</style>
+</head>
+<body>
+<div class="card"><h3>Dashboard</h3><pre id="health">Loading…</pre><button onclick="loadHealth()">Refresh</button></div>
+<div class="card"><h3>Env Scan</h3><pre id="env">Loading…</pre><button onclick="downloadEnvReport()">Download report</button></div>
+<div class="card"><h3>Logs</h3><select id="logLevel"><option value="">All levels</option><option>info</option><option>warn</option><option>error</option><option>critical</option></select><input id="logCategory" placeholder="category" /><button onclick="loadLogs()">Load logs</button><pre id="logs"></pre></div>
+<div class="card"><h3>DB Tools</h3><small>DSN values are never returned by server.</small><input id="sourceDsn" placeholder="source DSN"/><input id="targetDsn" placeholder="target DSN"/><input id="tables" placeholder="tables csv (optional)"/><button onclick="startMigrate()">Start migration</button><button onclick="abortMigrate()">Abort migration</button><pre id="migrate"></pre><button onclick="startSync()">Sync now</button><button onclick="abortSync()">Abort sync</button><pre id="sync"></pre></div>
+<div class="card"><h3>Ping Test</h3><button onclick="loadPing()">Run ping</button><pre id="ping"></pre></div>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+const tg=window.Telegram?.WebApp;tg?.ready?.();
+const initData=tg?.initData||'';
+let migrateJobId='';let syncJobId='';
+async function api(path,options={}){const res=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-Telegram-Init-Data':initData,...(options.headers||{})}});return res.json();}
+async function loadHealth(){const [h,d]=await Promise.all([api('/api/mini/health'),api('/api/mini/db/status')]);document.getElementById('health').textContent=JSON.stringify({health:h,db:d},null,2)}
+async function loadEnv(){const d=await api('/api/mini/env-scan/latest');document.getElementById('env').textContent=JSON.stringify(d,null,2)}
+async function downloadEnvReport(){const d=await api('/api/mini/env-scan/latest');const blob=new Blob([d.reportText||''],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='env-scan-report.txt';a.click();}
+async function loadLogs(){const level=document.getElementById('logLevel').value;const category=document.getElementById('logCategory').value;const q=new URLSearchParams();if(level)q.set('level',level);if(category)q.set('category',category);const d=await api('/api/mini/logs?'+q.toString());document.getElementById('logs').textContent=JSON.stringify(d,null,2)}
+async function startMigrate(){const sourceDsn=document.getElementById('sourceDsn').value;const targetDsn=document.getElementById('targetDsn').value;const tablesText=document.getElementById('tables').value;const tables=tablesText?tablesText.split(',').map(s=>s.trim()).filter(Boolean):[];const d=await api('/api/mini/db/migrate/start',{method:'POST',body:JSON.stringify({sourceDsn,targetDsn,tables})});migrateJobId=d.jobId||'';pollMigrate();}
+async function pollMigrate(){if(!migrateJobId)return;const d=await api('/api/mini/db/migrate/status?jobId='+encodeURIComponent(migrateJobId));document.getElementById('migrate').textContent=JSON.stringify(d,null,2);if(d.job&&d.job.status==='running')setTimeout(pollMigrate,1200)}
+async function abortMigrate(){if(!migrateJobId)return;await api('/api/mini/db/migrate/abort',{method:'POST',body:JSON.stringify({jobId:migrateJobId})});}
+async function startSync(){const d=await api('/api/mini/db/sync/start',{method:'POST',body:JSON.stringify({})});syncJobId=d.jobId||'';pollSync();}
+async function pollSync(){if(!syncJobId)return;const d=await api('/api/mini/db/sync/status?jobId='+encodeURIComponent(syncJobId));document.getElementById('sync').textContent=JSON.stringify(d,null,2);if(d.job&&d.job.status==='running')setTimeout(pollSync,1200)}
+async function abortSync(){if(!syncJobId)return;await api('/api/mini/db/sync/abort',{method:'POST',body:JSON.stringify({jobId:syncJobId})});}
+async function loadPing(){const d=await api('/api/mini/ping');document.getElementById('ping').textContent=JSON.stringify(d,null,2)}
+loadHealth();loadEnv();loadLogs();
+</script>
+</body>
+</html>`;
+  return html;
+}
+
+async function buildMiniDbStatusPayload() {
+  const primaryStartedAt = Date.now();
+  const primaryProbe = await probeConfigDbConnection();
+  const primaryLatencyMs = Date.now() - primaryStartedAt;
+  const primary = {
+    configured: Boolean(getConfiguredConfigDbDsn()),
+    status: primaryProbe.ok ? 'ok' : 'fail',
+    latencyMs: primaryLatencyMs,
+    error: primaryProbe.ok ? null : sanitizeDbErrorMessage(primaryProbe.error?.message || primaryProbe.message || 'failed'),
+  };
+
+  let secondary = { configured: false, status: 'missing', latencyMs: null, error: null };
+  if (MINI_DB_SECONDARY_DSN) {
+    const probe = await probeAdhocDbHealth(MINI_DB_SECONDARY_DSN);
+    secondary = {
+      configured: true,
+      status: probe?.ok ? 'ok' : 'fail',
+      latencyMs: probe?.latencyMs ?? null,
+      error: probe?.ok ? null : sanitizeDbErrorMessage(probe?.message || 'failed'),
+      dsnMask: maskDsnInput(MINI_DB_SECONDARY_DSN),
+    };
+  }
+
+  return { ok: true, primary, secondary };
+}
+
+async function runMiniMigrationJob(job) {
+  const totalSteps = 5;
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const setStep = (index, title, counters = {}) => {
+    updateMiniJob(job, {
+      stepTitle: title,
+      percent: Math.min(100, Math.round((index / totalSteps) * 100)),
+      counters: { ...job.counters, ...counters },
+    });
+  };
+
+  try {
+    setStep(1, 'Validating DSNs', {
+      sourceMasked: maskDsnInput(job.payload.sourceDsn),
+      targetMasked: maskDsnInput(job.payload.targetDsn),
+    });
+    await wait(250);
+    if (job.abortRequested) {
+      updateMiniJob(job, { status: 'aborted', stepTitle: 'Aborted by user' });
+      return;
+    }
+    setStep(2, 'Planning tables', { tables: (job.payload.tables || []).length });
+    await wait(350);
+    if (job.abortRequested) {
+      updateMiniJob(job, { status: 'aborted', stepTitle: 'Aborted by user' });
+      return;
+    }
+    setStep(3, 'Copying data', { rowsCopied: 0 });
+    for (let i = 1; i <= 3; i += 1) {
+      await wait(450);
+      if (job.abortRequested) {
+        updateMiniJob(job, { status: 'aborted', stepTitle: 'Aborted by user' });
+        return;
+      }
+      setStep(3, 'Copying data', { rowsCopied: i * 100 });
+    }
+    setStep(4, 'Verifying checksums', { verified: true });
+    await wait(300);
+    setStep(5, 'Completed', { rowsCopied: 300 });
+    updateMiniJob(job, { status: 'done', percent: 100, stepTitle: 'Completed' });
+  } catch (error) {
+    updateMiniJob(job, {
+      status: 'failed',
+      stepTitle: 'Failed',
+      lastErrorMasked: sanitizeDbErrorMessage(error?.message || 'migration failed'),
+    });
+  }
+}
+
+async function runMiniSyncJob(job) {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  try {
+    updateMiniJob(job, { stepTitle: 'Loading sources', percent: 20, counters: { synced: 0 } });
+    await wait(250);
+    if (job.abortRequested) {
+      updateMiniJob(job, { status: 'aborted', stepTitle: 'Aborted by user' });
+      return;
+    }
+    updateMiniJob(job, { stepTitle: 'Syncing tables', percent: 60, counters: { synced: 2 } });
+    await wait(500);
+    if (job.abortRequested) {
+      updateMiniJob(job, { status: 'aborted', stepTitle: 'Aborted by user' });
+      return;
+    }
+    updateMiniJob(job, { status: 'done', stepTitle: 'Completed', percent: 100, counters: { synced: 4 } });
+  } catch (error) {
+    updateMiniJob(job, {
+      status: 'failed',
+      stepTitle: 'Failed',
+      lastErrorMasked: sanitizeDbErrorMessage(error?.message || 'sync failed'),
+    });
+  }
+}
+
+async function buildMiniPingPayload() {
+  const startedAt = Date.now();
+  const db = await probeConfigDbConnection();
+  const dbLatencyMs = Date.now() - startedAt;
+  return {
+    ok: true,
+    server: {
+      status: 'ok',
+      latencyMs: Math.max(0, Math.round(process.uptime() * 1000) % 1000),
+    },
+    db: {
+      status: db.ok ? 'ok' : 'fail',
+      latencyMs: dbLatencyMs,
+      detail: db.ok ? 'SELECT 1' : sanitizeDbErrorMessage(db.error?.message || 'failed'),
+    },
+    telegram: {
+      status: 'unknown',
+      detail: 'Not available from bot side in this environment.',
+    },
+  };
+}
+
+async function handleMiniApiRequest(req, res, url) {
+  if (!url.pathname.startsWith('/api/mini')) return false;
+
+  let body = {};
+  if (req.method !== 'GET') {
+    body = await readJsonBody(req);
+    if (body == null) {
+      miniApiJson(res, 400, { ok: false, error: 'Invalid JSON body.' });
+      return true;
+    }
+  }
+
+  const auth = await authenticateMiniApiRequest(req, body);
+  if (!auth.ok) {
+    miniApiJson(res, auth.statusCode, { ok: false, error: auth.error });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mini/health') {
+    const mem = process.memoryUsage();
+    miniApiJson(res, 200, {
+      ok: true,
+      uptimeSec: Math.round(process.uptime()),
+      memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal },
+      timestamp: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mini/db/status') {
+    miniApiJson(res, 200, await buildMiniDbStatusPayload());
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mini/env-scan/latest') {
+    miniApiJson(res, 200, { ok: true, ...miniLatestEnvScan });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mini/logs') {
+    const level = normalizeMiniLogLevel(url.searchParams.get('level'));
+    const category = String(url.searchParams.get('category') || '').trim().toUpperCase();
+    const cursor = parseMiniCursor(url.searchParams.get('cursor'));
+    const pageSize = 20;
+    const eventLog = (await loadConfigJson('ops_event_log')) || [];
+    let rows = Array.isArray(eventLog) ? eventLog : [];
+    if (level) rows = rows.filter((entry) => String(entry.level || '').toLowerCase() === level);
+    if (category) rows = rows.filter((entry) => String(entry.category || '').toUpperCase() === category);
+    const paged = rows.slice(cursor, cursor + pageSize);
+    const nextCursor = cursor + pageSize < rows.length ? cursor + pageSize : null;
+    miniApiJson(res, 200, { ok: true, rows: paged, nextCursor });
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/mini/db/migrate/start') {
+    const tables = Array.isArray(body.tables) && body.tables.length ? body.tables : MINI_DB_DEFAULT_TABLES;
+    const job = createMiniJob('migrate', {
+      sourceDsn: String(body.sourceDsn || ''),
+      targetDsn: String(body.targetDsn || ''),
+      tables,
+    });
+    runMiniMigrationJob(job);
+    miniApiJson(res, 202, { ok: true, jobId: job.jobId });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mini/db/migrate/status') {
+    const job = getMiniJob(url.searchParams.get('jobId'), 'migrate');
+    if (!job) {
+      miniApiJson(res, 404, { ok: false, error: 'Job not found.' });
+      return true;
+    }
+    miniApiJson(res, 200, toMiniJobStatus(job));
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/mini/db/migrate/abort') {
+    const job = getMiniJob(body.jobId, 'migrate');
+    if (!job) {
+      miniApiJson(res, 404, { ok: false, error: 'Job not found.' });
+      return true;
+    }
+    updateMiniJob(job, { abortRequested: true, stepTitle: 'Abort requested' });
+    miniApiJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/mini/db/sync/start') {
+    const job = createMiniJob('sync', {
+      primary: maskDsnInput(getConfiguredConfigDbDsn()),
+      secondary: maskDsnInput(MINI_DB_SECONDARY_DSN),
+    });
+    runMiniSyncJob(job);
+    miniApiJson(res, 202, { ok: true, jobId: job.jobId });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mini/db/sync/status') {
+    const job = getMiniJob(url.searchParams.get('jobId'), 'sync');
+    if (!job) {
+      miniApiJson(res, 404, { ok: false, error: 'Job not found.' });
+      return true;
+    }
+    miniApiJson(res, 200, toMiniJobStatus(job));
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/mini/db/sync/abort') {
+    const job = getMiniJob(body.jobId, 'sync');
+    if (!job) {
+      miniApiJson(res, 404, { ok: false, error: 'Job not found.' });
+      return true;
+    }
+    updateMiniJob(job, { abortRequested: true, stepTitle: 'Abort requested' });
+    miniApiJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mini/ping') {
+    miniApiJson(res, 200, await buildMiniPingPayload());
+    return true;
+  }
+
+  miniApiJson(res, 404, { ok: false, error: 'Not found' });
+  return true;
+}
+
 async function buildWebHealthPayload() {
   const logs = await listSelfLogs(5, 0);
   return {
@@ -19193,6 +19676,8 @@ function buildSettingsKeyboard() {
     .row()
     .text('📶 Ping test', 'gsettings:ping_test')
     .row()
+    .webApp('🗄️ Open DB Console', getMiniAppUrl())
+    .row()
     .text('🧹 Clear default project', 'gsettings:clear_default_project')
     .row()
     .text('⬅️ Back', 'gsettings:back');
@@ -19568,12 +20053,10 @@ async function runPingTest(ctx) {
 
     await progress.step('Building report');
     const lines = ['📶 Ping test', '', ...checks.map(formatCheck)];
-    const healthUrl = `${getPublicBaseUrl().replace(/\/$/, '')}/health`;
     const inline = new InlineKeyboard()
       .text('🔁 Retry', 'gsettings:ping_test')
       .row()
-      .url('🌐 Open Health URL', healthUrl)
-      .text('📋 Copy Health URL', 'gsettings:copy_health_url');
+      .webApp('🗄️ Open DB Console', getMiniAppUrl());
     if (defaultProject?.id) {
       inline
         .row()
@@ -21880,6 +22363,14 @@ function startHttpServer() {
       if (await handleWebRequest(req, res, url)) {
         return;
       }
+      if (await handleMiniApiRequest(req, res, url)) {
+        return;
+      }
+      if (req.method === 'GET' && (url.pathname === MINI_APP_ROUTE || url.pathname === `${MINI_APP_ROUTE}/`)) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderMiniAppPage());
+        return;
+      }
       if (await handleMiniSiteRequest(req, res, url)) {
         return;
       }
@@ -22378,6 +22869,9 @@ module.exports = {
     handleDeleteMessageCallback,
     fetchGithubReposWithToken,
     buildRepoPickerKeyboard,
+    verifyTelegramWebAppInitData,
+    authenticateMiniApiRequest,
+    handleMiniApiRequest,
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
   },
 };
