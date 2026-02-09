@@ -18,6 +18,12 @@ const {
   snapshot: getConfigDbSnapshot,
 } = require('./configDbState');
 const { classifyDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
+function truncateRuntimeError(value, max = 2500) {
+  const text = String(value == null ? '' : value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
 const {
   loadOpsState,
   appendEvent,
@@ -33,14 +39,14 @@ process.on('unhandledRejection', (reason) => {
   const error = reason instanceof Error ? reason : new Error(String(reason || 'Unhandled rejection'));
   runtimeStatus.fatalError = {
     source: 'unhandledRejection',
-    message: error.message,
-    stack: error.stack,
+    message: truncateRuntimeError(error.message, 600),
+    stack: truncateRuntimeError(error.stack, 2500),
     timestamp: new Date().toISOString(),
   };
   pmLogger.error('unhandledRejection', {
     source: 'process',
-    error: error.message,
-    stack: error.stack,
+    error: truncateRuntimeError(error.message, 600),
+    stack: truncateRuntimeError(error.stack, 2500),
   });
   console.error('[FATAL] Unhandled promise rejection', runtimeStatus.fatalError);
 });
@@ -49,14 +55,14 @@ process.on('uncaughtException', (error) => {
   const fatalError = error instanceof Error ? error : new Error(String(error || 'Uncaught exception'));
   runtimeStatus.fatalError = {
     source: 'uncaughtException',
-    message: fatalError.message,
-    stack: fatalError.stack,
+    message: truncateRuntimeError(fatalError.message, 600),
+    stack: truncateRuntimeError(fatalError.stack, 2500),
     timestamp: new Date().toISOString(),
   };
   pmLogger.error('uncaughtException', {
     source: 'process',
-    error: fatalError.message,
-    stack: fatalError.stack,
+    error: truncateRuntimeError(fatalError.message, 600),
+    stack: truncateRuntimeError(fatalError.stack, 2500),
   });
   console.error('[FATAL] Uncaught exception', runtimeStatus.fatalError);
 });
@@ -22612,26 +22618,50 @@ function startHttpServer() {
       }
       if (req.method === 'GET' && (url.pathname === '/pm/diagnostics' || url.pathname === '/__pm/diagnostics')) {
         const diagnostics = pmLogger.diagnostics();
+        const memory = process.memoryUsage();
+        const dbHealth = getDbHealthSnapshot();
         sendJson(res, 200, {
           ok: true,
-          enabled: diagnostics.flags.enabled,
-          hasPmUrl: diagnostics.flags.hasPmUrl,
-          hasIngestToken: diagnostics.flags.hasIngestToken,
-          testEnabled: diagnostics.flags.testEnabled,
-          hasTestToken: diagnostics.flags.hasTestToken,
-          hooksInstalled: diagnostics.flags.hooksInstalled,
-          lastSend: diagnostics.lastSend
+          version: resolveBuildVersion(),
+          uptimeSeconds: Math.floor(process.uptime()),
+          memory: {
+            rssMb: Number((memory.rss / (1024 * 1024)).toFixed(2)),
+            heapUsedMb: Number((memory.heapUsed / (1024 * 1024)).toFixed(2)),
+            heapTotalMb: Number((memory.heapTotal / (1024 * 1024)).toFixed(2)),
+            externalMb: Number((memory.external / (1024 * 1024)).toFixed(2)),
+          },
+          dbHealthSnapshot: dbHealth
             ? {
-                at: diagnostics.lastSend.at || null,
-                level: diagnostics.lastSend.level || null,
-                ok: diagnostics.lastSend.ok === true,
-                statusCode: Number.isFinite(diagnostics.lastSend.statusCode)
-                  ? diagnostics.lastSend.statusCode
-                  : null,
-                correlationId: diagnostics.lastSend.correlationId || null,
-                skipped: diagnostics.lastSend.skipped === true,
+                status: dbHealth.status || null,
+                updatedAt: dbHealth.updatedAt || null,
+                failureStreak: Number.isFinite(dbHealth.failureStreak) ? dbHealth.failureStreak : null,
+                lastErrorCategory: dbHealth.lastErrorCategory || null,
               }
             : null,
+          envScanSummary: {
+            scannedAt: miniLatestEnvScan?.scannedAt || null,
+            summary: miniLatestEnvScan?.summary || 'No scan yet.',
+          },
+          pm: {
+            enabled: diagnostics.flags.enabled,
+            hasPmUrl: diagnostics.flags.hasPmUrl,
+            hasIngestToken: diagnostics.flags.hasIngestToken,
+            testEnabled: diagnostics.flags.testEnabled,
+            hasTestToken: diagnostics.flags.hasTestToken,
+            hooksInstalled: diagnostics.flags.hooksInstalled,
+            lastSend: diagnostics.lastSend
+              ? {
+                  at: diagnostics.lastSend.at || null,
+                  level: diagnostics.lastSend.level || null,
+                  ok: diagnostics.lastSend.ok === true,
+                  statusCode: Number.isFinite(diagnostics.lastSend.statusCode)
+                    ? diagnostics.lastSend.statusCode
+                    : null,
+                  correlationId: diagnostics.lastSend.correlationId || null,
+                  skipped: diagnostics.lastSend.skipped === true,
+                }
+              : null,
+          },
         });
         return;
       }
@@ -22652,17 +22682,28 @@ function startHttpServer() {
           return;
         }
 
-        const level = normalizeLogLevel(payload.level) || 'info';
-        const result = await pmLogger.send(level, payload.message || 'pm test log', {
-          source: 'pm-test-log',
-          correlationId: payload.correlationId,
-          route: url.pathname,
-        });
+        const baseMessage = payload.message || 'pm synthetic test log';
+        const correlationId = payload.correlationId;
+        const levels = ['info', 'warn', 'error'];
+        const sends = [];
+        for (const level of levels) {
+          sends.push(
+            pmLogger.send(level, `${baseMessage} (${level.toUpperCase()})`, {
+              source: 'pm-test-log',
+              correlationId,
+              route: url.pathname,
+              synthetic: true,
+            }),
+          );
+        }
+        const results = await Promise.all(sends);
+        const allOk = results.every((entry) => entry && entry.ok === true);
 
-        sendJson(res, result.ok ? 200 : 502, {
-          ok: result.ok === true,
+        sendJson(res, allOk ? 200 : 502, {
+          ok: allOk,
           accepted: true,
-          correlationId: result.correlationId || null,
+          emitted: levels,
+          correlationIds: results.map((entry) => (entry ? entry.correlationId || null : null)),
         });
         return;
       }
