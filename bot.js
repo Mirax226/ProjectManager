@@ -971,15 +971,28 @@ async function sendEphemeralMessage(ctx, text, extra) {
 async function sendDismissibleMessage(ctx, text, extra = {}) {
   const ownerId = ctx?.from?.id;
   const chatId = getChatIdFromCtx(ctx);
+  const existingMarkup = sanitizeReplyMarkup(extra.reply_markup);
+  const withPendingDelete = {
+    inline_keyboard: [
+      ...(Array.isArray(existingMarkup?.inline_keyboard) ? existingMarkup.inline_keyboard : []),
+      [{ text: '🗑 Delete', callback_data: 'msgdel:pending' }],
+    ],
+  };
   const response = await replySafely(ctx, text, {
     ...extra,
-    reply_markup: new InlineKeyboard().text('🗑 Delete', 'msgdel:pending'),
+    reply_markup: withPendingDelete,
   });
   if (response?.message_id && chatId && ownerId) {
     const callback = buildCb('msgdel', [ownerId, chatId, response.message_id]);
+    const finalMarkup = {
+      inline_keyboard: [
+        ...(Array.isArray(existingMarkup?.inline_keyboard) ? existingMarkup.inline_keyboard : []),
+        [{ text: '🗑 Delete', callback_data: callback }],
+      ],
+    };
     try {
       await bot.api.editMessageReplyMarkup(chatId, response.message_id, {
-        reply_markup: new InlineKeyboard().text('🗑 Delete', callback),
+        reply_markup: finalMarkup,
       });
     } catch (error) {
       console.warn('[msgdel] failed to attach final delete callback', error?.message);
@@ -2267,6 +2280,7 @@ const GLOBAL_COMMAND_ALIASES = {
   '/cronjobs': '/cronjobs',
   '/deploy': '/deploy',
   '/logs': '/logs',
+  '/health': '/health',
   '/start': '/start',
 };
 
@@ -2331,6 +2345,15 @@ async function handleStartCommand(ctx, payload) {
 }
 
 async function handleGlobalCommand(ctx, command, payload) {
+  if (command === '/health') {
+    const healthUrl = `${getPublicBaseUrl().replace(/\/$/, '')}/health`;
+    await sendDismissibleMessage(
+      ctx,
+      `This is a web endpoint. Open: ${healthUrl}`,
+      { reply_markup: new InlineKeyboard().url('🌐 Open Health URL', healthUrl) },
+    );
+    return true;
+  }
   if (command === '/start') {
     await handleStartCommand(ctx, payload);
     return true;
@@ -3933,6 +3956,11 @@ async function handleGlobalSettingsCallback(ctx, data) {
     case 'ping_test':
       await runPingTest(ctx);
       break;
+    case 'copy_health_url': {
+      const healthUrl = `${getPublicBaseUrl().replace(/\/$/, '')}/health`;
+      await ensureAnswerCallback(ctx, { text: healthUrl, show_alert: true });
+      break;
+    }
     case 'clear_default_base':
       await clearDefaultBaseBranch();
       await renderGlobalSettings(ctx, '✅ Default base branch cleared (using environment default).');
@@ -5545,7 +5573,7 @@ async function promptEnvVaultValue(ctx, projectId, key, options = {}) {
     added: [],
     skipped: [],
     existing: [],
-    backCallback: `envvault:menu:${projectId}`,
+    backCallback: options.backCallback || `envvault:menu:${projectId}`,
     messageContext,
   };
   await promptNextEnvVaultKey(ctx, state);
@@ -5562,7 +5590,8 @@ async function promptNextEnvVaultKey(ctx, state) {
     }
     state.currentKey = nextKey;
     setUserState(ctx.from.id, state);
-    const inline = new InlineKeyboard().text('❌ Cancel', 'cancel_input');
+    const inline = new InlineKeyboard().text('⬅️ Back', state.backCallback || `envvault:menu:${state.projectId}`);
+    inline.row().text('❌ Cancel', 'cancel_input');
     if (state.allowSkip) {
       inline.text('⏭ Skip this key', 'envvault:skip:' + state.projectId);
     }
@@ -5587,8 +5616,8 @@ async function finishEnvVaultSequence(ctx, state) {
     lines.push(`Missing required: ${missingRequired.join(', ')}`);
   }
   clearUserState(ctx.from.id);
-  await renderStateMessage(ctx, state, lines.join('\n'), {
-    reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
+  await sendDismissibleMessage(ctx, lines.join('\n'), {
+    reply_markup: buildBackKeyboard(state.backCallback || `envvault:menu:${state.projectId}`),
   });
 }
 
@@ -11549,15 +11578,12 @@ async function scanEnvRequirements(ctx, projectId) {
   };
 
   const summarizeEntry = (entry, classification, resolved) => {
+    const preset = getPmEnvPreset(entry.name);
     const lines = [
       `${classification} ${entry.name}`,
       `• Source: ${resolved.source || '-'} | First seen: ${entry.firstSeen?.path || '-'}:${entry.firstSeen?.line || '-'}`,
+      `• Recommended profile: ${preset.category}`,
     ];
-    if (entry.firstSeenExcerpt) {
-      lines.push(
-        ...entry.firstSeenExcerpt.split('\n').map((line) => `> ${line}`),
-      );
-    }
     return lines;
   };
 
@@ -11578,12 +11604,16 @@ async function scanEnvRequirements(ctx, projectId) {
     `💡 Suggested: ${suggested.length}`,
   ];
 
-  const reportLines = [header, ...summary];
+  const reportLines = [header, ...summary, '', 'Detailed missing env report:'];
   if (missingRequiredEntries.length) {
     reportLines.push('', '❌ Required missing:');
     missingRequiredEntries.forEach((entry) => {
       const resolved = resolveEnvStatus(entry.name);
+      const preset = getPmEnvPreset(entry.name);
       reportLines.push(...summarizeEntry(entry, '❌ Required:', resolved));
+      reportLines.push(`• What it does: ${getEnvPurposeHint(entry.name)}`);
+      reportLines.push(`• Recommended value for PM: ${preset.recommendedValue || '(none / set manually)'}`);
+      reportLines.push(`• Notes: ${preset.notes}`);
       reportLines.push('');
     });
   }
@@ -11591,7 +11621,11 @@ async function scanEnvRequirements(ctx, projectId) {
     reportLines.push('', '⚠️ Optional missing:');
     missingOptionalEntries.forEach((entry) => {
       const resolved = resolveEnvStatus(entry.name);
+      const preset = getPmEnvPreset(entry.name);
       reportLines.push(...summarizeEntry(entry, '⚠️ Optional:', resolved));
+      reportLines.push(`• What it does: ${getEnvPurposeHint(entry.name)}`);
+      reportLines.push(`• Recommended value for PM: ${preset.recommendedValue || '(optional)'}`);
+      reportLines.push(`• Notes: ${preset.notes}`);
       reportLines.push('');
     });
   }
@@ -11602,24 +11636,16 @@ async function scanEnvRequirements(ctx, projectId) {
       .sort((a, b) => a.name.localeCompare(b.name))
       .forEach((entry) => {
         const resolved = resolveEnvStatus(entry.name);
+        const preset = getPmEnvPreset(entry.name);
         reportLines.push(...summarizeEntry(entry, '💡 Suggested:', resolved));
+        reportLines.push(`• What it does: ${getEnvPurposeHint(entry.name)}`);
+        reportLines.push(`• Recommended value for PM: ${preset.recommendedValue || '(optional)'}`);
+        reportLines.push(`• Notes: ${preset.notes}`);
         reportLines.push('');
       });
   }
 
-  const maxLines = 120;
-  const maxChars = 3500;
-  let truncated = false;
-  let outputLines = reportLines;
-  if (outputLines.length > maxLines) {
-    outputLines = outputLines.slice(0, maxLines);
-    truncated = true;
-  }
-  let outputText = outputLines.join('\n').trim();
-  if (outputText.length > maxChars) {
-    outputText = `${outputText.slice(0, maxChars)}\n... (truncated)`;
-    truncated = true;
-  }
+  const outputText = [header, ...summary].join('\n');
 
   const inline = new InlineKeyboard()
     .text('🛠️ Fix missing required envs', `proj:env_scan_fix_missing:${projectId}`)
@@ -11630,12 +11656,11 @@ async function scanEnvRequirements(ctx, projectId) {
     .row()
     .text('⬅️ Back', `proj:diagnostics_menu:${projectId}`);
 
-  await updateProgress(outputText, [], { reply_markup: inline });
-
-  if (truncated) {
-    const filename = `${projectId}-env-scan-report.txt`;
-    await sendTextFile(ctx, filename, reportLines.join('\n'));
-  }
+  await sendDismissibleMessage(ctx, outputText, { reply_markup: inline });
+  const filename = `${projectId}-env-scan-report.txt`;
+  await sendTextFile(ctx, filename, reportLines.join('\n'), 'Env scan detailed report');
+  await updateProgress('✅ Env scan completed. Opening diagnostics menu…');
+  await renderProjectDiagnosticsMenu(ctx, projectId, '✅ Env scan completed.');
 
   console.log('[env scan] end', { projectId, entries: entries.length });
 }
@@ -19543,7 +19568,12 @@ async function runPingTest(ctx) {
 
     await progress.step('Building report');
     const lines = ['📶 Ping test', '', ...checks.map(formatCheck)];
-    const inline = new InlineKeyboard().text('🔁 Retry', 'gsettings:ping_test');
+    const healthUrl = `${getPublicBaseUrl().replace(/\/$/, '')}/health`;
+    const inline = new InlineKeyboard()
+      .text('🔁 Retry', 'gsettings:ping_test')
+      .row()
+      .url('🌐 Open Health URL', healthUrl)
+      .text('📋 Copy Health URL', 'gsettings:copy_health_url');
     if (defaultProject?.id) {
       inline
         .row()
@@ -19627,6 +19657,119 @@ async function checkConfigDbHealthForPing() {
       };
   }
   return response;
+}
+
+function getPmEnvPreset(name) {
+  const presets = {
+    PGCONNECT_TIMEOUT: {
+      recommendedValue: '15',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Postgres connect timeout in seconds.',
+      notes: 'Safe default for production and development.',
+    },
+    DB_STATEMENT_TIMEOUT_MS: {
+      recommendedValue: '8000',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Cancels slow SQL statements after timeout.',
+      notes: 'Use 5000-8000 ms to reduce long-running query impact.',
+    },
+    LOG_DEDUPE_WINDOW_SEC: {
+      recommendedValue: '30',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Deduplicates repeated logs inside the time window.',
+      notes: 'Reduces alert noise while keeping signal.',
+    },
+    LOG_RATE_LIMIT_PER_MIN: {
+      recommendedValue: '60',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Caps per-minute log throughput to protect sinks.',
+      notes: 'Tune up only if you intentionally handle high volume.',
+    },
+    LOG_RATE_LIMIT_BURST: {
+      recommendedValue: '20',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Allows short log bursts before throttling.',
+      notes: 'Keep aligned with LOG_RATE_LIMIT_PER_MIN.',
+    },
+    PM_DB_SCHEMA: {
+      recommendedValue: 'public',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Default schema used by PM DB operations.',
+      notes: 'Use explicit schema if your DB is multi-tenant.',
+    },
+    SELF_LOG_FORWARDING: {
+      recommendedValue: 'enabled',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Enables forwarding PM self-logs to configured targets.',
+      notes: 'Useful for operational visibility in production.',
+    },
+    SELF_LOG_FALLBACK: {
+      recommendedValue: 'console',
+      category: 'Recommended (prod)',
+      whatItDoes: 'Fallback sink when forwarding cannot be delivered.',
+      notes: 'Keeps diagnostic logs available during integration outages.',
+    },
+    ALLOW_INSECURE_TLS_FOR_TESTS: {
+      recommendedValue: null,
+      category: 'Dev-only (do not set in prod)',
+      whatItDoes: 'Disables TLS verification for test-only endpoints.',
+      notes: 'Security risk in production. Keep unset in prod.',
+    },
+  };
+  return presets[name] || {
+    recommendedValue: null,
+    category: 'Optional',
+    whatItDoes: 'Environment variable used by project/runtime code.',
+    notes: 'Set only if required by your runtime behavior.',
+  };
+}
+
+function getEnvPurposeHint(name) {
+  const preset = getPmEnvPreset(name);
+  if (preset.whatItDoes && preset.whatItDoes !== 'Environment variable used by project/runtime code.') {
+    return preset.whatItDoes;
+  }
+  if (name.includes('TOKEN') || name.includes('SECRET') || name.includes('KEY')) {
+    return 'Authentication secret/token used by integrations.';
+  }
+  if (name.includes('URL') || name.includes('HOST') || name.includes('PORT')) {
+    return 'Connection endpoint/runtime routing setting.';
+  }
+  if (name.includes('TIMEOUT')) {
+    return 'Timeout control for external or DB operations.';
+  }
+  if (name.includes('LOG')) {
+    return 'Logging/observability behavior control.';
+  }
+  return 'Environment variable used by project/runtime code.';
+}
+
+function buildPublicHealthPayload(latencyMs, lastErrorCategory) {
+  const memory = process.memoryUsage();
+  return {
+    status: runtimeStatus.fatalError ? 'degraded' : 'ok',
+    uptimeSec: Math.floor(process.uptime()),
+    configDb: {
+      status: runtimeStatus.configDbOk ? 'ok' : 'down',
+      latencyMs,
+      lastErrorCategory: lastErrorCategory || null,
+    },
+    memory: {
+      rssMb: Number((memory.rss / (1024 * 1024)).toFixed(2)),
+      heapUsedMb: Number((memory.heapUsed / (1024 * 1024)).toFixed(2)),
+    },
+  };
+}
+
+async function buildPublicHealthPayloadSafely() {
+  const startedAt = Date.now();
+  try {
+    const probe = await probeConfigDbConnection();
+    const latencyMs = Date.now() - startedAt;
+    return buildPublicHealthPayload(latencyMs, probe?.category || getDbHealthSnapshot()?.lastErrorCategory);
+  } catch (error) {
+    return buildPublicHealthPayload(Date.now() - startedAt, classifyDbError(error));
+  }
 }
 
 
@@ -20290,7 +20433,7 @@ function getPublicBaseUrl() {
     process.env.PM_BASE_URL ||
     process.env.PUBLIC_BASE_URL ||
     process.env.RENDER_EXTERNAL_URL ||
-    `http://localhost:${port}`
+    `http://localhost:${PORT}`
   );
 }
 
@@ -21742,6 +21885,12 @@ function startHttpServer() {
       }
       if (req.method === 'GET' && url.pathname === '/healthz') {
         const payload = await buildHealthzPayloadSafely();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(payload));
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/health') {
+        const payload = await buildPublicHealthPayloadSafely();
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(payload));
         return;
