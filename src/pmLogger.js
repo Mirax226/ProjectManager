@@ -1,8 +1,10 @@
 const crypto = require('crypto');
 
-const fetchImpl = global.fetch || require('node-fetch');
 
 const SENSITIVE_META_KEY = /(token|secret|password|authorization|api[-_]?key|cookie)/i;
+const MAX_STRING_LENGTH = 1500;
+const MAX_META_DEPTH = 4;
+const MAX_META_KEYS = 50;
 
 function parseBoolean(value, defaultValue = false) {
   if (value == null) return defaultValue;
@@ -12,19 +14,40 @@ function parseBoolean(value, defaultValue = false) {
   return defaultValue;
 }
 
-function normalizeMeta(meta) {
-  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
-    return {};
+function truncateString(value, max = MAX_STRING_LENGTH) {
+  const text = String(value == null ? '' : value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function normalizeMetaValue(value, depth = 0) {
+  if (value == null) return value;
+  if (typeof value === 'string') return truncateString(value);
+  if (typeof value !== 'object') return value;
+  if (depth >= MAX_META_DEPTH) return '[TRUNCATED]';
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_META_KEYS).map((entry) => normalizeMetaValue(entry, depth + 1));
   }
   const clean = {};
-  for (const [key, value] of Object.entries(meta)) {
+  let count = 0;
+  for (const [key, entry] of Object.entries(value)) {
+    if (count >= MAX_META_KEYS) {
+      clean.__truncated__ = true;
+      break;
+    }
+    count += 1;
     if (SENSITIVE_META_KEY.test(key)) {
       clean[key] = '[MASKED]';
       continue;
     }
-    clean[key] = value;
+    clean[key] = normalizeMetaValue(entry, depth + 1);
   }
   return clean;
+}
+
+function normalizeMeta(meta) {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return {};
+  return normalizeMetaValue(meta, 0);
 }
 
 function getCorrelationId(meta) {
@@ -36,8 +59,9 @@ function getCorrelationId(meta) {
 
 function createPmLogger(options = {}) {
   const env = options.env || process.env;
-  const baseUrl = (options.pmUrl || env.PM_URL || '').trim().replace(/\/$/, '');
-  const ingestToken = (options.ingestToken || env.PM_INGEST_TOKEN || '').trim();
+  const fetchImpl = options.fetch || global.fetch || require('node-fetch');
+  const baseUrl = (options.pmUrl || env.PM_URL || env.PATH_APPLIER_URL || '').trim().replace(/\/$/, '');
+  const ingestToken = (options.ingestToken || env.PM_INGEST_TOKEN || env.PM_TOKEN || '').trim();
   const testEnabled = parseBoolean(options.testEnabled ?? env.PM_TEST_ENABLED, false);
   const testToken = (options.testToken || env.PM_TEST_TOKEN || '').trim();
   const enabled = Boolean(baseUrl && ingestToken);
@@ -69,25 +93,34 @@ function createPmLogger(options = {}) {
     }
 
     try {
-      const response = await fetchImpl(`${baseUrl}/api/logs`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${ingestToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          level: requestMeta.level,
-          message: message == null ? '' : String(message),
-          meta: normalizedMeta,
-        }),
-      });
-      requestMeta.statusCode = response.status;
-      requestMeta.ok = response.ok;
-      if (!response.ok) {
-        requestMeta.error = `status_${response.status}`;
+      const payload = {
+        level: requestMeta.level,
+        message: truncateString(message == null ? '' : String(message)),
+        meta: normalizedMeta,
+      };
+      const ingestPaths = ['/api/logs', '/api/pm/logs'];
+      let response = null;
+      for (const ingestPath of ingestPaths) {
+        response = await fetchImpl(`${baseUrl}${ingestPath}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${ingestToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        if (response.ok) {
+          break;
+        }
+        if (response.status !== 404) {
+          break;
+        }
       }
+      requestMeta.statusCode = response ? response.status : null;
+      requestMeta.ok = response ? response.ok : false;
+      if (!requestMeta.ok) requestMeta.error = `status_${requestMeta.statusCode || 'unknown'}`;
       state.lastSend = requestMeta;
-      return { ok: response.ok, correlationId, statusCode: response.status };
+      return { ok: requestMeta.ok, correlationId, statusCode: requestMeta.statusCode };
     } catch (error) {
       requestMeta.error = error?.message || 'request_failed';
       state.lastSend = requestMeta;
@@ -121,16 +154,16 @@ function createPmLogger(options = {}) {
       const error = reason instanceof Error ? reason : new Error(String(reason || 'Unhandled rejection'));
       send('error', 'unhandledRejection', {
         source: 'process',
-        error: error.message,
-        stack: error.stack,
+        error: truncateString(error.message, 600),
+        stack: truncateString(error.stack || '', 2500),
       });
     });
     process.on('uncaughtException', (error) => {
       const resolved = error instanceof Error ? error : new Error(String(error || 'Uncaught exception'));
       send('error', 'uncaughtException', {
         source: 'process',
-        error: resolved.message,
-        stack: resolved.stack,
+        error: truncateString(resolved.message, 600),
+        stack: truncateString(resolved.stack || '', 2500),
       });
     });
   }
