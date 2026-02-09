@@ -10,9 +10,22 @@ const rules = [
   require('./rules/repoInspectionMissing'),
   require('./rules/schemaRunnerMiniApp'),
   require('./rules/oomLoop'),
+  ...require('./rules/expandedCatalog'),
 ];
 
 const SIGNAL_SYNONYMS = {
+
+  OLD_MENU_NOT_CLEANED: ['old menu messages', 'menu clutter'],
+  CRON_4XX_5XX: ['cron 4xx', 'cron 5xx', 'rate limited'],
+  DB_TIMEOUTS: ['db timeout', 'statement timeout', 'connection timeout'],
+  WIZARD_STUCK: ['wizard stuck', 'flow stuck'],
+  HEALTH_MISCONFIG: ['missing /health', 'health misconfigured'],
+  TELEGRAM_CALLBACK_ERRORS: ['message not modified', 'message too old'],
+  DUPLICATE_NOTIFICATION_SPAM: ['duplicate notifications', 'spam alerts'],
+  SAFE_MODE_STATE_BUG: ['safe mode not triggering', 'safe mode not exiting'],
+  DRIFT_BASELINE_MISSING: ['drift baseline missing'],
+  DUAL_DB_SYNC_CONFLICT: ['dual db sync', 'divergence'],
+  SCHEMA_RUNNER_REGRESSION: ['schema runner not in mini app'],
   CRON_CREATE_500: ['cron 500', 'cron-job', 'failed to create cron job'],
   INVALID_DSN: ['invalid url', 'dsn', 'postgres url'],
   WORKDIR_OUTSIDE_REPO: ['outside repo', 'working directory invalid'],

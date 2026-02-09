@@ -180,6 +180,13 @@ const {
 const { createLogIngestService, formatContext, shouldRouteBySeverity } = require('./logIngestService');
 const { getDefaultGithubToken, setDefaultGithubToken } = require('./userGithubTokenStore');
 const { createLogsRouter, parseAllowedProjects } = require('./src/routes/logs.ts');
+const { createOpsTimelineStore } = require('./src/opsTimeline');
+const { createSafeModeController } = require('./src/safeMode');
+const { buildProjectSnapshot, calculateDrift } = require('./src/driftDetector');
+const { generateRunbooksFromRoutineRules, searchRunbooks } = require('./src/runbooks');
+const { planRiskyOperation } = require('./src/shadowRuns');
+const { listTemplates, getTemplate } = require('./src/projectTemplates');
+const { resolveRole, canAccess } = require('./src/permissions');
 const {
   listNotes,
   getNote,
@@ -338,6 +345,9 @@ const ephemeralMessageIdsByChat = new Map();
 const ephemeralTimersByChat = new Map();
 const webSessions = new Map();
 const webLoginAttempts = new Map();
+const opsTimeline = createOpsTimelineStore({ globalLimit: Number(process.env.OPS_TIMELINE_GLOBAL_LIMIT) || 2000, projectLimit: Number(process.env.OPS_TIMELINE_PROJECT_LIMIT) || 2000 });
+const safeMode = createSafeModeController({});
+const driftBaselines = new Map();
 const pendingLogTests = new Map();
 let httpServerPromise = null;
 let miniSiteWarmupSummary = {
@@ -1239,10 +1249,14 @@ function getNavigationHandlers() {
   return {
     main: async (ctx) => renderMainMenu(ctx),
     projects: async (ctx) => renderProjectsList(ctx),
-    database: async (ctx) => renderDataCenterMenu(ctx),
-    cronjobs: async (ctx) => renderCronMenu(ctx),
     settings: async (ctx) => renderGlobalSettings(ctx),
     logs: async (ctx) => renderLogsProjectList(ctx, '📣 Logs'),
+    ops: async (ctx) => renderOpsMenu(ctx),
+    diagnostics: async (ctx) => renderLogDeliveryDiagnosticsMenu(ctx),
+    templates: async (ctx) => renderTemplatesMenu(ctx),
+    help: async (ctx) => renderHelpMenu(ctx),
+    database: async (ctx) => renderDataCenterMenu(ctx),
+    cronjobs: async (ctx) => renderCronMenu(ctx),
     deploy: async (ctx) => renderDeploysProjectList(ctx),
   };
 }
@@ -1982,15 +1996,15 @@ async function handleReplyKeyboardNavigation(ctx, route) {
 function buildMainMenuInlineKeyboard() {
   return new InlineKeyboard()
     .text('📦 Projects', 'main:projects')
-    .text('🗄️ Database', 'main:database')
-    .row()
-    .text('⏱️ Cronjobs', 'main:cronjobs')
-    .text('⚙️ Settings', 'main:settings')
-    .row()
     .text('📣 Logs', 'main:logs')
-    .text('🚀 Deploys', 'main:deploys')
     .row()
-    .webApp('🗄️ Open DB Console', getMiniAppUrl());
+    .text('🛟 Ops', 'main:ops')
+    .text('🧪 Diagnostics', 'main:diagnostics')
+    .row()
+    .text('🧩 Templates', 'main:templates')
+    .text('❓ Help', 'main:help')
+    .row()
+    .text('⚙️ Settings', 'main:settings');
 }
 
 function buildCancelKeyboard() {
@@ -2316,29 +2330,40 @@ function triggerConfigDbWarmup(reason = 'manual') {
 }
 
 
-async function sendOpsAlertByDestinations(destinations, text, extra = {}, meta = {}) {
+function buildErrorEnvelope(event) {
+  return {
+    refId: event?.meta_json?.refId || `OPS-${String(event.id || '').slice(0, 8).toUpperCase()}`,
+    category: event.category || 'GENERAL',
+    severity: String(event.level || 'warn').toLowerCase(),
+    messageMasked: maskDiagnosticText(event.message_short || ''),
+    nextActions: ['📋 Copy debug', '🔎 Open timeline', '🗑 Delete'],
+  };
+}
+
+function buildOpsAlertText(event, envelope) {
+  return [
+    `🚨 [${String(envelope.severity).toUpperCase()}] ${envelope.category}`,
+    `Ref: ${envelope.refId}`,
+    envelope.messageMasked,
+  ].join('\n');
+}
+
+async function sendOpsAlertByDestinations(destinations, event, extra = {}) {
   const sends = [];
-  const routineButton = buildRoutineFixButton(text, meta.category || null, meta.refId || null);
-  const composedExtra = routineButton
-    ? {
-        ...extra,
-        reply_markup: {
-          inline_keyboard: [
-            ...((extra.reply_markup && extra.reply_markup.inline_keyboard) || []),
-            [routineButton],
-          ],
-        },
-      }
-    : extra;
-  if (destinations.admin_inbox && ADMIN_TELEGRAM_ID) {
-    sends.push(bot.api.sendMessage(ADMIN_TELEGRAM_ID, text, composedExtra));
-  }
-  if (destinations.admin_room && ADMIN_ROOM_CHAT_ID) {
-    sends.push(bot.api.sendMessage(ADMIN_ROOM_CHAT_ID, text, composedExtra));
-  }
-  if (destinations.admin_rob && ADMIN_ROB_CHAT_ID) {
-    sends.push(bot.api.sendMessage(ADMIN_ROB_CHAT_ID, text, composedExtra));
-  }
+  const envelope = buildErrorEnvelope(event);
+  const text = buildOpsAlertText(event, envelope);
+  const routineButton = buildRoutineFixButton(text, envelope.category, envelope.refId);
+  const debugPayload = Buffer.from(JSON.stringify(envelope)).toString('base64url');
+  const keyboard = [
+    ...(routineButton ? [[routineButton]] : []),
+    [{ text: '📋 Copy debug', callback_data: buildCb('opsdbg', [debugPayload]) }],
+    [{ text: '🔎 Timeline', callback_data: 'ops:timeline' }],
+    [{ text: '🗑 Delete', callback_data: buildCb('del', [ADMIN_TELEGRAM_ID || '0']) }],
+  ];
+  const composedExtra = { ...extra, reply_markup: { inline_keyboard: keyboard } };
+  if (destinations.admin_inbox && ADMIN_TELEGRAM_ID) sends.push(bot.api.sendMessage(ADMIN_TELEGRAM_ID, text, composedExtra));
+  if (destinations.admin_room && ADMIN_ROOM_CHAT_ID) sends.push(bot.api.sendMessage(ADMIN_ROOM_CHAT_ID, text, composedExtra));
+  if (destinations.admin_rob && ADMIN_ROB_CHAT_ID) sends.push(bot.api.sendMessage(ADMIN_ROB_CHAT_ID, text, composedExtra));
   if (!sends.length) return [];
   return Promise.allSettled(sends);
 }
@@ -2347,12 +2372,21 @@ async function routeOpsAlert(event) {
   const prefs = await getUserAlertPrefs(ADMIN_TELEGRAM_ID || 'admin');
   if (!shouldRouteEvent(prefs, event)) return;
   const destinations = computeDestinations(prefs, event.level);
-  const text = `⚠️ [${String(event.level || 'warn').toUpperCase()}] ${event.category}\n${event.message_short}`;
-  await sendOpsAlertByDestinations(destinations, text, { disable_web_page_preview: true }, { category: event.category, refId: event?.meta_json?.refId || null });
+  await sendOpsAlertByDestinations(destinations, event, { disable_web_page_preview: true });
 }
 
 async function emitOpsEvent(level, category, message, meta) {
   const event = await appendEvent({ level, category, messageShort: message, source: 'config-db', meta });
+  opsTimeline.append({
+    scope: meta?.projectId ? 'project' : 'global', projectId: meta?.projectId || null,
+    type: category, severity: level, title: message, detailsMasked: maskDiagnosticText(JSON.stringify(meta || {})), refId: meta?.refId || null,
+  });
+  const safeEval = safeMode.markSeverity(level);
+  if (safeEval.changed && safeEval.mode === 'on') {
+    await appendEvent({ level: 'critical', category: 'SAFE_MODE_ENTER', messageShort: `Safe Mode entered (${safeEval.reasons.join(', ')})`, source: 'safe-mode', meta: { refId: `SAFE-${Date.now()}` } });
+  } else if (safeEval.changed && safeEval.mode === 'off') {
+    await appendEvent({ level: 'info', category: 'SAFE_MODE_EXIT', messageShort: 'Safe Mode exited after stable recovery.', source: 'safe-mode', meta: { refId: `SAFE-${Date.now()}` } });
+  }
   await routeOpsAlert(event);
 }
 
@@ -2901,6 +2935,12 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     await handleRoutineCallback(ctx, data);
     return;
   }
+  if (data.startsWith('opsdbg:')) {
+    await ensureAnswerCallback(ctx);
+    const payload = decodeRoutinePayload(data.split(':')[1]);
+    await sendDismissibleMessage(ctx, `\`\`\`json\n${JSON.stringify(payload || {}, null, 2)}\n\`\`\``);
+    return;
+  }
   if (data.startsWith('routinefix:')) {
     const parts = data.split(':');
     await maybeSendRoutineFixFromButton(ctx, parts[1]);
@@ -2908,6 +2948,14 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
   }
   if (data.startsWith('main:')) {
     await handleMainCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('ops:')) {
+    await handleOpsCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('help:')) {
+    await handleHelpCallback(ctx, data);
     return;
   }
   if (data.startsWith('proj:')) {
@@ -3179,12 +3227,59 @@ async function handleMainCallback(ctx, data) {
     case 'logs':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'logs', { ctx });
       break;
+    case 'ops':
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'ops', { ctx });
+      break;
+    case 'diagnostics':
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'diagnostics', { ctx });
+      break;
+    case 'templates':
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'templates', { ctx });
+      break;
+    case 'help':
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'help', { ctx });
+      break;
     case 'deploys':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'deploy', { ctx });
       break;
     default:
       break;
   }
+}
+
+async function handleOpsCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const [, action] = data.split(':');
+  if (action === 'timeline') {
+    const result = opsTimeline.query({ pageSize: 12 });
+    const lines = ['🕒 Ops Timeline', ...result.items.map((e) => `• [${e.severity}] ${e.type}: ${e.title}${e.refId ? ` (${e.refId})` : ''}`)];
+    await renderOrEdit(ctx, lines.join('\n') || 'No events yet.', { reply_markup: new InlineKeyboard().text('⬅️ Back', 'main:ops') });
+    return;
+  }
+  if (action === 'safe_mode') {
+    const status = safeMode.getStatus();
+    const lines = [
+      '🛡 Safe Mode',
+      `Status: ${status.mode === 'on' ? 'ON' : 'OFF'}`,
+      `Forced: ${status.forced || 'none'}`,
+      `Last reason: ${status.lastEnteredReason || '-'}`,
+    ];
+    const kb = new InlineKeyboard().text('Force ON', 'ops:sm_force_on').text('Force OFF', 'ops:sm_force_off').row().text('Reset counters', 'ops:sm_reset').row().text('⬅️ Back', 'main:ops');
+    await renderOrEdit(ctx, lines.join('\n'), { reply_markup: kb });
+    return;
+  }
+  if (action === 'sm_force_on') safeMode.setForced('on');
+  if (action === 'sm_force_off') safeMode.setForced('off');
+  if (action === 'sm_reset') safeMode.resetCounters();
+  await renderOpsMenu(ctx);
+}
+
+async function handleHelpCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const [, page] = data.split(':');
+  const pages = buildHelpPages();
+  const text = pages[page] || pages.overview;
+  await renderOrEdit(ctx, `❓ Help — ${page || 'overview'}\n\n${text}`, { reply_markup: new InlineKeyboard().text('⬅️ Back', 'main:help') });
 }
 
 async function handleProjectCallback(ctx, data) {
@@ -20068,6 +20163,62 @@ async function getLastOpsErrorContext() {
     refId,
     category: event.category || null,
   };
+}
+
+async function renderOpsMenu(ctx) {
+  const status = safeMode.getStatus();
+  const lines = [
+    '🛟 Ops',
+    `Safe Mode: ${status.mode === 'on' ? '🟠 ON' : '🟢 OFF'}`,
+    status.lastEnteredReason ? `Last reason: ${status.lastEnteredReason}` : null,
+  ].filter(Boolean);
+  const keyboard = new InlineKeyboard()
+    .text('🕒 Timeline', 'ops:timeline')
+    .text('🛡 Safe Mode', 'ops:safe_mode')
+    .row()
+    .text('⬅️ Back', 'main:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: keyboard });
+}
+
+async function renderTemplatesMenu(ctx) {
+  const templates = listTemplates();
+  const lines = ['🧩 Templates', ...templates.map((item) => `• ${item.name}`), '', 'Use templates to apply safe defaults quickly.'];
+  const keyboard = new InlineKeyboard().text('⬅️ Back', 'main:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: keyboard });
+}
+
+function buildHelpPages() {
+  return {
+    overview: 'PM is an operations control bot with safe navigation and incident tooling.\nWhere: Main Menu -> Help -> Overview.\nUse: start from Projects, then Ops for incident triage.\nSafety: non-menu messages are dismissible.',
+    timeline: 'Timeline records chronological events (deploys, db, safe mode, shadow runs).\nWhere: Main Menu -> Ops -> Timeline.\nUse: filter by severity/type and inspect refs.\nSafety: event details are masked.',
+    safe_mode: 'Safe Mode auto-protects PM during restart loops, DB outages, error spikes, or memory pressure.\nWhere: Main Menu -> Ops -> Safe Mode.\nUse: monitor status and reset counters.\nSafety: force controls are admin/owner only.',
+    alerts: 'Actionable alerts always include refId, copy debug, and timeline deep link.\nWhere: Main Menu -> Ops + inbox alerts.\nUse: run routine fixes in one tap.\nSafety: ENV/DSN misconfig is internal-only.',
+    drift: 'Drift detector compares current project config to a baseline snapshot.\nWhere: Project -> Ops -> Drift.\nUse: identify what changed before incidents.\nSafety: snapshots never store raw secrets.',
+    runbooks: 'Runbooks are rule-based docs generated from routine fixes.\nWhere: Main Menu -> Help -> Runbooks.\nUse: search symptoms and copy Codex task.\nSafety: read-only guidance.',
+    shadow: 'Shadow runs provide a dry plan before dangerous execute actions.\nWhere: migration/sync/env bulk workflows.\nUse: inspect operations and confirm execute.\nSafety: no destructive action without confirm.',
+    templates: 'Templates apply best-practice defaults for new projects.\nWhere: Main Menu -> Templates.\nUse: preview changes, shadow run, then execute.\nSafety: scoped defaults only.',
+    guest: 'Guest role is read-only for status, logs, timeline, and runbooks.\nWhere: Settings -> Access controls.\nUse: observer access without mutation rights.\nSafety: write actions blocked.',
+  };
+}
+
+async function renderHelpMenu(ctx) {
+  const pages = buildHelpPages();
+  const lines = ['❓ Help', '', pages.overview];
+  const keyboard = new InlineKeyboard()
+    .text('📘 Timeline', 'help:timeline')
+    .text('🛡 Safe Mode', 'help:safe_mode')
+    .row()
+    .text('🚨 Alerts', 'help:alerts')
+    .text('🧭 Drift', 'help:drift')
+    .row()
+    .text('📚 Runbooks', 'help:runbooks')
+    .text('🕶 Shadow Runs', 'help:shadow')
+    .row()
+    .text('🧩 Templates', 'help:templates')
+    .text('👀 Guest Access', 'help:guest')
+    .row()
+    .text('⬅️ Back', 'main:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: keyboard });
 }
 
 async function renderLogDeliveryDiagnosticsMenu(ctx) {

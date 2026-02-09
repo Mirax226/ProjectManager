@@ -170,3 +170,17 @@ If JSON is not convenient, send a plain text body; it will be treated as an erro
   - Batch partitioning for large-copy operations
   - Pair sync diff helper
 - These functions are covered by unit tests and are ready to be wired into project DB UI actions (`Sync now`, `Migrate DB`).
+
+## Ops Suite v1
+
+PM now includes an operations-first suite with:
+- Normalized main menu: Projects, Logs, Ops, Diagnostics, Templates, Help, Settings.
+- Ops Timeline with bounded retention and filters (severity/type/scope).
+- Automatic Safe Mode for restart loops, DB outages, error spikes, and memory pressure.
+- Actionable alerts (Routine Fix, Copy debug, Timeline, Delete).
+- Drift detector snapshots and compare reports.
+- Rule-generated runbooks and quick routine detection.
+- Shadow-run plans for dangerous operations before execute.
+- Built-in project templates (Node Telegram bot, worker, API, cron-only).
+- Guest read-only role controls for safe observability.
+- Expanded Help pages for each major Ops feature.

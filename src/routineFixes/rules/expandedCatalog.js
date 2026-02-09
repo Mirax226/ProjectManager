@@ -1,0 +1,20 @@
+function mk(id, title, triggers, diagnosis, steps, task, internalOnlyAutoButton = false) {
+  return { id, title, triggers, internalOnlyAutoButton,
+    match: (ctx) => triggers.some((t) => ctx.normalizedText.includes(t)) ? { confidence: 0.86, fields: {} } : null,
+    render: () => ({ diagnosis: [diagnosis], steps, task }),
+  };
+}
+
+module.exports = [
+  mk('OLD_MENU_NOT_CLEANED', 'Old menu messages not cleaned up', ['old menu messages', 'menu clutter', 'menu not cleaned'], 'Previous menu panels are still active and creating clutter.', ['Enable menu registry cleanup and stale keyboard invalidation.', 'Keep only one active panel per chat.'], 'Implement Menu Message Registry cleanup on every navigation event.'),
+  mk('CRON_4XX_5XX', 'Cron create/update API failures', ['cron 4xx', 'cron 5xx', 'rate limit', 'token missing'], 'Cron API request failed due to auth/method/payload or rate limit.', ['Validate token and endpoint method.', 'Retry with bounded backoff.', 'Store refId and payload validation errors.'], 'Harden cron client error handling and request validation with bounded retries.'),
+  mk('DB_TIMEOUTS', 'DB timeout/down incidents', ['statement timeout', 'connection timeout', 'db down', 'database timeout'], 'Database connectivity degraded or unavailable.', ['Check DB status and failover.', 'Reduce retry pressure in Safe Mode.', 'Verify statement_timeout and pool limits.'], 'Add DB timeout guards and Safe Mode-triggered retry caps.'),
+  mk('WIZARD_STUCK', 'Wizard stuck state', ['wizard stuck', 'flow stuck', 'env scan stuck'], 'Wizard state did not clear after step transitions.', ['Reset state on cancel/back.', 'Add timeout for stale wizard sessions.'], 'Patch wizard state transitions to always support back/cancel and timeout cleanup.'),
+  mk('HEALTH_MISCONFIG', 'Health endpoint missing/misconfigured', ['missing /health', 'health misconfigured', 'health endpoint'], 'Health checks point to missing route or wrong port mode.', ['Set healthPath and port mode from template defaults.', 'Verify endpoint locally.'], 'Apply health defaults and add diagnostics for route mismatch.'),
+  mk('TELEGRAM_CALLBACK_ERRORS', 'Telegram callback lifecycle errors', ['message not modified', 'message too old', 'delete permission'], 'Telegram callback attempted invalid or expired edit/delete action.', ['Use safe edit/delete wrappers with fallback paths.', 'Treat message-not-modified as success.'], 'Harden Telegram callback handling for stale/immutable messages.'),
+  mk('DUPLICATE_NOTIFICATION_SPAM', 'Duplicate notification spam', ['duplicate notification', 'dedupe missing', 'spam alerts'], 'Alert dedupe/rate limit was bypassed and caused noisy repeats.', ['Enable per-category debounce.', 'Apply max events per 10m.'], 'Implement dedupe key + debounce + hard cap in alert router.'),
+  mk('SAFE_MODE_STATE_BUG', 'Safe Mode not entering/exiting correctly', ['safe mode not triggering', 'safe mode not exiting'], 'Safe Mode counters or transition window is misconfigured.', ['Reset counters.', 'Review trigger windows and thresholds.', 'Verify recovery timer.'], 'Fix Safe Mode state transitions and add unit tests for enter/exit.'),
+  mk('DRIFT_BASELINE_MISSING', 'Config drift baseline missing/mismatch', ['drift baseline missing', 'baseline mismatch'], 'No baseline snapshot found or compared snapshot format changed.', ['Set baseline now.', 'Re-run compare.', 'Normalize snapshot schema version.'], 'Implement baseline snapshot migration + compare guardrails.'),
+  mk('DUAL_DB_SYNC_CONFLICT', 'Dual DB sync divergence/conflicts', ['dual db sync conflict', 'divergence'], 'Primary and secondary DB data diverged during sync.', ['Run shadow plan before sync.', 'Apply conflict policy and report deltas.'], 'Add dry-run conflict report and guarded execute step for DB sync.'),
+  mk('SCHEMA_RUNNER_REGRESSION', 'Schema runner Mini App regression', ['schema runner not in mini app', 'schema runner regression'], 'Schema runner action is no longer available in Mini App route.', ['Restore Mini App route wiring.', 'Keep bot action as fallback dry-run only.'], 'Re-enable schema runner in Mini App with shadow-run confirmation.'),
+];
