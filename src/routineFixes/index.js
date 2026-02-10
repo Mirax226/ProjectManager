@@ -1,4 +1,5 @@
 const { buildRoutineTemplate } = require('./template');
+const { resolveGithubCapability } = require('./githubMapping');
 
 const rules = [
   require('./rules/nonMenuDeleteButton'),
@@ -97,6 +98,7 @@ function rankRules(input) {
 
 function renderMatch(match) {
   const rendered = match.rule.render(match.fields || {});
+  const github = resolveGithubCapability(match.rule.id);
   return {
     ruleId: match.rule.id,
     title: match.rule.title,
@@ -104,6 +106,8 @@ function renderMatch(match) {
     diagnosis: rendered.diagnosis,
     steps: rendered.steps,
     task: rendered.task,
+    githubImpact: github.githubImpact,
+    githubActions: github.githubActions,
     templateText: buildRoutineTemplate({
       diagnosisLines: rendered.diagnosis,
       steps: rendered.steps,
@@ -137,4 +141,5 @@ module.exports = {
   listCatalog,
   getRuleById,
   buildRoutineTemplate,
+  resolveGithubCapability,
 };
