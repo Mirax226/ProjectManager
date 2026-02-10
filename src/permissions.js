@@ -1,4 +1,4 @@
-const GUEST_ALLOWED = new Set(['projects', 'logs', 'ops', 'timeline', 'health', 'runbooks', 'help']);
+const GUEST_ALLOWED = new Set(['projects', 'database', 'cronjobs', 'deploy', 'logs', 'settings', 'ops', 'templates', 'timeline', 'health', 'runbooks', 'help']);
 
 function resolveRole(userId, settings = {}) {
   const id = String(userId || '');
@@ -11,7 +11,12 @@ function resolveRole(userId, settings = {}) {
 
 function canAccess(role, action) {
   if (role === 'owner' || role === 'admin') return true;
-  return GUEST_ALLOWED.has(String(action || '').toLowerCase());
+  const normalized = String(action || '').toLowerCase();
+  if (!normalized) return false;
+  if (normalized.startsWith('mutate:') || normalized.startsWith('write:') || normalized.startsWith('delete:')) {
+    return false;
+  }
+  return GUEST_ALLOWED.has(normalized) || normalized.startsWith('read:');
 }
 
 module.exports = { resolveRole, canAccess };

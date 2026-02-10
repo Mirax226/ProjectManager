@@ -1169,6 +1169,9 @@ async function handleDeleteMessageCallback(ctx, data) {
 
 async function renderPanel(ctx, text, extra) {
   const safeExtra = normalizeTelegramExtra(extra);
+  if (safeExtra?.reply_markup?.inline_keyboard) {
+    safeExtra.reply_markup = withDeleteButton(safeExtra.reply_markup, extra || {});
+  }
   const settings = await getCachedSettings();
   const cleanup = normalizeUiCleanupSettings(settings);
   let response = null;
@@ -1739,6 +1742,9 @@ async function renderCronWizardMessage(ctx, state, text, extra) {
   }
   const messageContext = state?.messageContext;
   const safeExtra = normalizeTelegramExtra(extra);
+  if (safeExtra?.reply_markup?.inline_keyboard) {
+    safeExtra.reply_markup = withDeleteButton(safeExtra.reply_markup, extra || {});
+  }
   if (messageContext?.chatId && messageContext?.messageId) {
     try {
       await ctx.telegram.editMessageText(
@@ -1765,6 +1771,9 @@ async function renderCronWizardMessage(ctx, state, text, extra) {
 
 async function renderStateMessage(ctx, state, text, extra) {
   const safeExtra = normalizeTelegramExtra(extra);
+  if (safeExtra?.reply_markup?.inline_keyboard) {
+    safeExtra.reply_markup = withDeleteButton(safeExtra.reply_markup, extra || {});
+  }
   const messageContext = state?.messageContext;
   if (messageContext?.chatId && messageContext?.messageId) {
     try {
@@ -1864,8 +1873,10 @@ async function renderMainMenu(ctx) {
   const statusLine = buildConfigDbStatusLine();
   const banner = buildDegradedBanner();
   const prefix = statusLine ? `${statusLine}\n` : '';
-  await renderPanel(ctx, `${banner}${prefix}🧭 Main menu:`, {
+  await renderPanel(ctx, `${banner}${prefix}🧭 Main menu:
+${buildScopedHeader('GLOBAL', 'Main')}`, {
     reply_markup: buildMainMenuInlineKeyboard(),
+    skipDelete: true,
   });
 }
 
@@ -1995,16 +2006,16 @@ async function handleReplyKeyboardNavigation(ctx, route) {
 
 function buildMainMenuInlineKeyboard() {
   return new InlineKeyboard()
-    .text('📦 Projects', 'main:projects')
-    .text('📣 Logs', 'main:logs')
+    .text('📁 Projects', 'main:projects')
+    .text('🗄 Databases', 'main:database')
     .row()
-    .text('🛟 Ops', 'main:ops')
-    .text('🧪 Diagnostics', 'main:diagnostics')
+    .text('⏱ Cron Jobs', 'main:cronjobs')
+    .text('🚀 Deployments', 'main:deploy')
     .row()
-    .text('🧩 Templates', 'main:templates')
+    .text('📜 Logs', 'main:logs')
+    .text('⚙️ Settings', 'main:settings')
+    .row()
     .text('❓ Help', 'main:help')
-    .row()
-    .text('⚙️ Settings', 'main:settings');
 }
 
 function buildCancelKeyboard() {
@@ -2013,6 +2024,33 @@ function buildCancelKeyboard() {
 
 function buildBackKeyboard(callbackData, label = '⬅️ Back') {
   return new InlineKeyboard().text(label, callbackData);
+}
+
+function buildScopedHeader(scopeLabel, breadcrumb) {
+  const lines = [];
+  if (scopeLabel) {
+    lines.push(`Scope: ${scopeLabel}`);
+  }
+  if (breadcrumb) {
+    lines.push(`Breadcrumb: ${breadcrumb}`);
+  }
+  if (lines.length) {
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function withDeleteButton(replyMarkup, options = {}) {
+  const skip = options.skipDelete === true;
+  if (skip) return replyMarkup;
+  const existingRows = Array.isArray(replyMarkup?.inline_keyboard)
+    ? replyMarkup.inline_keyboard.map((row) => Array.isArray(row) ? row.slice() : row)
+    : [];
+  const hasDelete = existingRows.some((row) => Array.isArray(row) && row.some((button) => button?.text === '🗑 Delete'));
+  if (!hasDelete) {
+    existingRows.push([{ text: '🗑 Delete', callback_data: buildCb('msgdel', [ADMIN_TELEGRAM_ID || '0']) }]);
+  }
+  return { inline_keyboard: existingRows };
 }
 
 function buildPatchSessionKeyboard() {
@@ -3200,7 +3238,7 @@ async function renderProjectsList(ctx) {
     return;
   }
 
-  await renderOrEdit(ctx, `${banner}Select a project:`, {
+  await renderOrEdit(ctx, `${banner}${buildScopedHeader('GLOBAL', 'Main → Projects')}Select a project:`, {
     reply_markup: buildProjectsKeyboard(projects, globalSettings),
   });
 }
@@ -3209,6 +3247,12 @@ async function handleMainCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action] = data.split(':');
   switch (action) {
+    case 'defaults':
+      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Defaults')}⚙️ Defaults\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, { reply_markup: buildBackKeyboard('gsettings:menu') });
+      break;
+    case 'defaults':
+      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Defaults')}⚙️ Defaults\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, { reply_markup: buildBackKeyboard('gsettings:menu') });
+      break;
     case 'back':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'main', { ctx });
       break;
@@ -3240,6 +3284,7 @@ async function handleMainCallback(ctx, data) {
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'help', { ctx });
       break;
     case 'deploys':
+    case 'deploy':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'deploy', { ctx });
       break;
     default:
@@ -3296,7 +3341,6 @@ async function handleProjectCallback(ctx, data) {
     await startProjectWizard(ctx);
     return;
   }
-
   if (action === 'list') {
     await renderProjectsList(ctx);
     return;
@@ -3951,6 +3995,9 @@ async function handleGlobalSettingsCallback(ctx, data) {
     return;
   }
   switch (action) {
+    case 'defaults':
+      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Defaults')}⚙️ Defaults\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, { reply_markup: buildBackKeyboard('gsettings:menu') });
+      break;
     case 'ui': {
       const settings = await getCachedSettings();
       const view = buildUiCleanupSettingsView(settings);
@@ -4458,6 +4505,24 @@ async function handleCronCallback(ctx, data) {
     case 'list':
       await renderCronJobList(ctx);
       break;
+    case 'pause_all': {
+      const role = await resolveAccessRoleForUser(ctx.from?.id);
+      if (!canAccess(role, 'mutate:cronjobs')) {
+        await ensureAnswerCallback(ctx, { text: 'Read-only access', show_alert: true });
+        return;
+      }
+      await renderCronMenu(ctx);
+      break;
+    }
+    case 'resume_all': {
+      const role = await resolveAccessRoleForUser(ctx.from?.id);
+      if (!canAccess(role, 'mutate:cronjobs')) {
+        await ensureAnswerCallback(ctx, { text: 'Read-only access', show_alert: true });
+        return;
+      }
+      await renderCronMenu(ctx);
+      break;
+    }
     case 'create':
       if (!CRON_API_TOKEN) {
         await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
@@ -7773,13 +7838,18 @@ async function renderCronMenu(ctx) {
     return;
   }
 
-  const lines = ['⏰ Cron jobs', '', `Total jobs: ${jobs.length}`];
+  const lines = ['⏱ Cron Jobs', buildScopedHeader('GLOBAL', 'Main → Cron Jobs'), `Total jobs: ${jobs.length}`];
   const inline = new InlineKeyboard()
     .text('📋 List jobs', 'cron:list')
     .row()
     .text('➕ Create job', 'cron:create')
     .row()
     .text('🧷 Link job to project', 'cronlink:menu')
+    .row()
+    .text('⏸ Pause all', 'cron:pause_all')
+    .text('▶️ Resume all', 'cron:resume_all')
+    .row()
+    .text('⚙️ Global cron defaults', 'gsettings:defaults')
     .row()
     .text('🧹 Show “Other” only', 'cronlink:other')
     .row()
@@ -12459,6 +12529,7 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
   const workingDirLabel = formatWorkingDirDisplay(project);
 
   const lines = [
+    buildScopedHeader(`PROJECT: ${name}`, `Main → Projects → ${name} → Overview`),
     `📦 Project: ${isDefault ? '⭐ ' : ''}${name} (🆔 ${project.id})`,
     notice || null,
     '',
@@ -12488,31 +12559,18 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
   ].filter((line) => line !== null);
 
   const inline = new InlineKeyboard()
-    .text('✏️ Edit project', `proj:project_menu:${project.id}`)
-    .text('🌱 Change base branch', `proj:change_base:${project.id}`)
+    .text('Overview', `proj:open:${project.id}`)
+    .text('Repository', `proj:edit_repo:${project.id}`)
     .row()
-    .text('🏷️ Project type', `proj:project_type:${project.id}`)
+    .text('Database', `dbmenu:open:${project.id}`)
+    .text('Cron Jobs', `projcron:menu:${project.id}`)
     .row()
-    .text('📝 Edit repo', `proj:edit_repo:${project.id}`)
-    .text('📁 Working Direction', `proj:workdir_menu:${project.id}`)
+    .text('Deploy', `deploy:open:${project.id}`)
+    .text('Logs', `logmenu:open:${project.id}`)
     .row()
-    .text('🔑 Edit GitHub token', `proj:edit_github_token:${project.id}`)
+    .text('Ops (Timeline, Safe Mode, Drift)', `proj:diagnostics_menu:${project.id}`)
     .row()
-    .text('🧰 Edit commands', `proj:commands:${project.id}`)
-    .row()
-    .text('🧪 Diagnostics', `proj:diagnostics_menu:${project.id}`)
-    .row()
-    .text('📡 Server', `proj:server_menu:${project.id}`)
-    .text('🗄️ Database binding', `proj:supabase:${project.id}`)
-    .row()
-    .text('🔐 Env Vault', `envvault:menu:${project.id}`)
-    .text('🤖 Telegram Setup', `tgbot:menu:${project.id}`)
-    .row()
-    .text('📝 SQL runner', `proj:sql_menu:${project.id}`)
-    .row()
-    .text('📣 Log alerts', `projlog:menu:${project.id}`)
-    .row()
-    .text('📝 Quick Notes', `notes:menu:${project.id}`)
+    .text('Access (Guests)', `tgbot:menu:${project.id}`)
     .row();
 
   if (missingSetup.length) {
@@ -12525,7 +12583,7 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
     inline.text('⭐ Set as default project', `proj:set_default:${project.id}`).row();
   }
 
-  inline.text('🗑 Delete project', `proj:delete:${project.id}`).text('⬅️ Back', 'proj:list');
+  inline.text('🗑 Delete project', `proj:delete:${project.id}`).row().text('⬅️ Back to Main Menu', 'main:back');
 
   return { text: lines.join('\n'), keyboard: inline };
 }
@@ -16221,7 +16279,7 @@ async function renderProjectMenu(ctx, projectId) {
     .row()
     .text('⬅️ Back', `proj:open:${projectId}`);
 
-  await renderOrEdit(ctx, `📂 Project menu: ${project.name || project.id}`, {
+  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}`, {
     reply_markup: inline,
   });
 }
@@ -18891,11 +18949,11 @@ async function resolveProjectDbCardInfo(project) {
 
 async function buildDataCenterView() {
   const projects = await loadProjects();
-  const lines = [`${buildDegradedBanner()}🗄️ Database`, `Status: ${appState.dbReady ? '✅ UP' : '🔴 DOWN'}`];
+  const lines = [`${buildDegradedBanner()}🗄 Databases`, buildScopedHeader('GLOBAL', 'Main → Databases'), `Status: ${appState.dbReady ? '✅ UP' : '🔴 DOWN'}`];
   if (appState.degradedMode) {
     lines.push('Mode: ⚠️ Degraded (config DB unavailable)');
   }
-  lines.push('', 'Select a project:');
+  lines.push('', 'Configured databases across projects:', 'Use actions below for project drill-down and global controls.');
   const inline = new InlineKeyboard();
   if (!projects.length) {
     lines.push('', 'No projects configured yet.');
@@ -18906,6 +18964,8 @@ async function buildDataCenterView() {
       inline.text(label, `dbmenu:open:${project.id}`).row();
     });
   }
+  inline.text('⚙️ Global DB Settings', 'gsettings:defaults').row();
+  inline.text('🔁 Sync all', 'dbmenu:sync_all').text('🚑 Migrate', 'dbmenu:migrate').row();
   inline.text('⬅️ Back', 'main:back');
   return { text: lines.join('\n'), keyboard: inline };
 }
@@ -18962,9 +19022,10 @@ async function renderLogsProjectList(ctx, notice) {
     return;
   }
   const projects = await loadProjects();
-  const lines = [`${buildDegradedBanner()}📣 Logs`, notice || null, '', 'Select a project:'].filter(Boolean);
+  const lines = [`${buildDegradedBanner()}📜 Logs`, buildScopedHeader('GLOBAL', 'Main → Logs'), notice || null, '', 'Unified logs viewer across projects:'].filter(Boolean);
   const inline = new InlineKeyboard();
   inline.text('🧾 Projects needing log test', 'logtest:reminders').row();
+  inline.text('⚙️ Global log policies', 'gsettings:logs').row();
   if (!projects.length) {
     lines.push('', 'No projects configured yet.');
     inline.text('➕ Add project', 'proj:add').row();
@@ -19041,7 +19102,8 @@ async function renderDeploysProjectList(ctx, notice) {
         .join(', ')}${unmapped.length > 3 ? '…' : ''}`
     : null;
   const lines = [
-    `${buildDegradedBanner()}🚀 Deploys`,
+    `${buildDegradedBanner()}🚀 Deployments`,
+    buildScopedHeader('GLOBAL', 'Main → Deployments'),
     notice || null,
     '',
     formatRenderPollingStatusLine(renderSettings, apiKeyStatus),
@@ -19049,7 +19111,7 @@ async function renderDeploysProjectList(ctx, notice) {
     `🔑 Render API key: ${apiKeyLabel}`,
     unmappedList,
     '',
-    'Select a project:',
+    'Unified deploy timeline across projects:',
   ].filter(Boolean);
   const inline = new InlineKeyboard();
   if (!projects.length) {
@@ -19078,7 +19140,7 @@ async function renderDeploysProjectList(ctx, notice) {
   }
   inline.text('🔑 Set Render API key', 'deploy:api_key').row();
   inline.text('🔎 Discover services', 'deploy:discover').row();
-  inline.text('⚙️ Deploy settings', 'deploy:settings').row();
+  inline.text('⚙️ Global deploy defaults', 'deploy:settings').row();
   inline.text('⬅️ Back', 'main:back');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
@@ -19323,6 +19385,16 @@ async function renderDeployRecentEvents(ctx, projectId) {
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
+
+async function resolveAccessRoleForUser(userId) {
+  const settings = await getCachedSettings();
+  return resolveRole(userId, {
+    ownerId: ADMIN_TELEGRAM_ID,
+    adminIds: normalizeSecuritySettings(settings).adminIds || [],
+    guestIds: [],
+  });
+}
+
 async function handleDatabaseMenuCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action, projectId] = data.split(':');
@@ -19332,6 +19404,24 @@ async function handleDatabaseMenuCallback(ctx, data) {
   }
   if (action === 'open' && projectId) {
     await renderDatabaseProjectPanel(ctx, projectId);
+    return;
+  }
+  if (action === 'sync_all') {
+    const role = await resolveAccessRoleForUser(ctx.from?.id);
+    if (!canAccess(role, 'mutate:database')) {
+      await ensureAnswerCallback(ctx, { text: 'Read-only access', show_alert: true });
+      return;
+    }
+    await renderDataCenterMenu(ctx);
+    return;
+  }
+  if (action === 'migrate') {
+    const role = await resolveAccessRoleForUser(ctx.from?.id);
+    if (!canAccess(role, 'mutate:database')) {
+      await ensureAnswerCallback(ctx, { text: 'Read-only access', show_alert: true });
+      return;
+    }
+    await renderDataCenterMenu(ctx);
     return;
   }
   await renderDataCenterMenu(ctx);
@@ -20312,6 +20402,7 @@ function buildGlobalSettingsView(settings, projects, notice) {
   const integrations = normalizeIntegrationSettings(settings);
   const backups = normalizeBackupSettings(settings);
   const lines = [
+    buildScopedHeader('GLOBAL', 'Main → Settings'),
     notice || null,
     `defaultBaseBranch: ${settings.defaultBaseBranch || DEFAULT_BASE_BRANCH}`,
     `defaultProjectId: ${settings.defaultProjectId || '-'}` +
@@ -20371,9 +20462,17 @@ async function renderGlobalSettingsForMessage(messageContext, notice) {
 
 function buildSettingsKeyboard() {
   return new InlineKeyboard()
-    .text('🧹 UI & Cleanup', 'gsettings:ui')
+    .text('🧩 Ops', 'main:ops')
     .row()
-    .text('🔐 Security', 'gsettings:security')
+    .text('🧱 Templates', 'main:templates')
+    .row()
+    .text('🧰 Routine Fixes', 'gsettings:routine_menu')
+    .row()
+    .text('🔐 Access Control', 'gsettings:security')
+    .row()
+    .text('⚙️ Defaults', 'gsettings:defaults')
+    .row()
+    .text('🧹 UI & Cleanup', 'gsettings:ui')
     .row()
     .text('📣 Logs', 'gsettings:logs')
     .row()
@@ -23698,6 +23797,7 @@ module.exports = {
     isPmTestAllowedForTests: (token) => pmLogger.isTestRequestAllowed(token),
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
     buildRoutineFixButton,
+    buildScopedHeader,
   },
 };
 

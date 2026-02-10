@@ -172,3 +172,30 @@ test('navigation queues during operation in progress', async () => {
   assert.equal(calls.editMessageText.length, 0);
   assert.equal(calls.sendMessage.length, 1);
 });
+
+
+test('global to project database drill-down keeps navigation callbacks', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(30);
+  __test.setActivePanelMessageId(30, 300);
+
+  const ctx = {
+    chat: { id: 30 },
+    message: { chat: { id: 30 }, message_id: 501, text: '/database' },
+    from: { id: 90 },
+    api,
+  };
+
+  const handled = await handleGlobalCommand(ctx, '/database', '');
+  assert.equal(handled, true);
+  assert.equal(calls.editMessageText.length, 1);
+  const [, , renderedText] = calls.editMessageText[0];
+  assert.match(renderedText, /Database/);
+});
+
+test('breadcrumb helper renders expected format', () => {
+  const header = __test.buildScopedHeader('PROJECT: Alpha', 'Main → Databases → Alpha → Database');
+  assert.match(header, /Scope: PROJECT: Alpha/);
+  assert.match(header, /Breadcrumb: Main → Databases → Alpha → Database/);
+});
