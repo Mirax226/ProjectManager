@@ -210,6 +210,15 @@ const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbac
 const { paginateRepos, mapRepoButton, listAllGithubRepos } = require('./src/repoPicker');
 const { createPmLogger } = require('./src/pmLogger');
 const {
+  createCodexTask,
+  listCodexTasks,
+  getCodexTask,
+  markCodexTaskDone,
+  deleteCodexTask,
+  clearDoneCodexTasks,
+  purgeOldDoneCodexTasks,
+} = require('./src/codexTasksStore');
+const {
   ROUTINE_AUTO_THRESHOLD,
   ROUTINE_BUTTON_THRESHOLD,
   matchBest: matchRoutineFix,
@@ -1023,7 +1032,7 @@ async function sendEphemeralMessage(ctx, text, extra) {
 async function sendTransientNotice(ctx, text, options = {}) {
   const ownerId = Number(options.ownerId || ctx?.from?.id || 0);
   const ttlSec = Number.isFinite(options.ttlSec) ? Number(options.ttlSec) : 10;
-  const deleteButton = options.deleteButton !== false;
+  const deleteButton = options.includeDelete !== false && options.deleteButton !== false;
   const extraMarkup = sanitizeReplyMarkup(options.extraMarkup || options.reply_markup);
   const extra = { ...(options.extra || {}) };
   if (options.disable_web_page_preview != null) {
@@ -1076,6 +1085,147 @@ async function sendDismissibleMessage(ctx, text, extra = {}) {
   return sendTransientNotice(ctx, text, { ttlSec: 10, deleteButton: true, extraMarkup: extra.reply_markup, extra });
 }
 
+
+function codexTaskShortId(id) {
+  return String(id || '').slice(0, 8);
+}
+
+function formatCodexTaskTitle(task) {
+  return `#${codexTaskShortId(task.id)} ${task.title || 'Untitled task'}`.slice(0, 64);
+}
+
+async function verifyCodexTask(task) {
+  if (!task) return { ok: false, message: 'Task not found.' };
+  if (task.sourceType !== 'repo_inspection') {
+    return { ok: true, message: 'No verifier for this task type. Marked done.' };
+  }
+  if (!task.projectId) {
+    return { ok: true, message: 'No project context. Marked done.' };
+  }
+  const cached = repoInspectionCache.get(task.projectId);
+  if (!cached?.report?.missing?.length) {
+    return { ok: true, message: 'Inspection has no missing items.' };
+  }
+  return { ok: false, message: `Still missing: ${cached.report.missing.join(', ')}` };
+}
+
+async function createCodexTaskAndNotify(ctx, payload) {
+  const result = await createCodexTask(payload);
+  const text = result.created
+    ? '🧠 Task added to Codex Tasks queue'
+    : '🧠 Task already exists in Codex Tasks queue';
+  const extraMarkup = new InlineKeyboard().text('Open Codex Tasks', 'main:codex_tasks');
+  await sendTransientNotice(ctx, text, { ttlSec: 10, includeDelete: true, extraMarkup });
+  return result;
+}
+
+async function renderCodexTasksMenu(ctx, notice) {
+  await purgeOldDoneCodexTasks();
+  const pending = await listCodexTasks({ status: 'pending' });
+  const done = await listCodexTasks({ status: 'done' });
+  const lines = [
+    '🧠 Codex Tasks',
+    buildScopedHeader('GLOBAL', 'Main → Codex Tasks'),
+    notice || null,
+    `Pending: ${pending.length}`,
+    `Done: ${done.length}`,
+  ].filter(Boolean);
+  const inline = new InlineKeyboard();
+  if (!pending.length) {
+    lines.push('', 'No pending tasks.');
+  } else {
+    lines.push('', 'Pending tasks:');
+    pending.slice(0, 20).forEach((task) => {
+      inline.text(formatCodexTaskTitle(task), `codex_tasks:view:${task.id}`).row();
+    });
+  }
+  inline.text('🧹 Clear all done', 'codex_tasks:clear_done').row();
+  inline.text('📤 Export pending', 'codex_tasks:export').row();
+  inline.text('⬅️ Back', 'main:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderCodexTaskDetails(ctx, id, notice) {
+  const task = await getCodexTask(id);
+  if (!task) {
+    await renderCodexTasksMenu(ctx, 'Task not found.');
+    return;
+  }
+  const lines = [
+    `🧠 Codex Task #${codexTaskShortId(task.id)}`,
+    `Title: ${task.title || '-'}`,
+    `Source: ${task.sourceType || '-'}`,
+    `Project: ${task.projectId || '-'}`,
+    `Status: ${task.status}`,
+    notice || null,
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('📋 Copy task', `codex_tasks:copy:${task.id}`)
+    .row()
+    .text('✅ Mark as Done', `codex_tasks:done:${task.id}`)
+    .text('🗑 Delete task', `codex_tasks:delete:${task.id}`)
+    .row()
+    .text('↩ Back', 'main:codex_tasks');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function handleCodexTasksCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const parts = String(data || '').split(':');
+  const action = parts[1];
+  const id = parts[2];
+  if (action === 'list') {
+    await renderCodexTasksMenu(ctx);
+    return;
+  }
+  if (action === 'view' && id) {
+    await renderCodexTaskDetails(ctx, id);
+    return;
+  }
+  if (action === 'copy' && id) {
+    const task = await getCodexTask(id);
+    if (!task) {
+      await renderCodexTasksMenu(ctx, 'Task not found.');
+      return;
+    }
+    await sendDismissibleMessage(ctx, `\`\`\`text
+${task.body}
+\`\`\``);
+    await renderCodexTaskDetails(ctx, id, 'Task copied.');
+    return;
+  }
+  if (action === 'done' && id) {
+    const task = await getCodexTask(id);
+    const verify = await verifyCodexTask(task);
+    if (!verify.ok) {
+      await renderCodexTaskDetails(ctx, id, `❌ Verification failed. ${verify.message}`);
+      return;
+    }
+    await markCodexTaskDone(id);
+    await renderCodexTasksMenu(ctx, `✅ Task marked done. ${verify.message}`);
+    return;
+  }
+  if (action === 'delete' && id) {
+    await deleteCodexTask(id);
+    await renderCodexTasksMenu(ctx, '🗑 Task deleted.');
+    return;
+  }
+  if (action === 'clear_done') {
+    const removed = await clearDoneCodexTasks();
+    await renderCodexTasksMenu(ctx, `🧹 Removed ${removed} done task(s).`);
+    return;
+  }
+  if (action === 'export') {
+    const pending = await listCodexTasks({ status: 'pending' });
+    const body = pending
+      .map((task, idx) => `${idx + 1}. [${task.projectId || '-'}] ${task.title}\n${task.body}`)
+      .join('\n\n');
+    await sendDismissibleMessage(ctx, body ? `\`\`\`text\n${body}\n\`\`\`` : 'No pending tasks.');
+    await renderCodexTasksMenu(ctx);
+    return;
+  }
+  await renderCodexTasksMenu(ctx);
+}
 
 function buildRoutineOutputKeyboard(ctx, payload, backCallback = 'gsettings:routine_menu') {
   const packed = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -1281,6 +1431,7 @@ function getNavigationHandlers() {
     diagnostics: async (ctx) => renderLogDeliveryDiagnosticsMenu(ctx),
     templates: async (ctx) => renderTemplatesMenu(ctx),
     help: async (ctx) => renderHelpMenu(ctx),
+    codex_tasks: async (ctx) => renderCodexTasksMenu(ctx),
     database: async (ctx) => renderDataCenterMenu(ctx),
     cronjobs: async (ctx) => renderCronMenu(ctx),
     deploy: async (ctx) => renderDeploysProjectList(ctx),
@@ -2070,6 +2221,7 @@ function buildMainMenuInlineKeyboard() {
     .text('⚙️ Settings', 'main:settings')
     .row()
     .text('❓ Help', 'main:help')
+    .text('🧠 Codex Tasks', 'main:codex_tasks')
 }
 
 function buildCancelKeyboard() {
@@ -3038,6 +3190,10 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     await maybeSendRoutineFixFromButton(ctx, parts[1]);
     return;
   }
+  if (data.startsWith('codex_tasks:')) {
+    await handleCodexTasksCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('main:')) {
     await handleMainCallback(ctx, data);
     return;
@@ -3340,6 +3496,9 @@ async function handleMainCallback(ctx, data) {
       break;
     case 'help':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'help', { ctx });
+      break;
+    case 'codex_tasks':
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'codex_tasks', { ctx });
       break;
     case 'deploys':
     case 'deploy':
@@ -3997,7 +4156,14 @@ async function handleLogTestCallback(ctx, data) {
       '',
       'Include correlationId in meta, add interceptors + process hooks, and keep secrets masked.',
     ].join('\n');
-    await renderOrEdit(ctx, task, { reply_markup: buildBackKeyboard(`projlog:menu:${projectId}`) });
+    await createCodexTaskAndNotify(ctx, {
+      sourceType: 'routine_fix',
+      projectId,
+      title: 'Add diagnostics + test endpoint + log sender',
+      body: task,
+      refId: `logtest:${projectId}`,
+    });
+    await renderProjectLogAlerts(ctx, projectId);
     return;
   }
 
@@ -4012,9 +4178,14 @@ async function handleLogTestCallback(ctx, data) {
       await renderProjectLogAlerts(ctx, projectId, 'No repo inspection report available yet.');
       return;
     }
-    await renderOrEdit(ctx, cached.codexTask, {
-      reply_markup: buildBackKeyboard(`projlog:menu:${projectId}`),
+    await createCodexTaskAndNotify(ctx, {
+      sourceType: 'repo_inspection',
+      projectId,
+      title: 'Repo inspection remediation task',
+      body: cached.codexTask,
+      refId: `repo_inspection:${projectId}`,
     });
+    await renderProjectLogAlerts(ctx, projectId);
     return;
   }
 
@@ -14764,6 +14935,15 @@ async function runRepoInspection(ctx, projectId) {
     currentStep: 'Summarize',
     nextStep: null,
   });
+  await sendTransientNotice(
+    ctx,
+    `🔍 Repo inspection — ${project.name || project.id}
+✅ Completed (100%)
+Completed: 3/3
+Current: Summarize
+Remaining: 0`,
+    { ttlSec: 10, includeDelete: true },
+  );
   const inline = new InlineKeyboard()
     .text('🧩 Generate Codex task for client repo', `logtest:generate_repo_task:${projectId}`)
     .row()
@@ -20979,8 +21159,6 @@ function buildSettingsKeyboard() {
     .row()
     .text('📶 Ping test', 'gsettings:ping_test')
     .row()
-    .webApp('🗄️ Open DB Console', getMiniAppUrl())
-    .row()
     .text('⬅️ Back', 'gsettings:back');
 }
 
@@ -21355,9 +21533,7 @@ async function runPingTest(ctx) {
     await progress.step('Building report');
     const lines = ['📶 Ping test', '', ...checks.map(formatCheck)];
     const inline = new InlineKeyboard()
-      .text('🔁 Retry', 'gsettings:ping_test')
-      .row()
-      .webApp('🗄️ Open DB Console', getMiniAppUrl());
+      .text('🔁 Retry', 'gsettings:ping_test');
     if (defaultProject?.id) {
       inline
         .row()
@@ -24353,6 +24529,11 @@ async function startBot() {
   await startBotPolling();
   scheduleLogTestDailyReminder();
   scheduleRenderPolling();
+  setInterval(() => {
+    purgeOldDoneCodexTasks().catch((error) => {
+      console.warn('[codex_tasks] cleanup failed', error?.message);
+    });
+  }, 24 * 60 * 60 * 1000).unref?.();
   console.error('[boot] bot started');
 }
 
