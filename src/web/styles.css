@@ -346,3 +346,41 @@ textarea {
     gap: 12px;
   }
 }
+
+.db-grid {
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+
+.db-hero {
+  background: linear-gradient(160deg, #111827, #0f2237);
+  border-color: rgba(56, 189, 248, 0.32);
+}
+
+.card,
+.list-item,
+button,
+input,
+select,
+textarea {
+  transition: all 0.2s ease;
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(56, 189, 248, 0.4);
+}
+
+.checkbox {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+#dbRows,
+#dbSqlResult,
+#dbMigrateResult {
+  max-height: 260px;
+  overflow: auto;
+}

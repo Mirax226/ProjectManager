@@ -5,6 +5,8 @@ const state = {
   projects: [],
   health: null,
   logsTimer: null,
+  dbConnections: [],
+  dbBindings: [],
 };
 
 const elements = {
@@ -41,6 +43,38 @@ const elements = {
   patchApply: document.getElementById('patchApply'),
   patchPreviewOutput: document.getElementById('patchPreviewOutput'),
   patchResult: document.getElementById('patchResult'),
+
+  dbOverallStatus: document.getElementById('dbOverallStatus'),
+  dbConnectionForm: document.getElementById('dbConnectionForm'),
+  dbConnectionName: document.getElementById('dbConnectionName'),
+  dbConnectionDsn: document.getElementById('dbConnectionDsn'),
+  dbConnectionSslMode: document.getElementById('dbConnectionSslMode'),
+  dbConnectionSslVerify: document.getElementById('dbConnectionSslVerify'),
+  dbConnectionsList: document.getElementById('dbConnectionsList'),
+  dbProjectSelect: document.getElementById('dbProjectSelect'),
+  dbBindingOptions: document.getElementById('dbBindingOptions'),
+  dbBindingSave: document.getElementById('dbBindingSave'),
+  dbDualEnabled: document.getElementById('dbDualEnabled'),
+  dbDualPrimary: document.getElementById('dbDualPrimary'),
+  dbDualSecondary: document.getElementById('dbDualSecondary'),
+  dbDualSave: document.getElementById('dbDualSave'),
+  dbSyncNow: document.getElementById('dbSyncNow'),
+  dbDualStatus: document.getElementById('dbDualStatus'),
+  dbConnectionSelect: document.getElementById('dbConnectionSelect'),
+  dbSchemaSelect: document.getElementById('dbSchemaSelect'),
+  dbTableSelect: document.getElementById('dbTableSelect'),
+  dbLoadRows: document.getElementById('dbLoadRows'),
+  dbSchemaInfo: document.getElementById('dbSchemaInfo'),
+  dbRows: document.getElementById('dbRows'),
+  dbSqlForm: document.getElementById('dbSqlForm'),
+  dbSqlInput: document.getElementById('dbSqlInput'),
+  dbEnableWrites: document.getElementById('dbEnableWrites'),
+  dbWriteConfirm: document.getElementById('dbWriteConfirm'),
+  dbSqlResult: document.getElementById('dbSqlResult'),
+  dbMigrateForm: document.getElementById('dbMigrateForm'),
+  dbMigrateSource: document.getElementById('dbMigrateSource'),
+  dbMigrateTarget: document.getElementById('dbMigrateTarget'),
+  dbMigrateResult: document.getElementById('dbMigrateResult'),
 };
 
 const subtitles = {
@@ -49,7 +83,7 @@ const subtitles = {
   logs: 'Recent logs with filters and polling.',
   cronjobs: 'Cron scheduler status and jobs.',
   envvault: 'Env Vault keys (masked) and updates.',
-  database: 'DB mini-site browser.',
+  database: 'DB console: bindings, schema/table browser, SQL, migration, and dual sync.',
   patches: 'Apply PM Change Spec v1 patches.',
 };
 
@@ -249,6 +283,96 @@ async function loadEnvVault() {
     .join('');
 }
 
+
+function dbConnectionOptionHtml(connection) {
+  return `<option value="${connection.id}">${connection.name}</option>`;
+}
+
+function getSelectedProjectBinding() {
+  const projectId = elements.dbProjectSelect.value;
+  return state.dbBindings.find((item) => item.projectId === projectId) || null;
+}
+
+async function loadDbConnections() {
+  const response = await apiFetch(`${API_BASE}/db/connections`);
+  const data = await response.json();
+  state.dbConnections = data.connections || [];
+  state.dbBindings = data.bindings || [];
+  renderStats(elements.dbOverallStatus, [
+    { label: 'Primary DB', value: data.health?.primaryConfigured ? '✅ Configured' : '⚠️ Missing' },
+    { label: 'Secondary DB', value: data.health?.secondaryConfigured ? '✅ Configured' : '⚠️ Missing' },
+    { label: 'Saved connections', value: String(state.dbConnections.length) },
+  ]);
+  elements.dbConnectionsList.innerHTML = state.dbConnections
+    .map((connection) => `<div class="list-item"><h4>${connection.name}</h4><div class="muted">${connection.dsnMasked || '••••'}</div><button class="secondary" data-db-remove="${connection.id}">Remove</button></div>`)
+    .join('') || '<div class="list-item">No connections yet.</div>';
+  const options = state.dbConnections.map(dbConnectionOptionHtml).join('');
+  elements.dbConnectionSelect.innerHTML = options;
+  elements.dbDualPrimary.innerHTML = `<option value="">Primary</option>${options}`;
+  elements.dbDualSecondary.innerHTML = `<option value="">Secondary</option>${options}`;
+  elements.dbMigrateSource.innerHTML = `<option value="">Select source</option>${options}`;
+  elements.dbMigrateTarget.innerHTML = `<option value="">Select target</option>${options}`;
+
+  const projectOptions = state.projects.map((project) => `<option value="${project.id}">${project.name}</option>`).join('');
+  elements.dbProjectSelect.innerHTML = projectOptions;
+  renderDbBindingsForProject();
+  await loadDbSchemas();
+}
+
+function renderDbBindingsForProject() {
+  const binding = getSelectedProjectBinding();
+  const selected = new Set(binding?.connectionIds || []);
+  elements.dbBindingOptions.innerHTML = state.dbConnections
+    .map((connection) => `<label class="pill"><input type="checkbox" data-db-bind="${connection.id}" ${selected.has(connection.id) ? 'checked' : ''}/> ${connection.name}</label>`)
+    .join('') || '<span class="pill">No connections</span>';
+  const dualDb = binding?.dualDb || {};
+  elements.dbDualEnabled.checked = Boolean(dualDb.enabled);
+  elements.dbDualPrimary.value = dualDb.primaryConnectionId || '';
+  elements.dbDualSecondary.value = dualDb.secondaryConnectionId || '';
+  elements.dbDualStatus.textContent = dualDb.lastSyncAt
+    ? `Last sync: ${new Date(dualDb.lastSyncAt).toLocaleString()} (${dualDb.lastSyncResult?.ok ? 'ok' : 'needs attention'})`
+    : 'No sync history yet.';
+}
+
+async function loadDbSchemas() {
+  const connectionId = elements.dbConnectionSelect.value;
+  if (!connectionId) {
+    elements.dbSchemaSelect.innerHTML = '';
+    elements.dbTableSelect.innerHTML = '';
+    return;
+  }
+  const schemaRes = await apiFetch(`${API_BASE}/db/${encodeURIComponent(connectionId)}/schemas`);
+  const schemaData = await schemaRes.json();
+  elements.dbSchemaSelect.innerHTML = (schemaData.schemas || []).map((s) => `<option value="${s}">${s}</option>`).join('');
+  await loadDbTables();
+}
+
+async function loadDbTables() {
+  const connectionId = elements.dbConnectionSelect.value;
+  const schema = elements.dbSchemaSelect.value || 'public';
+  if (!connectionId) return;
+  const tableRes = await apiFetch(`${API_BASE}/db/${encodeURIComponent(connectionId)}/tables?schema=${encodeURIComponent(schema)}`);
+  const tableData = await tableRes.json();
+  elements.dbTableSelect.innerHTML = (tableData.tables || []).map((t) => `<option value="${t}">${t}</option>`).join('');
+}
+
+async function loadDbRows() {
+  const connectionId = elements.dbConnectionSelect.value;
+  const schema = elements.dbSchemaSelect.value || 'public';
+  const table = elements.dbTableSelect.value;
+  if (!connectionId || !table) return;
+  const rowRes = await apiFetch(`${API_BASE}/db/${encodeURIComponent(connectionId)}/table-rows?schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&page=0`);
+  const data = await rowRes.json();
+  elements.dbSchemaInfo.innerHTML = (data.columns || [])
+    .map((column) => `<div class="list-item"><h4>${column.column_name}</h4><div class="muted">${column.data_type}</div></div>`)
+    .join('');
+  elements.dbRows.textContent = JSON.stringify(data.rows || [], null, 2);
+}
+
+async function loadDatabaseView() {
+  await loadDbConnections();
+}
+
 function parseSpecPreview(text) {
   const blocks = text
     .split(/\n\s*\n/)
@@ -319,6 +443,9 @@ async function refreshCurrentView() {
     case 'envvault':
       await loadEnvVault();
       break;
+    case 'database':
+      await loadDatabaseView();
+      break;
     case 'patches':
       elements.patchPreviewOutput.textContent = '';
       elements.patchResult.textContent = '';
@@ -378,6 +505,103 @@ function setupEventHandlers() {
 
   elements.envRefresh.addEventListener('click', loadEnvVault);
   elements.envProject.addEventListener('change', loadEnvVault);
+
+
+  elements.dbConnectionForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const response = await apiFetch(`${API_BASE}/db/connections`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: elements.dbConnectionName.value.trim(),
+        dsn: elements.dbConnectionDsn.value.trim(),
+        sslMode: elements.dbConnectionSslMode.value,
+        sslVerify: elements.dbConnectionSslVerify.checked,
+      }),
+    });
+    const data = await response.json();
+    if (!data.ok) {
+      elements.dbSqlResult.textContent = data.error || 'Failed to add connection.';
+      return;
+    }
+    elements.dbConnectionName.value = '';
+    elements.dbConnectionDsn.value = '';
+    await loadDbConnections();
+  });
+
+  elements.dbConnectionsList.addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-db-remove]');
+    if (!button) return;
+    await apiFetch(`${API_BASE}/db/connections/${encodeURIComponent(button.dataset.dbRemove)}`, { method: 'DELETE' });
+    await loadDbConnections();
+  });
+
+  elements.dbProjectSelect.addEventListener('change', renderDbBindingsForProject);
+
+  elements.dbBindingSave.addEventListener('click', async () => {
+    const selected = Array.from(elements.dbBindingOptions.querySelectorAll('input[data-db-bind]:checked')).map((input) => input.dataset.dbBind);
+    await apiFetch(`${API_BASE}/db/project-bindings`, {
+      method: 'POST',
+      body: JSON.stringify({ projectId: elements.dbProjectSelect.value, connectionIds: selected }),
+    });
+    await loadDbConnections();
+  });
+
+  elements.dbDualSave.addEventListener('click', async () => {
+    const response = await apiFetch(`${API_BASE}/db/dual-mode`, {
+      method: 'POST',
+      body: JSON.stringify({
+        projectId: elements.dbProjectSelect.value,
+        enabled: elements.dbDualEnabled.checked,
+        primaryConnectionId: elements.dbDualPrimary.value,
+        secondaryConnectionId: elements.dbDualSecondary.value,
+      }),
+    });
+    const data = await response.json();
+    elements.dbDualStatus.textContent = data.ok ? 'Dual DB mode updated.' : data.error;
+    await loadDbConnections();
+  });
+
+  elements.dbSyncNow.addEventListener('click', async () => {
+    const response = await apiFetch(`${API_BASE}/db/sync`, {
+      method: 'POST',
+      body: JSON.stringify({ projectId: elements.dbProjectSelect.value }),
+    });
+    const data = await response.json();
+    elements.dbDualStatus.textContent = data.ok ? `Sync OK at ${new Date(data.lastSyncAt).toLocaleString()}` : data.error;
+    await loadDbConnections();
+  });
+
+  elements.dbConnectionSelect.addEventListener('change', loadDbSchemas);
+  elements.dbSchemaSelect.addEventListener('change', loadDbTables);
+  elements.dbLoadRows.addEventListener('click', loadDbRows);
+
+  elements.dbSqlForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const connectionId = elements.dbConnectionSelect.value;
+    const response = await apiFetch(`${API_BASE}/db/${encodeURIComponent(connectionId)}/sql`, {
+      method: 'POST',
+      body: JSON.stringify({
+        sql: elements.dbSqlInput.value,
+        enableWrite: elements.dbEnableWrites.checked,
+        confirmWrite: elements.dbWriteConfirm.value.trim(),
+        projectId: elements.dbProjectSelect.value,
+      }),
+    });
+    const data = await response.json();
+    elements.dbSqlResult.textContent = JSON.stringify(data, null, 2);
+  });
+
+  elements.dbMigrateForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const sourceConnectionId = elements.dbMigrateSource.value;
+    const targetConnectionId = elements.dbMigrateTarget.value;
+    const response = await apiFetch(`${API_BASE}/db/migrate`, {
+      method: 'POST',
+      body: JSON.stringify({ sourceConnectionId, targetConnectionId }),
+    });
+    const data = await response.json();
+    elements.dbMigrateResult.textContent = JSON.stringify(data, null, 2);
+  });
 
   elements.envForm.addEventListener('submit', async (event) => {
     event.preventDefault();

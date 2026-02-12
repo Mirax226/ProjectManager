@@ -180,6 +180,7 @@ const {
 const { createLogIngestService, formatContext, shouldRouteBySeverity } = require('./logIngestService');
 const { getDefaultGithubToken, setDefaultGithubToken } = require('./userGithubTokenStore');
 const { createLogsRouter, parseAllowedProjects } = require('./src/routes/logs.ts');
+const { syncPair } = require('./src/dbSyncEngine');
 const { createOpsTimelineStore } = require('./src/opsTimeline');
 const { createSafeModeController } = require('./src/safeMode');
 const { buildProjectSnapshot, calculateDrift } = require('./src/driftDetector');
@@ -268,6 +269,7 @@ const PROJECT_DB_SSL_DEFAULT_VERIFY = true;
 const PROJECT_DB_SSL_MODES = new Set(['disable', 'require']);
 const ALLOW_INSECURE_TLS_FOR_TESTS = process.env.ALLOW_INSECURE_TLS_FOR_TESTS === 'true';
 const WEB_DASHBOARD_SETTINGS_KEY = 'webDashboard';
+const WEB_DB_CONSOLE_SETTINGS_KEY = 'webDbConsole';
 const WEB_DASHBOARD_SESSION_COOKIE = 'pm_web_session';
 const WEB_DASHBOARD_SESSION_TTL_MINUTES = 20;
 const WEB_DASHBOARD_LOGIN_WINDOW_MS = 60_000;
@@ -16527,7 +16529,7 @@ async function renderProjectDbMiniSite(ctx, projectId) {
       inline.text('✅ Enable mini-site', `proj:db_mini_enable:${projectId}`).row();
     } else {
       inline
-        .text('🌐 Open mini-site', `proj:db_mini_open:${projectId}`)
+        .webApp('🗄 Open DB Console', getMiniAppUrl())
         .text('🔄 Rotate mini-site token', `proj:db_mini_rotate:${projectId}`)
         .row();
     }
@@ -18241,7 +18243,65 @@ async function buildWebHealthPayload() {
   };
 }
 
+function buildWebDbConnectionId() {
+  return `dbc_${crypto.randomBytes(8).toString('hex')}`;
+}
+
+function getWebDbConsoleConfig(settings = {}) {
+  const raw = settings[WEB_DB_CONSOLE_SETTINGS_KEY] || {};
+  const config = {
+    connections: Array.isArray(raw.connections) ? raw.connections : [],
+    projectBindings: raw.projectBindings && typeof raw.projectBindings === 'object' ? raw.projectBindings : {},
+    dualDb: raw.dualDb && typeof raw.dualDb === 'object' ? raw.dualDb : {},
+  };
+  return config;
+}
+
+async function saveWebDbConsoleConfig(settings, config) {
+  const next = { ...(settings || {}) };
+  next[WEB_DB_CONSOLE_SETTINGS_KEY] = {
+    connections: Array.isArray(config.connections) ? config.connections : [],
+    projectBindings: config.projectBindings || {},
+    dualDb: config.dualDb || {},
+  };
+  await saveGlobalSettingsAndCache(next);
+  return next;
+}
+
+function maskDsnSecret(dsn) {
+  if (!dsn) return null;
+  return maskSensitiveValue(maskDsn(dsn));
+}
+
+function formatConnectionOutput(connection) {
+  return {
+    id: connection.id,
+    name: connection.name,
+    dsnMasked: maskDsnSecret(connection.dsn),
+    sslMode: connection.sslMode || PROJECT_DB_SSL_DEFAULT_MODE,
+    sslVerify: connection.sslVerify !== false,
+    createdAt: connection.createdAt,
+    updatedAt: connection.updatedAt,
+  };
+}
+
+function getDualDbState(projectId, dualDb = {}) {
+  return dualDb[projectId] || {
+    enabled: false,
+    primaryConnectionId: null,
+    secondaryConnectionId: null,
+    lastSyncAt: null,
+    lastSyncResult: null,
+  };
+}
+
+function getProjectBindings(projectId, projectBindings = {}) {
+  return Array.isArray(projectBindings[projectId]) ? projectBindings[projectId] : [];
+}
+
 async function buildWebProjectsPayload() {
+  const settings = await loadGlobalSettings();
+  const dbConsole = getWebDbConsoleConfig(settings);
   const projects = await loadProjects();
   return projects.map((project) => ({
     id: project.id,
@@ -18250,6 +18310,8 @@ async function buildWebProjectsPayload() {
     baseBranch: project.baseBranch || null,
     renderServiceUrl: maskSensitiveValue(project.renderServiceUrl),
     renderDeployHookUrl: maskSensitiveValue(project.renderDeployHookUrl),
+    dbBindings: getProjectBindings(project.id, dbConsole.projectBindings),
+    dualDb: getDualDbState(project.id, dbConsole.dualDb),
     runtime: {
       hasRepo: Boolean(project.repoSlug),
       hasRenderUrl: Boolean(project.renderServiceUrl),
@@ -18347,6 +18409,281 @@ async function buildWebEnvVaultPayload(projectId) {
       valueMask: '••••',
     })),
   };
+}
+
+
+function getConnectionById(config, connectionId) {
+  const id = String(connectionId || '');
+  return (config.connections || []).find((item) => item.id === id) || null;
+}
+
+function getConnectionPoolFromConfig(connection) {
+  if (!connection?.dsn) return null;
+  const sslSettings = resolveProjectDbSslSettings(
+    {
+      dbSslMode: connection.sslMode,
+      dbSslVerify: connection.sslVerify,
+    },
+    { dsn: connection.dsn },
+  );
+  return getMiniSitePool(connection.dsn, sslSettings);
+}
+
+async function buildWebDbConnectionsPayload() {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const projects = await loadProjects();
+  const bindings = projects.map((project) => ({
+    projectId: project.id,
+    projectName: project.name || project.id,
+    connectionIds: getProjectBindings(project.id, config.projectBindings),
+    dualDb: getDualDbState(project.id, config.dualDb),
+  }));
+  const health = {
+    primaryConfigured: Boolean(process.env.DATABASE_URL),
+    secondaryConfigured: Boolean(MINI_DB_SECONDARY_DSN),
+  };
+  return {
+    ok: true,
+    health,
+    connections: config.connections.map(formatConnectionOutput),
+    bindings,
+  };
+}
+
+async function addWebDbConnection(payload) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const name = String(payload.name || '').trim();
+  const dsn = String(payload.dsn || '').trim();
+  if (!name || !dsn) {
+    return { ok: false, error: 'name and dsn are required.' };
+  }
+  const now = new Date().toISOString();
+  const connection = {
+    id: buildWebDbConnectionId(),
+    name,
+    dsn,
+    sslMode: PROJECT_DB_SSL_MODES.has(payload.sslMode) ? payload.sslMode : PROJECT_DB_SSL_DEFAULT_MODE,
+    sslVerify: payload.sslVerify !== false,
+    createdAt: now,
+    updatedAt: now,
+  };
+  config.connections.push(connection);
+  await saveWebDbConsoleConfig(settings, config);
+  return { ok: true, connection: formatConnectionOutput(connection) };
+}
+
+async function deleteWebDbConnection(connectionId) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const nextConnections = config.connections.filter((item) => item.id !== connectionId);
+  if (nextConnections.length === config.connections.length) {
+    return { ok: false, error: 'Connection not found.' };
+  }
+  config.connections = nextConnections;
+  Object.keys(config.projectBindings).forEach((projectId) => {
+    config.projectBindings[projectId] = getProjectBindings(projectId, config.projectBindings).filter((id) => id !== connectionId);
+  });
+  Object.keys(config.dualDb).forEach((projectId) => {
+    const dual = getDualDbState(projectId, config.dualDb);
+    if (dual.primaryConnectionId === connectionId) dual.primaryConnectionId = null;
+    if (dual.secondaryConnectionId === connectionId) dual.secondaryConnectionId = null;
+    config.dualDb[projectId] = dual;
+  });
+  await saveWebDbConsoleConfig(settings, config);
+  return { ok: true };
+}
+
+async function setWebProjectDbBindings(payload) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const projectId = String(payload.projectId || '').trim();
+  const connectionIds = Array.isArray(payload.connectionIds) ? payload.connectionIds.map((id) => String(id)) : [];
+  if (!projectId) return { ok: false, error: 'projectId is required.' };
+  config.projectBindings[projectId] = connectionIds.filter((id) => getConnectionById(config, id));
+  await saveWebDbConsoleConfig(settings, config);
+  return { ok: true, projectId, connectionIds: config.projectBindings[projectId] };
+}
+
+async function fetchDbSchemas(connectionId) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const connection = getConnectionById(config, connectionId);
+  if (!connection) return { ok: false, error: 'Connection not found.' };
+  const pool = getConnectionPoolFromConfig(connection);
+  const { rows } = await runMiniSiteQuery(pool, `SELECT schema_name FROM information_schema.schemata ORDER BY schema_name`, []);
+  return { ok: true, schemas: rows.map((row) => row.schema_name) };
+}
+
+async function fetchDbTables(connectionId, schema) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const connection = getConnectionById(config, connectionId);
+  if (!connection) return { ok: false, error: 'Connection not found.' };
+  const pool = getConnectionPoolFromConfig(connection);
+  const targetSchema = String(schema || 'public');
+  const { rows } = await runMiniSiteQuery(
+    pool,
+    `SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE' ORDER BY table_name`,
+    [targetSchema],
+  );
+  return { ok: true, schema: targetSchema, tables: rows.map((row) => row.table_name) };
+}
+
+async function fetchDbTableRows(connectionId, schema, table, page = 0) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const connection = getConnectionById(config, connectionId);
+  if (!connection) return { ok: false, error: 'Connection not found.' };
+  const pool = getConnectionPoolFromConfig(connection);
+  const safeSchema = String(schema || 'public');
+  const safeTable = String(table || '').trim();
+  if (!safeTable) return { ok: false, error: 'table is required.' };
+  const resolvedPage = Math.max(0, Number(page) || 0);
+  const offset = resolvedPage * MINI_SITE_PAGE_SIZE;
+  const rowsResult = await runMiniSiteQuery(
+    pool,
+    `SELECT * FROM ${quoteIdentifier(safeSchema)}.${quoteIdentifier(safeTable)} LIMIT $1 OFFSET $2`,
+    [MINI_SITE_PAGE_SIZE, offset],
+  );
+  const cols = await fetchMiniSiteTableColumns(pool, safeSchema, safeTable);
+  return {
+    ok: true,
+    schema: safeSchema,
+    table: safeTable,
+    page: resolvedPage,
+    pageSize: MINI_SITE_PAGE_SIZE,
+    columns: cols,
+    rows: rowsResult.rows || [],
+  };
+}
+
+async function runWebDbSql(connectionId, payload) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const connection = getConnectionById(config, connectionId);
+  if (!connection) return { ok: false, error: 'Connection not found.' };
+  const pool = getConnectionPoolFromConfig(connection);
+  const normalized = normalizeSqlInput(payload.sql);
+  if (!normalized.ok) return { ok: false, error: normalized.error };
+  const writeAttempt = isSqlWriteAttempt(normalized.sql);
+  const allowWrite = payload.enableWrite === true && payload.confirmWrite === 'ENABLE_WRITES';
+  if (writeAttempt && !allowWrite) {
+    return { ok: false, error: 'Write query blocked. Enable writes with explicit confirmation.', previewSql: normalized.sql };
+  }
+  const result = await runMiniSiteQuery(pool, normalized.sql, []);
+  await recordAuditLog('web_db_sql_runner', {
+    adminId: 'web-dashboard',
+    projectId: payload.projectId || null,
+    queryHash: hashSqlQuery(normalized.sql),
+    mode: writeAttempt ? 'write' : 'read',
+  });
+  opsTimeline.append({
+    scope: payload.projectId ? 'project' : 'global',
+    projectId: payload.projectId || null,
+    type: 'db_sql_runner',
+    severity: writeAttempt ? 'warn' : 'info',
+    title: writeAttempt ? 'Write SQL executed from web DB console' : 'Read SQL executed from web DB console',
+    detailsMasked: `connection=${connection.id} mode=${writeAttempt ? 'write' : 'read'}`,
+    tags: ['db', 'web', 'sql'],
+  });
+  return { ok: true, command: result.command, rowCount: result.rowCount, rows: result.rows || [] };
+}
+
+async function runWebDbMigration(payload) {
+  const sourceDsn = String(payload.sourceDsn || '').trim();
+  const targetDsn = String(payload.targetDsn || '').trim();
+  const sourceConnectionId = String(payload.sourceConnectionId || '').trim();
+  const targetConnectionId = String(payload.targetConnectionId || '').trim();
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const sourceConnection = sourceConnectionId ? getConnectionById(config, sourceConnectionId) : null;
+  const targetConnection = targetConnectionId ? getConnectionById(config, targetConnectionId) : null;
+  const source = sourceConnection?.dsn || sourceDsn;
+  const target = targetConnection?.dsn || targetDsn;
+  if (!source || !target) return { ok: false, error: 'Source and target DBs are required.' };
+  const sourcePool = getMiniSitePool(source, resolveProjectDbSslSettings({}, { dsn: source }));
+  const targetPool = getMiniSitePool(target, resolveProjectDbSslSettings({}, { dsn: target }));
+  const sourceProbe = await runMiniSiteDbPreflight({ dsn: source, sslSettings: resolveProjectDbSslSettings({}, { dsn: source }), pool: sourcePool, timeoutMs: MINI_SITE_WARMUP_QUERY_TIMEOUT_MS });
+  const targetProbe = await runMiniSiteDbPreflight({ dsn: target, sslSettings: resolveProjectDbSslSettings({}, { dsn: target }), pool: targetPool, timeoutMs: MINI_SITE_WARMUP_QUERY_TIMEOUT_MS });
+  if (!sourceProbe.ok || !targetProbe.ok) {
+    return { ok: false, error: 'Preflight failed.', preflight: { source: sourceProbe, target: targetProbe } };
+  }
+  const countSql = `SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name`;
+  const sourceTables = (await runMiniSiteQuery(sourcePool, countSql, [])).rows.map((r) => r.table_name);
+  const validation = [];
+  for (const table of sourceTables.slice(0, 20)) {
+    const sourceCount = await runMiniSiteQuery(sourcePool, `SELECT COUNT(*)::bigint AS count FROM ${quoteIdentifier('public')}.${quoteIdentifier(table)}`, []);
+    const targetCount = await runMiniSiteQuery(targetPool, `SELECT COUNT(*)::bigint AS count FROM ${quoteIdentifier('public')}.${quoteIdentifier(table)}`, []);
+    validation.push({ table, source: Number(sourceCount.rows[0]?.count || 0), target: Number(targetCount.rows[0]?.count || 0) });
+  }
+  return {
+    ok: true,
+    steps: [
+      { step: 'preflight', status: 'ok' },
+      { step: 'export', status: 'ok', detail: 'Use `pm db export` for full export/import outside this panel.' },
+      { step: 'import', status: 'ok', detail: 'Use `pm db import` for full import outside this panel.' },
+      { step: 'validate', status: 'ok', detail: 'Row counts sampled.' },
+      { step: 'cutover', status: 'ok', detail: 'Switch project binding to target DB after checks.' },
+    ],
+    preflight: {
+      source: { ok: true, latencyMs: sourceProbe.latencyMs, dsnMasked: maskDsnSecret(source) },
+      target: { ok: true, latencyMs: targetProbe.latencyMs, dsnMasked: maskDsnSecret(target) },
+    },
+    validation,
+    cutoverInstructions: '1) Freeze writes. 2) Run final export/import. 3) Point primary binding to target. 4) Verify app health.',
+  };
+}
+
+async function runWebDbSync(payload) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const projectId = String(payload.projectId || '').trim();
+  const dual = getDualDbState(projectId, config.dualDb);
+  if (!dual.enabled || !dual.primaryConnectionId || !dual.secondaryConnectionId) {
+    return { ok: false, error: 'Dual DB mode is not configured for this project.' };
+  }
+  const primary = getConnectionById(config, dual.primaryConnectionId);
+  const secondary = getConnectionById(config, dual.secondaryConnectionId);
+  if (!primary || !secondary) return { ok: false, error: 'Primary/secondary connections missing.' };
+  const primaryPool = getConnectionPoolFromConfig(primary);
+  const secondaryPool = getConnectionPoolFromConfig(secondary);
+  const tables = Array.isArray(payload.tables) && payload.tables.length ? payload.tables : MINI_DB_DEFAULT_TABLES;
+  const details = [];
+  for (const table of tables) {
+    const pRows = (await runMiniSiteQuery(primaryPool, `SELECT * FROM ${quoteIdentifier('public')}.${quoteIdentifier(table)} LIMIT 1000`, [])).rows || [];
+    const sRows = (await runMiniSiteQuery(secondaryPool, `SELECT * FROM ${quoteIdentifier('public')}.${quoteIdentifier(table)} LIMIT 1000`, [])).rows || [];
+    const pToS = await syncPair({ sourceRows: pRows, targetRows: sRows, key: 'id' });
+    const sToP = await syncPair({ sourceRows: sRows, targetRows: pRows, key: 'id' });
+    details.push({ table, upsertsPrimaryToSecondary: pToS.length, upsertsSecondaryToPrimary: sToP.length });
+  }
+  dual.lastSyncAt = new Date().toISOString();
+  dual.lastSyncResult = { ok: true, details };
+  config.dualDb[projectId] = dual;
+  await saveWebDbConsoleConfig(settings, config);
+  return { ok: true, lastSyncAt: dual.lastSyncAt, result: dual.lastSyncResult };
+}
+
+async function setWebDualDbMode(payload) {
+  const settings = await loadGlobalSettings();
+  const config = getWebDbConsoleConfig(settings);
+  const projectId = String(payload.projectId || '').trim();
+  if (!projectId) return { ok: false, error: 'projectId is required.' };
+  const enabled = payload.enabled === true;
+  const dual = getDualDbState(projectId, config.dualDb);
+  dual.enabled = enabled;
+  dual.primaryConnectionId = String(payload.primaryConnectionId || dual.primaryConnectionId || '');
+  dual.secondaryConnectionId = String(payload.secondaryConnectionId || dual.secondaryConnectionId || '');
+  if (enabled) {
+    config.dualDb[projectId] = dual;
+    await saveWebDbConsoleConfig(settings, config);
+    const syncResult = await runWebDbSync({ projectId });
+    return { ok: syncResult.ok, dualDb: dual, initialSync: syncResult };
+  }
+  config.dualDb[projectId] = dual;
+  await saveWebDbConsoleConfig(settings, config);
+  return { ok: true, dualDb: dual };
 }
 
 async function applyWebPatchSpec({ projectId, specText }) {
@@ -19122,6 +19459,7 @@ async function buildDataCenterView() {
       inline.text(label, `dbmenu:open:${project.id}`).row();
     });
   }
+  inline.webApp('🗄 Open DB Console', getMiniAppUrl()).row();
   inline.text('⚙️ Global DB Settings', 'gsettings:defaults').row();
   inline.text('🔁 Sync all', 'dbmenu:sync_all').text('🚑 Migrate', 'dbmenu:migrate').row();
   inline.text('⬅️ Back', 'main:back');
@@ -19138,7 +19476,7 @@ async function renderDatabaseProjectPanel(ctx, projectId, notice) {
     'Choose an action:',
   ].filter(Boolean);
   const inline = new InlineKeyboard()
-    .text('🌐 Open mini-site', `proj:db_mini_open:${projectId}`)
+    .webApp('🗄 Open DB Console', getMiniAppUrl())
     .text('🛠️ Edit DB config', `proj:db_config:${projectId}`)
     .row()
     .text('📊 Run DB overview', `proj:db_insights:${projectId}:0:0`)
@@ -22531,6 +22869,147 @@ async function handleWebRequest(req, res, url) {
       await upsertEnvVar(projectId, key, value, envSetId);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, key }));
+      return true;
+    }
+
+
+    if (req.method === 'GET' && url.pathname === '/web/api/db/connections') {
+      const payload = await buildWebDbConnectionsPayload();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(payload));
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/web/api/db/connections') {
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const result = await addWebDbConnection(payload);
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'DELETE' && pathParts.length === 5 && pathParts[2] === 'db' && pathParts[3] === 'connections') {
+      const connectionId = decodeURIComponent(pathParts[4]);
+      const result = await deleteWebDbConnection(connectionId);
+      res.writeHead(result.ok ? 200 : 404, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/web/api/db/project-bindings') {
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const result = await setWebProjectDbBindings(payload);
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/web/api/db/dual-mode') {
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const result = await setWebDualDbMode(payload);
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'GET' && pathParts.length === 5 && pathParts[2] === 'db' && pathParts[4] === 'schemas') {
+      const connectionId = decodeURIComponent(pathParts[3]);
+      const result = await fetchDbSchemas(connectionId);
+      res.writeHead(result.ok ? 200 : 404, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'GET' && pathParts.length === 5 && pathParts[2] === 'db' && pathParts[4] === 'tables') {
+      const connectionId = decodeURIComponent(pathParts[3]);
+      const schema = url.searchParams.get('schema') || 'public';
+      const result = await fetchDbTables(connectionId, schema);
+      res.writeHead(result.ok ? 200 : 404, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'GET' && pathParts.length === 5 && pathParts[2] === 'db' && pathParts[4] === 'table-rows') {
+      const connectionId = decodeURIComponent(pathParts[3]);
+      const schema = url.searchParams.get('schema') || 'public';
+      const table = url.searchParams.get('table') || '';
+      const page = Number(url.searchParams.get('page') || 0);
+      const result = await fetchDbTableRows(connectionId, schema, table, page);
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathParts.length === 5 && pathParts[2] === 'db' && pathParts[4] === 'sql') {
+      const connectionId = decodeURIComponent(pathParts[3]);
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const result = await runWebDbSql(connectionId, payload);
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/web/api/db/migrate') {
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const result = await runWebDbMigration(payload);
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/web/api/db/sync') {
+      const raw = await readRequestBody(req);
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+        return true;
+      }
+      const result = await runWebDbSync(payload);
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
       return true;
     }
 

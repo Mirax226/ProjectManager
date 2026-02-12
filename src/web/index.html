@@ -111,10 +111,84 @@
         </section>
 
         <section class="view" id="view-database">
-          <div class="card">
-            <h3>Database Browser</h3>
-            <p>Open the existing DB mini-site (read-only by default).</p>
-            <a class="primary-link" href="/db-mini" target="_blank" rel="noreferrer">Open DB mini-site →</a>
+          <div class="grid db-grid">
+            <div class="card db-hero">
+              <h3>🗄 DB Console</h3>
+              <p class="muted">Read-only by default. Writes require explicit enable + confirmation and are logged.</p>
+              <div id="dbOverallStatus" class="stat-list"></div>
+            </div>
+            <div class="card">
+              <h3>Connections</h3>
+              <form id="dbConnectionForm" class="form">
+                <input type="text" id="dbConnectionName" placeholder="Connection name" required />
+                <input type="password" id="dbConnectionDsn" placeholder="postgres://..." required />
+                <div class="filters">
+                  <select id="dbConnectionSslMode">
+                    <option value="require">SSL require</option>
+                    <option value="disable">SSL disable</option>
+                  </select>
+                  <label class="checkbox"><input type="checkbox" id="dbConnectionSslVerify" checked /> Verify TLS</label>
+                </div>
+                <button type="submit">Add Connection</button>
+              </form>
+              <div id="dbConnectionsList" class="list"></div>
+            </div>
+            <div class="card">
+              <h3>Project DB bindings</h3>
+              <div class="filters">
+                <select id="dbProjectSelect"></select>
+                <button class="secondary" id="dbBindingSave">Save Bindings</button>
+              </div>
+              <div id="dbBindingOptions" class="pill-list"></div>
+              <div class="filters" style="margin-top:12px;">
+                <label class="checkbox"><input type="checkbox" id="dbDualEnabled" /> Dual DB mode</label>
+                <select id="dbDualPrimary"></select>
+                <select id="dbDualSecondary"></select>
+                <button class="secondary" id="dbDualSave">Apply Dual Mode</button>
+                <button class="secondary" id="dbSyncNow">Sync now</button>
+              </div>
+              <div id="dbDualStatus" class="muted"></div>
+            </div>
+            <div class="card">
+              <h3>Table browser</h3>
+              <div class="filters">
+                <select id="dbConnectionSelect"></select>
+                <select id="dbSchemaSelect"></select>
+                <select id="dbTableSelect"></select>
+                <button class="secondary" id="dbLoadRows">Load rows</button>
+              </div>
+              <div id="dbSchemaInfo" class="list"></div>
+              <div id="dbRows" class="preview"></div>
+            </div>
+            <div class="card">
+              <h3>SQL runner</h3>
+              <p class="muted">Default mode allows only SELECT/SHOW/EXPLAIN.</p>
+              <form id="dbSqlForm" class="form">
+                <textarea id="dbSqlInput" rows="6" placeholder="SELECT * FROM projects LIMIT 10"></textarea>
+                <label class="checkbox"><input type="checkbox" id="dbEnableWrites" /> Danger Zone: enable writes</label>
+                <input type="text" id="dbWriteConfirm" placeholder="Type ENABLE_WRITES to confirm" />
+                <button type="submit">Run SQL</button>
+              </form>
+              <div id="dbSqlResult" class="preview"></div>
+            </div>
+            <div class="card">
+              <h3>Migration wizard (old → new)</h3>
+              <form id="dbMigrateForm" class="form">
+                <select id="dbMigrateSource"></select>
+                <select id="dbMigrateTarget"></select>
+                <button type="submit">Run migration preflight + validation</button>
+              </form>
+              <div id="dbMigrateResult" class="preview"></div>
+            </div>
+            <div class="card">
+              <h3>DB help & safety</h3>
+              <div class="list">
+                <div class="list-item"><h4>Read-only default</h4><div class="muted">SQL runner blocks write statements unless Danger Zone is explicitly enabled and confirmed.</div></div>
+                <div class="list-item"><h4>Write safety</h4><div class="muted">Write mode requires confirmation text and every run is logged to ops timeline/audit logs.</div></div>
+                <div class="list-item"><h4>Migration wizard</h4><div class="muted">Checks connectivity + latency, validates row counts, and prints cutover instructions.</div></div>
+                <div class="list-item"><h4>Dual DB sync</h4><div class="muted">Uses last-write-wins by updated_at and performs initial reconcile when mode is enabled.</div></div>
+              </div>
+            </div>
           </div>
         </section>
 
