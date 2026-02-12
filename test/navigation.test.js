@@ -199,3 +199,48 @@ test('breadcrumb helper renders expected format', () => {
   assert.match(header, /Scope: PROJECT: Alpha/);
   assert.match(header, /Breadcrumb: Main → Databases → Alpha → Database/);
 });
+
+const { pushSnapshot, clearStack } = require('../navigationStackStore');
+
+test('global db -> project db -> back returns to global db list', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(31);
+  await clearStack(31, 'global');
+
+  const ctx = {
+    chat: { id: 31 },
+    callbackQuery: { data: 'nav:back', message: { chat: { id: 31 }, message_id: 777 } },
+    from: { id: 91 },
+    api,
+    answerCallbackQuery: async () => {},
+  };
+
+  await pushSnapshot(31, 'global', { routeId: 'cb:dbmenu:list', timestamp: Date.now() - 1000 });
+  await pushSnapshot(31, 'global', { routeId: 'cb:dbmenu:open:demo', timestamp: Date.now() });
+
+  await __test.goBack(ctx);
+
+  const renderedText = calls.editMessageText.length
+    ? calls.editMessageText[0][2]
+    : calls.sendMessage[0][1];
+  assert.match(renderedText, /Database/);
+});
+
+test('goBack falls back to home when stack empty', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(32);
+  await clearStack(32, 'global');
+
+  const ctx = {
+    chat: { id: 32 },
+    from: { id: 92 },
+    api,
+  };
+
+  await __test.goBack(ctx);
+
+  assert.equal(calls.sendMessage.length, 1);
+  assert.match(calls.sendMessage[0][1], /Main menu/);
+});

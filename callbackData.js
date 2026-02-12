@@ -136,6 +136,12 @@ function sanitizeReplyMarkup(replyMarkup) {
   const rows = replyMarkup.inline_keyboard;
   rows.forEach((row) => {
     row.forEach((button) => {
+      const text = String(button?.text || '');
+      const isBackText = /(?:⬅|↩|◀)/.test(text) || /^back\b/i.test(text) || /\bback\b/i.test(text);
+      const isHomeText = /\bhome\b/i.test(text);
+      if (button.callback_data && isBackText && !isHomeText) {
+        button.callback_data = 'nav:back';
+      }
       if (button.callback_data) {
         button.callback_data = buildCb(button.callback_data);
       }

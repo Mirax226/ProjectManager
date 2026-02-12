@@ -162,6 +162,12 @@ const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
 const { ensureConfigTable, loadJson: loadConfigJson, saveJson: saveConfigJson } = require('./configStore');
 const {
+  pushSnapshot: pushNavigationSnapshot,
+  getStack: getNavigationStack,
+  setStack: setNavigationStack,
+  clearStack: clearNavigationStack,
+} = require('./navigationStackStore');
+const {
   getConfigDbPool,
   testConfigDbConnection: probeConfigDbConnection,
   maskDsn,
@@ -1394,6 +1400,15 @@ async function renderPanel(ctx, text, extra) {
   }
   if (response?.chat?.id && response?.message_id) {
     await trackPanelMessage(response.chat.id, response.message_id, cleanup, ctx?.from?.id);
+    if (ctx?.__navRouteId) {
+      await recordNavigationSnapshot(ctx, {
+        routeId: ctx.__navRouteId,
+        params: ctx?.__navParams || {},
+        messageId: response.message_id,
+        panelType: 'panel',
+        timestamp: Date.now(),
+      }, safeExtra || {});
+    }
   }
   return response;
 }
@@ -1408,6 +1423,83 @@ async function renderOrEdit(ctx, text, extra) {
 function normalizeRoute(route) {
   if (!route) return 'main';
   return String(route).trim().toLowerCase();
+}
+
+function getNavigationProjectScope(ctx) {
+  const projectId = ctx?.__navProjectId || ctx?.state?.projectId || null;
+  return projectId ? String(projectId) : 'global';
+}
+
+function shouldRecordNavigationSnapshot(ctx, options = {}) {
+  if (options?.skipNavigationRecord) return false;
+  if (ctx?.__skipNavigationRecord) return false;
+  if (ctx?.__transientNotice) return false;
+  return true;
+}
+
+async function recordNavigationSnapshot(ctx, snapshot, options = {}) {
+  if (!shouldRecordNavigationSnapshot(ctx, options)) return;
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) return;
+  const projectScope = getNavigationProjectScope(ctx);
+  await pushNavigationSnapshot(chatId, projectScope, snapshot);
+}
+
+async function renderScreen(ctx, routeId, params = {}) {
+  if (!routeId) return false;
+  if (routeId.startsWith('route:')) {
+    const route = routeId.slice('route:'.length);
+    await navigateTo(getChatIdFromCtx(ctx), ctx?.from?.id, route, { ctx, skipNavigationRecord: true });
+    return true;
+  }
+  if (routeId.startsWith('cb:')) {
+    const data = routeId.slice('cb:'.length);
+    const previousSkip = ctx.__skipNavigationRecord;
+    ctx.__skipNavigationRecord = true;
+    try {
+      await dispatchCallbackData(ctx, data, { skipNavigationRecord: true });
+    } finally {
+      ctx.__skipNavigationRecord = previousSkip;
+    }
+    return true;
+  }
+  return false;
+}
+
+async function goHome(ctx) {
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) return;
+  await clearNavigationStack(chatId, 'global');
+  await navigateTo(chatId, ctx?.from?.id, 'main', { ctx, skipNavigationRecord: false });
+}
+
+async function goBack(ctx) {
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) {
+    await goHome(ctx);
+    return;
+  }
+  const projectScope = getNavigationProjectScope(ctx);
+  const stack = await getNavigationStack(chatId, projectScope);
+  if (!stack.length) {
+    await goHome(ctx);
+    return;
+  }
+  const nextStack = [...stack];
+  nextStack.pop();
+  while (nextStack.length) {
+    const previous = nextStack[nextStack.length - 1];
+    await setNavigationStack(chatId, projectScope, nextStack);
+    try {
+      const rendered = await renderScreen(ctx, previous.routeId, previous.params || {});
+      if (rendered) return;
+    } catch (error) {
+      console.warn('[navigation] goBack failed snapshot render', error?.message);
+    }
+    nextStack.pop();
+  }
+  await setNavigationStack(chatId, projectScope, []);
+  await goHome(ctx);
 }
 
 function buildNavigationContext(chatId, userId, ctx) {
@@ -1457,6 +1549,8 @@ async function navigateTo(chatId, userId, route, options = {}) {
   const normalizedRoute = normalizeRoute(route);
   const handlers = options.handlers || getNavigationHandlers();
   const ctx = buildNavigationContext(chatId, userId, options.ctx);
+  ctx.__skipNavigationRecord = options.skipNavigationRecord === true;
+  ctx.__navRouteId = `route:${normalizedRoute}`;
   const targetChatId = getChatIdFromCtx(ctx);
   const targetUserId = ctx?.from?.id || userId || null;
   const handler = handlers[normalizedRoute] || handlers.main;
@@ -2966,6 +3060,20 @@ bot.command('start', async (ctx) => {
   await handleStartCommand(ctx, ctx.match || '');
 });
 
+
+bot.command('navdiag', async (ctx) => {
+  const userId = Number(ctx.from?.id || 0);
+  if (ADMIN_TELEGRAM_ID && userId !== Number(ADMIN_TELEGRAM_ID)) {
+    await respond(ctx, 'Not allowed.');
+    return;
+  }
+  const chatId = getChatIdFromCtx(ctx);
+  const stack = await getNavigationStack(chatId, 'global');
+  const top = stack.slice(-5).reverse().map((entry) => `• ${entry.routeId}`);
+  const lines = ['🧭 Navigation diagnostics (top 5)', ...(top.length ? top : ['• (empty)'])];
+  await respond(ctx, lines.join('\n'));
+});
+
 bot.hears('📦 Projects', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'projects');
 });
@@ -3164,6 +3272,60 @@ async function handleRoutineCallback(ctx, data) {
   }
 }
 
+async function dispatchCallbackData(ctx, data, options = {}) {
+  const callbackData = String(data || '');
+  if (callbackData === 'nav:back') {
+    await goBack(ctx);
+    return;
+  }
+  if (callbackData === 'nav:home') {
+    await goHome(ctx);
+    return;
+  }
+  if (callbackData.startsWith('msgdel:')) {
+    await handleDeleteMessageCallback(ctx, callbackData);
+    return;
+  }
+  if (callbackData.startsWith('routine:')) {
+    await handleRoutineCallback(ctx, callbackData);
+    return;
+  }
+  if (callbackData.startsWith('opsdbg:')) {
+    await ensureAnswerCallback(ctx);
+    const payload = decodeRoutinePayload(callbackData.split(':')[1]);
+    await sendDismissibleMessage(ctx, `\`\`\`json
+${JSON.stringify(payload || {}, null, 2)}
+\`\`\``);
+    return;
+  }
+  if (callbackData.startsWith('routinefix:')) {
+    const parts = callbackData.split(':');
+    await maybeSendRoutineFixFromButton(ctx, parts[1]);
+    return;
+  }
+  if (callbackData.startsWith('codex_tasks:')) return handleCodexTasksCallback(ctx, callbackData);
+  if (callbackData.startsWith('main:')) return handleMainCallback(ctx, callbackData);
+  if (callbackData.startsWith('ops:')) return handleOpsCallback(ctx, callbackData);
+  if (callbackData.startsWith('help:')) return handleHelpCallback(ctx, callbackData);
+  if (callbackData.startsWith('proj:')) return handleProjectCallback(ctx, callbackData);
+  if (callbackData.startsWith('projlog:')) return handleProjectLogCallback(ctx, callbackData);
+  if (callbackData.startsWith('logtest:')) return handleLogTestCallback(ctx, callbackData);
+  if (callbackData.startsWith('dbmenu:')) return handleDatabaseMenuCallback(ctx, callbackData);
+  if (callbackData.startsWith('logmenu:')) return handleLogsMenuCallback(ctx, callbackData);
+  if (callbackData.startsWith('deploy:')) return handleDeployCallback(ctx, callbackData);
+  if (callbackData.startsWith('notes:')) return handleNotesCallback(ctx, callbackData);
+  if (callbackData.startsWith('projwiz:')) return handleProjectWizardCallback(ctx, callbackData);
+  if (callbackData.startsWith('configdb:')) return handleConfigDbCallback(ctx, callbackData);
+  if (callbackData.startsWith('gsettings:')) return handleGlobalSettingsCallback(ctx, callbackData);
+  if (callbackData.startsWith('supabase:')) return handleSupabaseCallback(ctx, callbackData);
+  if (callbackData.startsWith('cron:')) return handleCronCallback(ctx, callbackData);
+  if (callbackData.startsWith('cronwiz:')) return handleCronWizardCallback(ctx, callbackData);
+  if (callbackData.startsWith('projcron:')) return handleProjectCronCallback(ctx, callbackData);
+  if (callbackData.startsWith('envvault:')) return handleEnvVaultCallback(ctx, callbackData);
+  if (callbackData.startsWith('cronlink:')) return handleCronLinkCallback(ctx, callbackData);
+  if (callbackData.startsWith('tgbot:')) return handleTelegramBotCallback(ctx, callbackData);
+}
+
 bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
   const resolved = await resolveCallbackData(ctx.callbackQuery.data);
   if (resolved.expired || !resolved.data) {
@@ -3171,109 +3333,10 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     return;
   }
   const data = resolved.data;
-  if (data.startsWith('msgdel:')) {
-    await handleDeleteMessageCallback(ctx, data);
-    return;
+  if (!ctx.__skipNavigationRecord && data !== 'nav:back' && data !== 'nav:home') {
+    ctx.__navRouteId = `cb:${data}`;
   }
-  if (data.startsWith('routine:')) {
-    await handleRoutineCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('opsdbg:')) {
-    await ensureAnswerCallback(ctx);
-    const payload = decodeRoutinePayload(data.split(':')[1]);
-    await sendDismissibleMessage(ctx, `\`\`\`json\n${JSON.stringify(payload || {}, null, 2)}\n\`\`\``);
-    return;
-  }
-  if (data.startsWith('routinefix:')) {
-    const parts = data.split(':');
-    await maybeSendRoutineFixFromButton(ctx, parts[1]);
-    return;
-  }
-  if (data.startsWith('codex_tasks:')) {
-    await handleCodexTasksCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('main:')) {
-    await handleMainCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('ops:')) {
-    await handleOpsCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('help:')) {
-    await handleHelpCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('proj:')) {
-    await handleProjectCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('projlog:')) {
-    await handleProjectLogCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('logtest:')) {
-    await handleLogTestCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('dbmenu:')) {
-    await handleDatabaseMenuCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('logmenu:')) {
-    await handleLogsMenuCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('deploy:')) {
-    await handleDeployCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('notes:')) {
-    await handleNotesCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('projwiz:')) {
-    await handleProjectWizardCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('configdb:')) {
-    await handleConfigDbCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('gsettings:')) {
-    await handleGlobalSettingsCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('supabase:')) {
-    await handleSupabaseCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('cron:')) {
-    await handleCronCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('cronwiz:')) {
-    await handleCronWizardCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('projcron:')) {
-    await handleProjectCronCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('envvault:')) {
-    await handleEnvVaultCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('cronlink:')) {
-    await handleCronLinkCallback(ctx, data);
-    return;
-  }
-  if (data.startsWith('tgbot:')) {
-    await handleTelegramBotCallback(ctx, data);
-    return;
-  }
+  await dispatchCallbackData(ctx, data, { skipNavigationRecord: false });
 }, 'callback_query:data'));
 
 async function handleStatefulMessage(ctx, state) {
@@ -24587,6 +24650,10 @@ module.exports = {
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
     buildRoutineFixButton,
     buildScopedHeader,
+    goBack,
+    goHome,
+    renderScreen,
+    dispatchCallbackData,
   },
 };
 
