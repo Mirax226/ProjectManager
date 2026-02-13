@@ -3643,6 +3643,13 @@ async function handleHelpCallback(ctx, data) {
   await renderOrEdit(ctx, `❓ Help — ${page || 'overview'}\n\n${text}`, { reply_markup: new InlineKeyboard().text('⬅️ Back', 'main:help') });
 }
 
+function buildDefaultProjectActionsKeyboard(projectId, isDefault) {
+  const kb = new InlineKeyboard().text('⭐ Set as default', `proj:set_default:${projectId}`).row();
+  if (isDefault) kb.text('🧹 Clear default', `proj:clear_default:${projectId}`).row();
+  kb.text('⬅️ Back', `proj:project_menu:${projectId}`);
+  return kb;
+}
+
 async function handleProjectCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action, projectId, extra, ...rest] = data.split(':');
@@ -3673,6 +3680,18 @@ async function handleProjectCallback(ctx, data) {
     case 'open':
       await renderProjectSettings(ctx, projectId);
       break;
+    case 'overview':
+      await openProjectOverview(ctx, projectId);
+      break;
+    case 'settings':
+      await renderProjectScopedSettings(ctx, projectId);
+      break;
+    case 'preferences':
+      await renderProjectPreferencesMenu(ctx, projectId);
+      break;
+    case 'repo_menu':
+      await renderProjectRepositoryMenu(ctx, projectId);
+      break;
     case 'project_menu':
       await renderProjectMenu(ctx, projectId);
       break;
@@ -3682,9 +3701,7 @@ async function handleProjectCallback(ctx, data) {
     case 'default_actions': {
       const settings = await loadGlobalSettings();
       const isDefault = settings.defaultProjectId === projectId;
-      const kb = new InlineKeyboard().text('⭐ Set as default', `proj:set_default:${projectId}`).row();
-      if (isDefault) kb.text('🧹 Clear default', `proj:clear_default:${projectId}`).row();
-      kb.text('⬅️ Back', `proj:project_menu:${projectId}`);
+      const kb = buildDefaultProjectActionsKeyboard(projectId, isDefault);
       await renderOrEdit(ctx, '⭐ Default project actions', { reply_markup: kb });
       break;
     }
@@ -12723,6 +12740,18 @@ async function getProjectById(projectId, ctx) {
   return project;
 }
 
+async function openProjectOverview(ctx, projectId, notice) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const globalSettings = await loadGlobalSettings();
+  const view = await buildProjectOverviewView(project, globalSettings, notice);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
 async function renderProjectSettings(ctx, projectId, notice) {
   if (!getConfigDbSnapshot().ready) {
     await renderConfigDbGate(ctx, { title: '📦 Project settings', backCallback: 'main:back' });
@@ -12734,8 +12763,7 @@ async function renderProjectSettings(ctx, projectId, notice) {
     await renderOrEdit(ctx, 'Project not found.');
     return;
   }
-  const globalSettings = await loadGlobalSettings();
-  const view = await buildProjectSettingsView(project, globalSettings, notice);
+  const view = buildProjectHubView(project, notice);
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
@@ -12972,7 +13000,7 @@ function getProjectMissingSetup(project, globalSettings) {
   return missing;
 }
 
-async function buildProjectSettingsView(project, globalSettings, notice) {
+async function buildProjectOverviewView(project, globalSettings, notice) {
   const effectiveBase = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
   const isDefault = globalSettings.defaultProjectId === project.id;
   const name = project.name || project.id;
@@ -12983,8 +13011,10 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
   const workingDirLabel = formatWorkingDirDisplay(project);
 
   const lines = [
-    buildScopedHeader(`PROJECT: ${name}||${project.id}`, `Main → Projects → ${name} → Overview`),
-    `📦 Project: ${isDefault ? '⭐ ' : ''}${name} (🆔 ${project.id})`,
+    buildScopedHeader(`PROJECT: ${name}||${project.id}`, `Main → Projects → ${name} → 🧾 Overview`),
+    `🧩 Project: ${isDefault ? '⭐ ' : ''}${name}`,
+    `🆔 ID: ${project.id}`,
+    '📦 Scope: Project',
     notice || null,
     '',
     `🧭 Project type: ${projectTypeLabel}`,
@@ -13013,36 +13043,89 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
   ].filter((line) => line !== null);
 
   const inline = new InlineKeyboard()
-    .text('Overview', `proj:open:${project.id}`)
-    .text('Repository', `proj:edit_repo:${project.id}`)
+    .text('✏️ Edit Project', `proj:project_menu:${project.id}`)
     .row()
-    .text('Database', `dbmenu:open:${project.id}`)
-    .text('Cron Jobs', `projcron:menu:${project.id}`)
+    .text('🌐 Repository', `proj:repo_menu:${project.id}`)
+    .text('🗄 Database', `dbmenu:open:${project.id}`)
     .row()
-    .text('Deploy', `deploy:open:${project.id}`)
-    .text('Logs', `logmenu:open:${project.id}`)
+    .text('⏱ Cron Jobs', `projcron:menu:${project.id}`)
+    .text('🚀 Deploy', `deploy:open:${project.id}`)
     .row()
-    .text('Ops (Timeline, Safe Mode, Drift)', `proj:diagnostics_menu:${project.id}`)
+    .text('🧾 Logs', `logmenu:open:${project.id}`)
+    .text('🛠 Ops & Safety', `proj:diagnostics_menu:${project.id}`)
     .row()
-    .text('Access (Guests)', `tgbot:menu:${project.id}`)
-    .row();
+    .text('⚙️ Project Settings', `proj:settings:${project.id}`)
+    .text('↩ Back', 'nav:back');
 
   if (missingSetup.length) {
-    inline
-      .text(`🧩 Complete Missing Setup (Missing: ${missingSetup.length})`, `proj:missing_setup:${project.id}`)
-      .row();
+    inline.row().text(`🧩 Complete Missing Setup (${missingSetup.length})`, `proj:missing_setup:${project.id}`);
   }
-
-  if (!isDefault) {
-    inline.text('⭐ Set as default project', `proj:set_default:${project.id}`).row();
-  } else {
-    inline.text('🧹 Clear default project', `proj:clear_default:${project.id}`).row();
-  }
-
-  inline.text('🧠 Codex Tasks', `proj:codex_tasks:${project.id}`).row();
-  inline.text('🗑 Delete project', `proj:delete:${project.id}`).row().text('🏠 Home', 'nav:home');
+  inline.row().text('🗑 Delete project', `proj:delete:${project.id}`).text('🏠 Home', 'nav:home');
 
   return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildProjectHubView(project, notice) {
+  const name = project.name || project.id;
+  const lines = [
+    buildScopedHeader(`PROJECT: ${name}||${project.id}`, `Main → Projects → ${name} → 📦 Project`),
+    `🧩 Project: ${name}`,
+    `🆔 ID: ${project.id}`,
+    '📦 Scope: Project',
+    notice || null,
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('🧾 Overview', `proj:overview:${project.id}`)
+    .row()
+    .text('✏️ Edit Project', `proj:project_menu:${project.id}`)
+    .row()
+    .text('🌐 Repository', `proj:repo_menu:${project.id}`)
+    .text('🗄 Database', `dbmenu:open:${project.id}`)
+    .row()
+    .text('⏱ Cron Jobs', `projcron:menu:${project.id}`)
+    .text('🚀 Deploy', `deploy:open:${project.id}`)
+    .row()
+    .text('🧾 Logs', `logmenu:open:${project.id}`)
+    .text('🛠 Ops & Safety', `proj:diagnostics_menu:${project.id}`)
+    .row()
+    .text('⚙️ Project Settings', `proj:settings:${project.id}`)
+    .row()
+    .text('🗑 Delete project', `proj:delete:${project.id}`)
+    .text('🏠 Home', 'nav:home');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectScopedSettings(ctx, projectId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const lines = [
+    buildScopedHeader(`PROJECT: ${project.name || project.id}||${project.id}`, `Main → Projects → ${project.name || project.id} → ⚙️ Project Settings`),
+    `⚙️ Project Settings — ${project.name || project.id}`,
+    notice || null,
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('⚙️ Preferences', `proj:preferences:${project.id}`)
+    .row()
+    .text('🧠 Codex Tasks', `proj:codex_tasks:${project.id}`)
+    .row()
+    .text('↩ Back', 'nav:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderProjectPreferencesMenu(ctx, projectId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const lines = [
+    `⚙️ Preferences — ${project.name || project.id}`,
+    notice || null,
+    '',
+    'Configure project-specific routing and behavior.',
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('🔔 Alerts & Log Routing', `logmenu:open:${project.id}`)
+    .row()
+    .text('↩ Back', 'nav:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function buildProjectMissingSetupView(project, globalSettings, notice) {
@@ -16686,8 +16769,7 @@ async function renderProjectSettingsForMessage(messageContext, projectId, notice
   if (!project) {
     return;
   }
-  const globalSettings = await loadGlobalSettings();
-  const view = await buildProjectSettingsView(project, globalSettings, notice);
+  const view = buildProjectHubView(project, notice);
   if (!messageContext.messageId) {
     await bot.api.sendMessage(
       messageContext.chatId,
@@ -16729,29 +16811,47 @@ async function renderProjectMenu(ctx, projectId) {
   if (!project) return;
 
   const inline = new InlineKeyboard()
-    .text('🧾 Overview', `proj:open:${projectId}`)
-    .row()
     .text('✏️ Edit Name', `proj:rename:${projectId}`)
+    .row()
     .text('🆔 Edit ID', `proj:edit_id:${projectId}`)
     .row()
     .text('🧭 Apply Path / Working Dir', `proj:working_dir:${projectId}`)
     .row()
     .text('⭐ Default project actions', `proj:default_actions:${projectId}`)
     .row()
-    .text('🌐 Repo & GitHub', `proj:edit_repo:${projectId}`)
-    .row()
-    .text('🗄 Database', `dbmenu:open:${projectId}`)
-    .text('⏱ Cron Jobs', `projcron:menu:${projectId}`)
-    .row()
-    .text('🚀 Deployments', `deploy:open:${projectId}`)
-    .text('🧾 Logs', `logmenu:open:${projectId}`)
-    .row()
-    .text('⚙️ Project Settings', `proj:open:${projectId}`)
+    .text('🌐 Repository', `proj:repo_menu:${projectId}`)
     .row()
     .text('↩ Back', 'nav:back');
 
-  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}||${project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}`,
+  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}||${project.id}`, `Main → Projects → ${project.name || project.id} → ✏️ Edit Project`)}📂 Project menu: ${project.name || project.id}`,
     { reply_markup: inline });
+}
+
+
+
+async function renderProjectRepositoryMenu(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const globalSettings = await loadGlobalSettings();
+  const effectiveBase = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+  const tokenKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';
+  const tokenLabel = tokenKey === 'GITHUB_TOKEN' ? 'default (GITHUB_TOKEN)' : `override (${tokenKey})`;
+  const lines = [
+    `🌐 Repository — ${project.name || project.id}`,
+    '',
+    `Repo: ${project.repoSlug || project.repoUrl || 'not set'}`,
+    `Token: ${tokenLabel}`,
+    `Base branch: ${effectiveBase}`,
+  ];
+  const inline = new InlineKeyboard()
+    .text('📚 Choose repo', `proj:edit_repo:${project.id}`)
+    .row()
+    .text('🔑 GitHub token (default/override)', `proj:edit_github_token:${project.id}`)
+    .row()
+    .text('🌿 Base branch', `proj:change_base:${project.id}`)
+    .row()
+    .text('↩ Back', 'nav:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderProjectDiagnosticsMenu(ctx, projectId, notice) {
@@ -24709,6 +24809,8 @@ module.exports = {
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
     buildRoutineFixButton,
     buildScopedHeader,
+    buildProjectHubView,
+    buildDefaultProjectActionsKeyboard,
     goBack,
     goHome,
     renderScreen,
