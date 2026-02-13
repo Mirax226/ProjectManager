@@ -383,6 +383,7 @@ let configDbDsnIssueAttempts = 0;
 let cachedSettings = null;
 let cachedSettingsAt = 0;
 const DB_OPERATION_TIMEOUT_MS = 5000;
+const routinePayloadCache = new Map();
 
 configureSelfLogger({
   bot,
@@ -1120,18 +1121,22 @@ async function createCodexTaskAndNotify(ctx, payload) {
   const text = result.created
     ? '🧠 Task added to Codex Tasks queue'
     : '🧠 Task already exists in Codex Tasks queue';
-  const extraMarkup = new InlineKeyboard().text('Open Codex Tasks', 'main:codex_tasks');
+  const projectTarget = payload?.projectId ? `proj:codex_tasks:${payload.projectId}` : 'proj:list';
+  const extraMarkup = new InlineKeyboard().text('Open Codex Tasks', projectTarget);
   await sendTransientNotice(ctx, text, { ttlSec: 10, includeDelete: true, extraMarkup });
   return result;
 }
 
-async function renderCodexTasksMenu(ctx, notice) {
+async function renderCodexTasksMenu(ctx, notice, options = {}) {
   await purgeOldDoneCodexTasks();
-  const pending = await listCodexTasks({ status: 'pending' });
-  const done = await listCodexTasks({ status: 'done' });
+  const projectId = options.projectId || null;
+  const pendingAll = await listCodexTasks({ status: 'pending' });
+  const doneAll = await listCodexTasks({ status: 'done' });
+  const pending = projectId ? pendingAll.filter((task) => task.projectId === projectId) : pendingAll;
+  const done = projectId ? doneAll.filter((task) => task.projectId === projectId) : doneAll;
   const lines = [
     '🧠 Codex Tasks',
-    buildScopedHeader('GLOBAL', 'Main → Codex Tasks'),
+    buildScopedHeader(projectId ? `PROJECT: ${projectId}` : 'GLOBAL', projectId ? `Main → Projects → ${projectId} → Project Settings → Codex Tasks` : 'Main → Codex Tasks'),
     notice || null,
     `Pending: ${pending.length}`,
     `Done: ${done.length}`,
@@ -1142,19 +1147,19 @@ async function renderCodexTasksMenu(ctx, notice) {
   } else {
     lines.push('', 'Pending tasks:');
     pending.slice(0, 20).forEach((task) => {
-      inline.text(formatCodexTaskTitle(task), `codex_tasks:view:${task.id}`).row();
+      inline.text(formatCodexTaskTitle(task), `codex_tasks:view:${task.id}:${projectId || ''}`).row();
     });
   }
-  inline.text('🧹 Clear all done', 'codex_tasks:clear_done').row();
-  inline.text('📤 Export pending', 'codex_tasks:export').row();
-  inline.text('⬅️ Back', 'main:back');
+  inline.text('🧹 Clear all done', `codex_tasks:clear_done:${projectId || ''}`).row();
+  inline.text('📤 Export pending', `codex_tasks:export:${projectId || ''}`).row();
+  inline.text('⬅️ Back', projectId ? `proj:settings:${projectId}` : 'nav:back');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
-async function renderCodexTaskDetails(ctx, id, notice) {
+async function renderCodexTaskDetails(ctx, id, notice, options = {}) {
   const task = await getCodexTask(id);
   if (!task) {
-    await renderCodexTasksMenu(ctx, 'Task not found.');
+    await renderCodexTasksMenu(ctx, 'Task not found.', options);
     return;
   }
   const lines = [
@@ -1166,12 +1171,12 @@ async function renderCodexTaskDetails(ctx, id, notice) {
     notice || null,
   ].filter(Boolean);
   const inline = new InlineKeyboard()
-    .text('📋 Copy task', `codex_tasks:copy:${task.id}`)
+    .text('📋 Copy task', `codex_tasks:copy:${task.id}:${options.projectId || ''}`)
     .row()
-    .text('✅ Mark as Done', `codex_tasks:done:${task.id}`)
-    .text('🗑 Delete task', `codex_tasks:delete:${task.id}`)
+    .text('✅ Mark as Done', `codex_tasks:done:${task.id}:${options.projectId || ''}`)
+    .text('🗑 Delete task', `codex_tasks:delete:${task.id}:${options.projectId || ''}`)
     .row()
-    .text('↩ Back', 'main:codex_tasks');
+    .text('↩ Back', options.projectId ? `proj:codex_tasks:${options.projectId}` : 'nav:back');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
@@ -1180,115 +1185,61 @@ async function handleCodexTasksCallback(ctx, data) {
   const parts = String(data || '').split(':');
   const action = parts[1];
   const id = parts[2];
+  const projectId = parts[3] || null;
+  const options = { projectId };
   if (action === 'list') {
-    await renderCodexTasksMenu(ctx);
+    await renderCodexTasksMenu(ctx, null, options);
     return;
   }
   if (action === 'view' && id) {
-    await renderCodexTaskDetails(ctx, id);
+    await renderCodexTaskDetails(ctx, id, null, options);
     return;
   }
   if (action === 'copy' && id) {
     const task = await getCodexTask(id);
     if (!task) {
-      await renderCodexTasksMenu(ctx, 'Task not found.');
+      await renderCodexTasksMenu(ctx, 'Task not found.', options);
       return;
     }
     await sendDismissibleMessage(ctx, `\`\`\`text
 ${task.body}
 \`\`\``);
-    await renderCodexTaskDetails(ctx, id, 'Task copied.');
+    await renderCodexTaskDetails(ctx, id, 'Task copied.', options);
     return;
   }
   if (action === 'done' && id) {
     const task = await getCodexTask(id);
     const verify = await verifyCodexTask(task);
     if (!verify.ok) {
-      await renderCodexTaskDetails(ctx, id, `❌ Verification failed. ${verify.message}`);
+      await renderCodexTaskDetails(ctx, id, `❌ Verification failed. ${verify.message}`, options);
       return;
     }
     await markCodexTaskDone(id);
-    await renderCodexTasksMenu(ctx, `✅ Task marked done. ${verify.message}`);
+    await renderCodexTasksMenu(ctx, `✅ Task marked done. ${verify.message}`, options);
     return;
   }
   if (action === 'delete' && id) {
     await deleteCodexTask(id);
-    await renderCodexTasksMenu(ctx, '🗑 Task deleted.');
+    await renderCodexTasksMenu(ctx, '🗑 Task deleted.', options);
     return;
   }
   if (action === 'clear_done') {
     const removed = await clearDoneCodexTasks();
-    await renderCodexTasksMenu(ctx, `🧹 Removed ${removed} done task(s).`);
+    await renderCodexTasksMenu(ctx, `🧹 Removed ${removed} done task(s).`, options);
     return;
   }
   if (action === 'export') {
     const pending = await listCodexTasks({ status: 'pending' });
-    const body = pending
+    const filtered = projectId ? pending.filter((task) => task.projectId === projectId) : pending;
+    const body = filtered
       .map((task, idx) => `${idx + 1}. [${task.projectId || '-'}] ${task.title}\n${task.body}`)
       .join('\n\n');
     await sendDismissibleMessage(ctx, body ? `\`\`\`text\n${body}\n\`\`\`` : 'No pending tasks.');
-    await renderCodexTasksMenu(ctx);
+    await renderCodexTasksMenu(ctx, null, options);
     return;
   }
-  await renderCodexTasksMenu(ctx);
-}
 
-function buildRoutineOutputKeyboard(ctx, payload, backCallback = 'gsettings:routine_menu') {
-  const packed = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  return new InlineKeyboard()
-    .text('📋 Copy task', buildCb('routine', ['copy', packed]))
-    .row()
-    .text('◀️ Back', backCallback);
-}
-
-function trackRoutineOutput(userId, payload) {
-  const key = String(userId || '');
-  if (!key) return;
-  const current = routineOutputsByUser.get(key) || [];
-  current.unshift({ at: Date.now(), payload });
-  routineOutputsByUser.set(key, current.slice(0, 5));
-}
-
-
-function buildRoutineFixButton(text, category = null, refId = null) {
-  const matched = matchRoutineFix({ rawText: text || '', category, refId }, ROUTINE_BUTTON_THRESHOLD);
-  if (!matched.best || matched.best.confidence < ROUTINE_BUTTON_THRESHOLD) return null;
-  if (matched.best.rule.internalOnlyAutoButton) return null;
-  const payload = Buffer.from(JSON.stringify({ ruleId: matched.best.rule.id, refId: refId || null })).toString('base64url');
-  return { text: '🛠 Fix (routine)', callback_data: buildCb('routinefix', [payload]) };
-}
-
-async function maybeSendRoutineFixFromButton(ctx, payloadEncoded) {
-  const payload = decodeRoutinePayload(payloadEncoded);
-  if (!payload?.ruleId) {
-    await ensureAnswerCallback(ctx, { text: 'Expired routine action', show_alert: true });
-    return;
-  }
-  const rule = getRoutineRuleById(payload.ruleId);
-  if (!rule) {
-    await ensureAnswerCallback(ctx, { text: 'Rule not found', show_alert: true });
-    return;
-  }
-  const rendered = renderRoutineFixMatch({ rule, confidence: 1, fields: {} });
-  await renderRoutineOutput(ctx, rendered, { backCallback: 'gsettings:routine_menu' });
-  await ensureAnswerCallback(ctx);
-}
-
-function decodeRoutinePayload(encoded) {
-  try {
-    const text = Buffer.from(String(encoded || ''), 'base64url').toString('utf8');
-    return JSON.parse(text);
-  } catch (_error) {
-    return null;
-  }
-}
-
-function buildRoutineMatchInput({ text = '', refId = null, category = null }) {
-  return {
-    rawText: text || '',
-    refId: refId || null,
-    category: category || null,
-  };
+  await renderCodexTasksMenu(ctx, null, options);
 }
 
 async function renderRoutineOutput(ctx, rendered, options = {}) {
@@ -1425,11 +1376,6 @@ function normalizeRoute(route) {
   return String(route).trim().toLowerCase();
 }
 
-function getNavigationProjectScope(ctx) {
-  const projectId = ctx?.__navProjectId || ctx?.state?.projectId || null;
-  return projectId ? String(projectId) : 'global';
-}
-
 function shouldRecordNavigationSnapshot(ctx, options = {}) {
   if (options?.skipNavigationRecord) return false;
   if (ctx?.__skipNavigationRecord) return false;
@@ -1441,8 +1387,8 @@ async function recordNavigationSnapshot(ctx, snapshot, options = {}) {
   if (!shouldRecordNavigationSnapshot(ctx, options)) return;
   const chatId = getChatIdFromCtx(ctx);
   if (!chatId) return;
-  const projectScope = getNavigationProjectScope(ctx);
-  await pushNavigationSnapshot(chatId, projectScope, snapshot);
+  const userId = ctx?.from?.id || null;
+  await pushNavigationSnapshot(chatId, userId, { ...snapshot, screenId: snapshot?.screenId || snapshot?.routeId });
 }
 
 async function renderScreen(ctx, routeId, params = {}) {
@@ -1466,10 +1412,39 @@ async function renderScreen(ctx, routeId, params = {}) {
   return false;
 }
 
+async function navigate(ctx, screenId, params = {}) {
+  const chatId = getChatIdFromCtx(ctx);
+  const userId = ctx?.from?.id || null;
+  if (!chatId) return;
+  const currentScreenId = ctx?.__navRouteId || null;
+  if (currentScreenId) {
+    await pushNavigationSnapshot(chatId, userId, { routeId: currentScreenId, screenId: currentScreenId, params: ctx?.__navParams || {}, timestamp: Date.now() });
+  }
+  await renderScreen(ctx, screenId, params);
+}
+
+async function replace(ctx, screenId, params = {}) {
+  const chatId = getChatIdFromCtx(ctx);
+  const userId = ctx?.from?.id || null;
+  if (!chatId) return;
+  const stack = await getNavigationStack(chatId, userId);
+  if (stack.length) stack.pop();
+  await setNavigationStack(chatId, userId, stack);
+  await renderScreen(ctx, screenId, params);
+}
+
+async function back(ctx) {
+  return goBack(ctx);
+}
+
+async function home(ctx) {
+  return goHome(ctx);
+}
+
 async function goHome(ctx) {
   const chatId = getChatIdFromCtx(ctx);
   if (!chatId) return;
-  await clearNavigationStack(chatId, 'global');
+  await clearNavigationStack(chatId, ctx?.from?.id || null);
   await navigateTo(chatId, ctx?.from?.id, 'main', { ctx, skipNavigationRecord: false });
 }
 
@@ -1479,8 +1454,8 @@ async function goBack(ctx) {
     await goHome(ctx);
     return;
   }
-  const projectScope = getNavigationProjectScope(ctx);
-  const stack = await getNavigationStack(chatId, projectScope);
+  const userId = ctx?.from?.id || null;
+  const stack = await getNavigationStack(chatId, userId);
   if (!stack.length) {
     await goHome(ctx);
     return;
@@ -1489,7 +1464,7 @@ async function goBack(ctx) {
   nextStack.pop();
   while (nextStack.length) {
     const previous = nextStack[nextStack.length - 1];
-    await setNavigationStack(chatId, projectScope, nextStack);
+    await setNavigationStack(chatId, userId, nextStack);
     try {
       const rendered = await renderScreen(ctx, previous.routeId, previous.params || {});
       if (rendered) return;
@@ -1498,7 +1473,7 @@ async function goBack(ctx) {
     }
     nextStack.pop();
   }
-  await setNavigationStack(chatId, projectScope, []);
+  await setNavigationStack(chatId, userId, []);
   await goHome(ctx);
 }
 
@@ -1518,12 +1493,11 @@ function getNavigationHandlers() {
     main: async (ctx) => renderMainMenu(ctx),
     projects: async (ctx) => renderProjectsList(ctx),
     settings: async (ctx) => renderGlobalSettings(ctx),
-    logs: async (ctx) => renderLogsProjectList(ctx, '📣 Logs'),
+    logs: async (ctx) => renderLogsProjectList(ctx, '🧾 Logs'),
     ops: async (ctx) => renderOpsMenu(ctx),
     diagnostics: async (ctx) => renderLogDeliveryDiagnosticsMenu(ctx),
     templates: async (ctx) => renderTemplatesMenu(ctx),
     help: async (ctx) => renderHelpMenu(ctx),
-    codex_tasks: async (ctx) => renderCodexTasksMenu(ctx),
     database: async (ctx) => renderDataCenterMenu(ctx),
     cronjobs: async (ctx) => renderCronMenu(ctx),
     deploy: async (ctx) => renderDeploysProjectList(ctx),
@@ -2172,7 +2146,7 @@ async function renderMainMenu(ctx) {
   const statusLine = buildConfigDbStatusLine();
   const banner = buildDegradedBanner();
   const prefix = statusLine ? `${statusLine}\n` : '';
-  await renderPanel(ctx, `${banner}${prefix}🧭 Main menu:
+  await renderPanel(ctx, `${banner}${prefix}🧭 Main Menu:
 ${buildScopedHeader('GLOBAL', 'Main')}`, {
     reply_markup: buildMainMenuInlineKeyboard(),
     skipDelete: true,
@@ -2305,17 +2279,16 @@ async function handleReplyKeyboardNavigation(ctx, route) {
 
 function buildMainMenuInlineKeyboard() {
   return new InlineKeyboard()
-    .text('📁 Projects', 'main:projects')
+    .text('📦 Projects', 'main:projects')
     .text('🗄 Databases', 'main:database')
     .row()
     .text('⏱ Cron Jobs', 'main:cronjobs')
     .text('🚀 Deployments', 'main:deploy')
     .row()
-    .text('📜 Logs', 'main:logs')
+    .text('🧾 Logs', 'main:logs')
     .text('⚙️ Settings', 'main:settings')
     .row()
     .text('❓ Help', 'main:help')
-    .text('🧠 Codex Tasks', 'main:codex_tasks')
 }
 
 function buildCancelKeyboard() {
@@ -2323,7 +2296,7 @@ function buildCancelKeyboard() {
 }
 
 function buildBackKeyboard(callbackData, label = '⬅️ Back') {
-  return new InlineKeyboard().text(label, callbackData);
+  return new InlineKeyboard().text(label, 'nav:back');
 }
 
 function buildScopedHeader(scopeLabel, breadcrumb) {
@@ -2351,6 +2324,35 @@ function withDeleteButton(replyMarkup, options = {}) {
     existingRows.push([{ text: '🗑 Delete', callback_data: buildCb('msgdel', [ADMIN_TELEGRAM_ID || '0']) }]);
   }
   return { inline_keyboard: existingRows };
+}
+
+function encodeRoutinePayload(payload) {
+  try {
+    const id = crypto.randomBytes(9).toString('base64url');
+    routinePayloadCache.set(id, { payload, ts: Date.now() });
+    return id;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function decodeRoutinePayload(id) {
+  if (!id) return null;
+  const entry = routinePayloadCache.get(String(id));
+  if (!entry) return null;
+  if (Date.now() - entry.ts > 24 * 60 * 60 * 1000) {
+    routinePayloadCache.delete(String(id));
+    return null;
+  }
+  return entry.payload || null;
+}
+
+function buildRoutineFixButton(text, category, refId) {
+  const blockedCategories = new Set(['INVALID_URL', 'ENV_MISCONFIG', 'MISSING_DSN']);
+  if (blockedCategories.has(String(category || '').toUpperCase())) return null;
+  const payload = encodeRoutinePayload({ text: String(text || '').slice(0, 1200), category: category || null, refId: refId || null });
+  if (!payload) return null;
+  return { text: '🛠 Fix (routine)', callback_data: `routinefix:${payload}` };
 }
 
 function buildPatchSessionKeyboard() {
@@ -2763,23 +2765,23 @@ async function startOpsScanner() {
 
 const mainKeyboard = new Keyboard()
   .text('📦 Projects')
-  .text('🗄️ Database')
+  .text('🗄 Databases')
   .row()
-  .text('⏱️ Cronjobs')
+  .text('⏱ Cron Jobs')
   .text('⚙️ Settings')
   .row()
-  .text('📣 Logs')
-  .text('🚀 Deploys')
+  .text('🧾 Logs')
+  .text('🚀 Deployments')
   .resized();
 
 const GLOBAL_COMMANDS = [
   { command: 'start', description: '🧭 Main menu' },
   { command: 'project', description: '📦 Projects' },
-  { command: 'database', description: '🗄️ Database' },
-  { command: 'cronjobs', description: '⏱ Cronjobs' },
+  { command: 'database', description: '🗄 Databases' },
+  { command: 'cronjobs', description: '⏱ Cron Jobs' },
   { command: 'setting', description: '⚙️ Settings' },
-  { command: 'logs', description: '📣 Logs' },
-  { command: 'deploy', description: '🚀 Deploys' },
+  { command: 'logs', description: '🧾 Logs' },
+  { command: 'deploy', description: '🚀 Deployments' },
 ];
 
 const GLOBAL_COMMAND_SCOPES = [{ type: 'default' }, { type: 'all_private_chats' }];
@@ -3068,9 +3070,9 @@ bot.command('navdiag', async (ctx) => {
     return;
   }
   const chatId = getChatIdFromCtx(ctx);
-  const stack = await getNavigationStack(chatId, 'global');
-  const top = stack.slice(-5).reverse().map((entry) => `• ${entry.routeId}`);
-  const lines = ['🧭 Navigation diagnostics (top 5)', ...(top.length ? top : ['• (empty)'])];
+  const stack = await getNavigationStack(chatId, ctx.from?.id || null);
+  const top = stack.slice(-10).reverse().map((entry) => `• ${entry.screenId || entry.routeId}`);
+  const lines = ['🧭 Navigation diagnostics (top 10)', ...(top.length ? top : ['• (empty)'])];
   await respond(ctx, lines.join('\n'));
 });
 
@@ -3078,7 +3080,7 @@ bot.hears('📦 Projects', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'projects');
 });
 
-bot.hears('🗄️ Database', async (ctx) => {
+bot.hears('🗄 Databases', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'database');
 });
 
@@ -3086,15 +3088,15 @@ bot.hears('⚙️ Settings', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'settings');
 });
 
-bot.hears('⏱️ Cronjobs', async (ctx) => {
+bot.hears('⏱ Cron Jobs', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'cronjobs');
 });
 
-bot.hears('📣 Logs', async (ctx) => {
+bot.hears('🧾 Logs', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'logs');
 });
 
-bot.hears('🚀 Deploys', async (ctx) => {
+bot.hears('🚀 Deployments', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'deploy');
 });
 
@@ -3274,11 +3276,11 @@ async function handleRoutineCallback(ctx, data) {
 
 async function dispatchCallbackData(ctx, data, options = {}) {
   const callbackData = String(data || '');
-  if (callbackData === 'nav:back') {
+  if (callbackData === 'nav:back' || callbackData === 'main:back' || callbackData.endsWith(':back')) {
     await goBack(ctx);
     return;
   }
-  if (callbackData === 'nav:home') {
+  if (callbackData === 'nav:home' || callbackData === 'main:home') {
     await goHome(ctx);
     return;
   }
@@ -3522,16 +3524,16 @@ async function handleMainCallback(ctx, data) {
   switch (action) {
     case 'defaults':
       await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Default project settings')}⚙️ Default project settings\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, {
-        reply_markup: new InlineKeyboard().text('🧹 Clear default project', 'gsettings:clear_default_project').row().text('⬅️ Back', 'gsettings:menu'),
+        reply_markup: new InlineKeyboard().text('⬅️ Back', 'nav:back'),
       });
       break;
     case 'defaults':
       await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Default project settings')}⚙️ Default project settings\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, {
-        reply_markup: new InlineKeyboard().text('🧹 Clear default project', 'gsettings:clear_default_project').row().text('⬅️ Back', 'gsettings:menu'),
+        reply_markup: new InlineKeyboard().text('⬅️ Back', 'nav:back'),
       });
       break;
     case 'back':
-      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'main', { ctx });
+      await goBack(ctx);
       break;
     case 'projects':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'projects', { ctx });
@@ -3559,9 +3561,6 @@ async function handleMainCallback(ctx, data) {
       break;
     case 'help':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'help', { ctx });
-      break;
-    case 'codex_tasks':
-      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'codex_tasks', { ctx });
       break;
     case 'deploys':
     case 'deploy':
@@ -3639,6 +3638,21 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'project_menu':
       await renderProjectMenu(ctx, projectId);
+      break;
+    case 'codex_tasks':
+      await renderCodexTasksMenu(ctx, null, { projectId });
+      break;
+    case 'default_actions': {
+      const settings = await loadGlobalSettings();
+      const isDefault = settings.defaultProjectId === projectId;
+      const kb = new InlineKeyboard().text('⭐ Set as default', `proj:set_default:${projectId}`).row();
+      if (isDefault) kb.text('🧹 Clear default', `proj:clear_default:${projectId}`).row();
+      kb.text('⬅️ Back', `proj:project_menu:${projectId}`);
+      await renderOrEdit(ctx, '⭐ Default project actions', { reply_markup: kb });
+      break;
+    }
+    case 'working_dir':
+      await renderWorkingDirectionMenu(ctx, projectId);
       break;
     case 'server_menu':
       await renderServerMenu(ctx, projectId);
@@ -3976,6 +3990,10 @@ async function handleProjectCallback(ctx, data) {
       await setDefaultProject(projectId);
       await renderProjectSettings(ctx, projectId);
       break;
+    case 'clear_default':
+      await clearDefaultProject();
+      await renderProjectSettings(ctx, projectId);
+      break;
     case 'back':
       await renderProjectsList(ctx);
       break;
@@ -4289,7 +4307,23 @@ async function handleGlobalSettingsCallback(ctx, data) {
   switch (action) {
     case 'defaults':
       await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Default project settings')}⚙️ Default project settings\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, {
-        reply_markup: new InlineKeyboard().text('🧹 Clear default project', 'gsettings:clear_default_project').row().text('⬅️ Back', 'gsettings:menu'),
+        reply_markup: new InlineKeyboard().text('⬅️ Back', 'nav:back'),
+      });
+      break;
+    case 'maintenance':
+      await renderOrEdit(ctx, '🧹 Maintenance\n\nUse maintenance tools for cleanup, diagnostics, and backups.', {
+        reply_markup: new InlineKeyboard()
+          .text('🧹 UI & Cleanup', 'gsettings:ui')
+          .row()
+          .text('📦 Backups', 'gsettings:backups')
+          .row()
+          .text('🧪 Diagnostics', 'gsettings:diagnostics_menu')
+          .row()
+          .text('🩺 PM Status', 'gsettings:pm_status')
+          .row()
+          .text('📶 Ping test', 'gsettings:ping_test')
+          .row()
+          .text('⬅️ Back', 'gsettings:menu'),
       });
       break;
     case 'ops_templates':
@@ -12964,9 +12998,12 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
 
   if (!isDefault) {
     inline.text('⭐ Set as default project', `proj:set_default:${project.id}`).row();
+  } else {
+    inline.text('🧹 Clear default project', `proj:clear_default:${project.id}`).row();
   }
 
-  inline.text('🗑 Delete project', `proj:delete:${project.id}`).row().text('⬅️ Back to Main Menu', 'main:back');
+  inline.text('🧠 Codex Tasks', `proj:codex_tasks:${project.id}`).row();
+  inline.text('🗑 Delete project', `proj:delete:${project.id}`).row().text('🏠 Home', 'nav:home');
 
   return { text: lines.join('\n'), keyboard: inline };
 }
@@ -16655,36 +16692,29 @@ async function renderProjectMenu(ctx, projectId) {
   if (!project) return;
 
   const inline = new InlineKeyboard()
-    .text('📋 Overview', `proj:open:${projectId}`)
+    .text('🧾 Overview', `proj:open:${projectId}`)
     .row()
-    .text('⚙️ Settings: rename', `proj:rename:${projectId}`)
-    .text('⚙️ Settings: base branch', `proj:change_base:${projectId}`)
+    .text('✏️ Edit Name', `proj:rename:${projectId}`)
+    .text('🆔 Edit ID', `proj:edit_id:${projectId}`)
     .row()
-    .text('⚙️ Settings: edit project ID', `proj:edit_id:${projectId}`)
+    .text('🧭 Apply Path / Working Dir', `proj:working_dir:${projectId}`)
     .row()
-    .text('🌿 Env', `envvault:menu:${projectId}`)
+    .text('⭐ Default project actions', `proj:default_actions:${projectId}`)
     .row()
-    .text('🔐 Repo/GitHub', `proj:edit_repo:${projectId}`)
-    .row()
-    .text('⏱ Cron Jobs', `projcron:menu:${projectId}`)
+    .text('🌐 Repo & GitHub', `proj:edit_repo:${projectId}`)
     .row()
     .text('🗄 Database', `dbmenu:open:${projectId}`)
+    .text('⏱ Cron Jobs', `projcron:menu:${projectId}`)
     .row()
     .text('🚀 Deployments', `deploy:open:${projectId}`)
+    .text('🧾 Logs', `logmenu:open:${projectId}`)
     .row()
-    .text('📜 Logs', `logmenu:open:${projectId}`)
+    .text('⚙️ Project Settings', `proj:open:${projectId}`)
     .row()
-    .text('🧪 Diagnostics', `proj:diagnostics_menu:${projectId}`)
-    .row()
-    .text('🧩 Apply patch', `proj:apply_patch:${projectId}`)
-    .row()
-    .text('⬅️ Back', `proj:open:${projectId}`);
+    .text('↩ Back', 'nav:back');
 
-  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}
-
-Sections: Overview · Settings · Env · Repo/GitHub · Cron Jobs · Database · Deployments · Logs`, {
-    reply_markup: inline,
-  });
+  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}`,
+    { reply_markup: inline });
 }
 
 async function renderProjectDiagnosticsMenu(ctx, projectId, notice) {
@@ -19757,15 +19787,14 @@ async function renderDataCenterMenuForMessage(messageContext) {
 
 async function renderLogsProjectList(ctx, notice) {
   if (!getConfigDbSnapshot().ready) {
-    await renderConfigDbGate(ctx, { title: '📣 Logs', backCallback: 'main:back' });
+    await renderConfigDbGate(ctx, { title: '🧾 Logs', backCallback: 'main:back' });
     return;
   }
   const projects = await loadProjects();
   const lines = [`${buildDegradedBanner()}📜 Logs`, buildScopedHeader('GLOBAL', 'Main → Logs'), notice || null, '', 'Unified logs viewer across projects:'].filter(Boolean);
   const inline = new InlineKeyboard();
   inline.text('🧾 Projects needing log test', 'logtest:reminders').row();
-  inline.text('⚙️ Global log policies', 'gsettings:logs').row();
-  inline.text('🤖 PM self logs & alerts', 'gsettings:bot_log_alerts').row();
+  inline.text('⚙️ Logs settings', 'gsettings:logs').row();
   if (!projects.length) {
     lines.push('', 'No projects configured yet.');
     inline.text('➕ Add project', 'proj:add').row();
@@ -19821,7 +19850,7 @@ function formatRenderWebhookStatusLine(renderSettings, webhookSettings) {
 
 async function renderDeploysProjectList(ctx, notice) {
   if (!getConfigDbSnapshot().ready) {
-    await renderConfigDbGate(ctx, { title: '🚀 Deploys', backCallback: 'main:back' });
+    await renderConfigDbGate(ctx, { title: '🚀 Deployments', backCallback: 'main:back' });
     return;
   }
   const projects = await loadProjects();
@@ -20171,7 +20200,7 @@ async function handleLogsMenuCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action, projectId] = data.split(':');
   if (!getConfigDbSnapshot().ready && action !== 'list') {
-    await renderConfigDbGate(ctx, { title: '📣 Logs', backCallback: 'main:back' });
+    await renderConfigDbGate(ctx, { title: '🧾 Logs', backCallback: 'main:back' });
     return;
   }
   if (action === 'list') {
@@ -20189,7 +20218,7 @@ async function handleDeployCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action, projectId, extra] = data.split(':');
   if (!getConfigDbSnapshot().ready && action !== 'list') {
-    await renderConfigDbGate(ctx, { title: '🚀 Deploys', backCallback: 'main:back' });
+    await renderConfigDbGate(ctx, { title: '🚀 Deployments', backCallback: 'main:back' });
     return;
   }
   if (action === 'list') {
@@ -21202,27 +21231,17 @@ async function renderGlobalSettingsForMessage(messageContext, notice) {
 
 function buildSettingsKeyboard() {
   return new InlineKeyboard()
-    .text('🧩 Ops & Templates', 'gsettings:ops_templates')
+    .text('🧩 Templates', 'main:templates')
     .row()
-    .text('🧰 Routine Fixes', 'gsettings:routine_menu')
-    .row()
-    .text('🔐 Access Control', 'gsettings:security')
-    .row()
-    .text('⚙️ Default project settings', 'gsettings:defaults')
-    .row()
-    .text('🧹 UI & Cleanup', 'gsettings:ui')
+    .text('🛠 Ops & Safety', 'gsettings:ops_templates')
     .row()
     .text('🌐 Integrations', 'gsettings:integrations')
     .row()
-    .text('📦 Backups', 'gsettings:backups')
+    .text('🧹 Maintenance', 'gsettings:maintenance')
     .row()
-    .text('🧪 Diagnostics', 'gsettings:diagnostics_menu')
+    .text('🔐 Access & Roles', 'gsettings:security')
     .row()
-    .text('🩺 PM Status', 'gsettings:pm_status')
-    .row()
-    .text('📶 Ping test', 'gsettings:ping_test')
-    .row()
-    .text('⬅️ Back', 'gsettings:back');
+    .text('⬅️ Back', 'nav:back');
 }
 
 function buildUiCleanupSettingsView(settings) {

@@ -185,3 +185,8 @@ PM now includes an operations-first suite with:
 - Built-in project templates (Node Telegram bot, worker, API, cron-only).
 - Guest read-only role controls for safe observability.
 - Expanded Help pages for each major Ops feature.
+
+## Navigation stack & menu regrouping
+- Added per-user navigation stack behavior (chatId + userId) with bounded history and centralized back/home handling.
+- Regrouped global hubs and project menu buckets, and moved Codex Tasks access to project scope.
+- Updated logs hub/settings placement and transient notice behavior alignment.
