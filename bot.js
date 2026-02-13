@@ -1037,7 +1037,6 @@ async function sendEphemeralMessage(ctx, text, extra) {
 }
 
 async function sendTransientNotice(ctx, text, options = {}) {
-  const ownerId = Number(options.ownerId || ctx?.from?.id || 0);
   const ttlSec = Number.isFinite(options.ttlSec) ? Number(options.ttlSec) : 10;
   const deleteButton = options.includeDelete !== false && options.deleteButton !== false;
   const extraMarkup = sanitizeReplyMarkup(options.extraMarkup || options.reply_markup);
@@ -1048,7 +1047,7 @@ async function sendTransientNotice(ctx, text, options = {}) {
   const chatId = getChatIdFromCtx(ctx);
   const rows = Array.isArray(extraMarkup?.inline_keyboard) ? extraMarkup.inline_keyboard.slice() : [];
   if (deleteButton) {
-    rows.push([{ text: '🗑 Delete', callback_data: 'msgdel:pending' }]);
+    rows.push([buildDeleteButton(ctx)]);
   }
   const response = await replySafely(ctx, text, {
     ...extra,
@@ -1068,12 +1067,11 @@ async function sendTransientNotice(ctx, text, options = {}) {
       }, ttlSec * 1000);
       ephemeralTimersByChat.get(response.chat.id).set(response.message_id, timer);
     }
-    if (deleteButton && chatId && ownerId) {
-      const callback = buildCb('msgdel', [ownerId, chatId, response.message_id]);
+    if (deleteButton && chatId) {
       const finalMarkup = {
         inline_keyboard: [
           ...(Array.isArray(extraMarkup?.inline_keyboard) ? extraMarkup.inline_keyboard : []),
-          [{ text: '🗑 Delete', callback_data: callback }],
+          [buildDeleteButton(ctx, { chatId, messageId: response.message_id })],
         ],
       };
       try {
@@ -1259,44 +1257,34 @@ function summarizeRoutineCandidates(matches) {
 }
 
 async function handleDeleteMessageCallback(ctx, data) {
-  const [, ownerIdRaw, chatIdRaw, messageIdRaw] = String(data).split(':');
-  const ownerId = Number(ownerIdRaw);
+  await ensureAnswerCallback(ctx);
+  const [, , chatIdRaw, messageIdRaw] = String(data).split(':');
   const chatId = Number(chatIdRaw);
   const messageId = Number(messageIdRaw);
-  const actorId = Number(ctx.from?.id);
-  let allowed = ownerId && ownerId === actorId;
-
-  const api = ctx?.api || bot.api;
-  const chatType = ctx?.callbackQuery?.message?.chat?.type || 'private';
-  if (!allowed && chatType !== 'private' && chatId && actorId) {
-    try {
-      const member = await api.getChatMember(chatId, actorId);
-      const status = member?.status;
-      allowed = status === 'administrator' || status === 'creator';
-    } catch (_error) {
-      allowed = false;
-    }
+  if (!chatId || !messageId) {
+    return { ok: false, reason: 'invalid_target' };
   }
-
-  if (!allowed) {
-    await ensureAnswerCallback(ctx, { text: 'Not allowed', show_alert: true });
-    return { ok: false, reason: 'unauthorized' };
-  }
-
+  const api = ctx?.telegram || ctx?.api || bot.api;
   try {
     await api.deleteMessage(chatId, messageId);
-    await ensureAnswerCallback(ctx);
     return { ok: true, mode: 'deleted' };
   } catch (error) {
-    try {
-      await api.editMessageText(chatId, messageId, '(Deleted)', {
-        reply_markup: { inline_keyboard: [] },
-      });
-    } catch (editError) {
-      await api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } }).catch(() => null);
+    if (isDeleteMessageNotFoundError(error)) {
+      return { ok: true, mode: 'already_deleted' };
     }
-    await ensureAnswerCallback(ctx);
-    return { ok: true, mode: 'edited' };
+    if (isDeleteMessageForbiddenError(error)) {
+      await ensureAnswerCallback(ctx, { text: "Can't delete this message." });
+      return { ok: false, reason: 'forbidden' };
+    }
+    const refId = buildDeleteRefId();
+    console.error('[msgdel] delete failed', {
+      refId,
+      chatId,
+      messageId,
+      error: error?.message || error?.description || 'unknown',
+    });
+    await ensureAnswerCallback(ctx, { text: "Can't delete this message." });
+    return { ok: false, reason: 'error', refId };
   }
 }
 
@@ -2301,8 +2289,17 @@ function buildBackKeyboard(callbackData, label = '⬅️ Back') {
 
 function buildScopedHeader(scopeLabel, breadcrumb) {
   const lines = [];
-  if (scopeLabel) {
-    lines.push(`Scope: ${scopeLabel}`);
+  const normalizedScope = String(scopeLabel || '').trim();
+  if (normalizedScope.startsWith('PROJECT:')) {
+    const payload = normalizedScope.replace('PROJECT:', '').trim();
+    const [projectNameRaw, projectIdRaw] = payload.split('||');
+    const projectName = (projectNameRaw || '').trim() || '-';
+    const projectId = (projectIdRaw || projectNameRaw || '').trim() || '-';
+    lines.push(`🧩 Project: ${projectName}`);
+    lines.push(`🆔 ID: ${projectId}`);
+    lines.push('📦 Scope: Project');
+  } else if (normalizedScope) {
+    lines.push('🌍 Scope: Global');
   }
   if (breadcrumb) {
     lines.push(`Breadcrumb: ${breadcrumb}`);
@@ -2321,7 +2318,7 @@ function withDeleteButton(replyMarkup, options = {}) {
     : [];
   const hasDelete = existingRows.some((row) => Array.isArray(row) && row.some((button) => button?.text === '🗑 Delete'));
   if (!hasDelete) {
-    existingRows.push([{ text: '🗑 Delete', callback_data: buildCb('msgdel', [ADMIN_TELEGRAM_ID || '0']) }]);
+    existingRows.push([{ text: '🗑 Delete', callback_data: 'msg:delete:pending' }]);
   }
   return { inline_keyboard: existingRows };
 }
@@ -2363,9 +2360,39 @@ function buildPatchSessionKeyboard() {
 }
 
 function getMessageTargetFromCtx(ctx) {
-  const message = ctx.callbackQuery?.message;
-  if (!message) return null;
-  return { chatId: message.chat.id, messageId: message.message_id };
+  const callbackMessage = ctx?.callbackQuery?.message;
+  if (callbackMessage?.chat?.id && callbackMessage?.message_id) {
+    return { chatId: callbackMessage.chat.id, messageId: callbackMessage.message_id };
+  }
+  const message = ctx?.message;
+  if (message?.chat?.id && message?.message_id) {
+    return { chatId: message.chat.id, messageId: message.message_id };
+  }
+  return null;
+}
+
+function buildDeleteButton(ctx, target) {
+  const resolvedTarget = target || getMessageTargetFromCtx(ctx);
+  const chatId = Number(resolvedTarget?.chatId);
+  const messageId = Number(resolvedTarget?.messageId);
+  if (!chatId || !messageId) {
+    return { text: '🗑 Delete', callback_data: 'msg:delete:pending' };
+  }
+  return { text: '🗑 Delete', callback_data: `msg:delete:${chatId}:${messageId}` };
+}
+
+function isDeleteMessageNotFoundError(error) {
+  const message = String(error?.description || error?.response?.description || error?.message || '').toLowerCase();
+  return message.includes('message to delete not found') || message.includes('message identifier is not specified');
+}
+
+function isDeleteMessageForbiddenError(error) {
+  const message = String(error?.description || error?.response?.description || error?.message || '').toLowerCase();
+  return message.includes("message can't be deleted") || message.includes('not enough rights to delete');
+}
+
+function buildDeleteRefId() {
+  return `MSGDEL-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 }
 
 async function startProgressMessage(ctx, text, extra = {}) {
@@ -2698,12 +2725,22 @@ async function sendOpsAlertByDestinations(destinations, event, extra = {}) {
     ...(routineButton ? [[routineButton]] : []),
     [{ text: '📋 Copy debug', callback_data: buildCb('opsdbg', [debugPayload]) }],
     [{ text: '🔎 Timeline', callback_data: 'ops:timeline' }],
-    [{ text: '🗑 Delete', callback_data: buildCb('del', [ADMIN_TELEGRAM_ID || '0']) }],
   ];
   const composedExtra = { ...extra, reply_markup: { inline_keyboard: keyboard } };
-  if (destinations.admin_inbox && ADMIN_TELEGRAM_ID) sends.push(bot.api.sendMessage(ADMIN_TELEGRAM_ID, text, composedExtra));
-  if (destinations.admin_room && ADMIN_ROOM_CHAT_ID) sends.push(bot.api.sendMessage(ADMIN_ROOM_CHAT_ID, text, composedExtra));
-  if (destinations.admin_rob && ADMIN_ROB_CHAT_ID) sends.push(bot.api.sendMessage(ADMIN_ROB_CHAT_ID, text, composedExtra));
+  const sendWithDeleteButton = async (chatId) => {
+    const sent = await bot.api.sendMessage(chatId, text, composedExtra);
+    const finalMarkup = {
+      inline_keyboard: [
+        ...keyboard,
+        [buildDeleteButton(null, { chatId, messageId: sent.message_id })],
+      ],
+    };
+    await bot.api.editMessageReplyMarkup(chatId, sent.message_id, { reply_markup: finalMarkup }).catch(() => null);
+    return sent;
+  };
+  if (destinations.admin_inbox && ADMIN_TELEGRAM_ID) sends.push(sendWithDeleteButton(ADMIN_TELEGRAM_ID));
+  if (destinations.admin_room && ADMIN_ROOM_CHAT_ID) sends.push(sendWithDeleteButton(ADMIN_ROOM_CHAT_ID));
+  if (destinations.admin_rob && ADMIN_ROB_CHAT_ID) sends.push(sendWithDeleteButton(ADMIN_ROB_CHAT_ID));
   if (!sends.length) return [];
   return Promise.allSettled(sends);
 }
@@ -3284,7 +3321,7 @@ async function dispatchCallbackData(ctx, data, options = {}) {
     await goHome(ctx);
     return;
   }
-  if (callbackData.startsWith('msgdel:')) {
+  if (callbackData.startsWith('msg:delete:')) {
     await handleDeleteMessageCallback(ctx, callbackData);
     return;
   }
@@ -8816,7 +8853,7 @@ async function handleCronEditScheduleMessage(ctx, state) {
     await updateJob(state.jobId, payload);
     clearCronJobsCache();
     clearUserState(ctx.from.id);
-    await ctx.reply('Cron job updated.');
+    await sendTransientNotice(ctx, 'Cron job updated.', { ttlSec: 10, deleteButton: true });
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
     const correlationId = buildCronCorrelationId();
@@ -8851,7 +8888,7 @@ async function handleCronEditUrlMessage(ctx, state) {
     await updateJob(state.jobId, payload);
     clearCronJobsCache();
     clearUserState(ctx.from.id);
-    await ctx.reply('Cron job updated.');
+    await sendTransientNotice(ctx, 'Cron job updated.', { ttlSec: 10, deleteButton: true });
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
     const correlationId = buildCronCorrelationId();
@@ -8882,7 +8919,7 @@ async function handleCronEditNameMessage(ctx, state) {
     await updateJob(state.jobId, payload);
     clearCronJobsCache();
     clearUserState(ctx.from.id);
-    await ctx.reply('Cron job updated.');
+    await sendTransientNotice(ctx, 'Cron job updated.', { ttlSec: 10, deleteButton: true });
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
     const correlationId = buildCronCorrelationId();
@@ -8912,7 +8949,7 @@ async function handleCronEditTimezoneMessage(ctx, state) {
     await updateJob(state.jobId, payload);
     clearCronJobsCache();
     clearUserState(ctx.from.id);
-    await ctx.reply('Cron job updated.');
+    await sendTransientNotice(ctx, 'Cron job updated.', { ttlSec: 10, deleteButton: true });
     await renderCronJobDetails(ctx, state.jobId, { backCallback: state.backCallback });
   } catch (error) {
     const correlationId = buildCronCorrelationId();
@@ -12946,7 +12983,7 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
   const workingDirLabel = formatWorkingDirDisplay(project);
 
   const lines = [
-    buildScopedHeader(`PROJECT: ${name}`, `Main → Projects → ${name} → Overview`),
+    buildScopedHeader(`PROJECT: ${name}||${project.id}`, `Main → Projects → ${name} → Overview`),
     `📦 Project: ${isDefault ? '⭐ ' : ''}${name} (🆔 ${project.id})`,
     notice || null,
     '',
@@ -16713,7 +16750,7 @@ async function renderProjectMenu(ctx, projectId) {
     .row()
     .text('↩ Back', 'nav:back');
 
-  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}`,
+  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}||${project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}`,
     { reply_markup: inline });
 }
 
@@ -20888,11 +20925,14 @@ async function runProjectAutoFixHealthSetup(ctx, projectId) {
   const result = applyHealthAutoFixDefaults(projects[index]);
   projects[index] = result.project;
   await saveProjects(projects);
-  const keyboard = new InlineKeyboard().text('🗑 Delete', buildCb('del', [ctx.from.id])).row().text('⬅️ Back', `proj:missing_setup:${projectId}`);
   const notice = result.changed.length
     ? `✅ Auto-fixed health setup: ${result.changed.join(', ')}`
     : '✅ Auto-fix skipped (all values already configured).';
-  await renderOrEdit(ctx, notice, { reply_markup: keyboard });
+  await sendTransientNotice(ctx, notice, {
+    ttlSec: 10,
+    deleteButton: true,
+    extraMarkup: new InlineKeyboard().text('⬅️ Back', `proj:missing_setup:${projectId}`),
+  });
   await renderProjectMissingSetup(ctx, projectId, '✅ Setup refreshed after auto-fix.');
 }
 
@@ -21155,7 +21195,7 @@ async function runLogDeliveryDiagnostics(ctx) {
     `routingPolicy=${maskDiagnosticText(JSON.stringify(prefs))}`,
   ];
   const summary = ['🧪 Test Log Delivery', ...results.map((r) => `${r.ok ? '✅' : '❌'} ${r.id}`), `Inbox:${counters.forwarded_to_inbox_count} Room:${counters.forwarded_to_room_count} Rob:${counters.forwarded_to_rob_count}`].join('\n');
-  const sent = await bot.api.sendMessage(chatId, summary, { reply_markup: new InlineKeyboard().text('🗑 Delete', buildCb('del', [ctx.from.id])) });
+  const sent = await sendTransientNotice(ctx, summary, { ttlSec: 10, deleteButton: true });
   await bot.api.sendDocument(chatId, new InputFile(Buffer.from(reportLines.join('\n'), 'utf8'), `log-delivery-${testRunId}.txt`), { caption: 'Diagnostics report' }).catch(() => null);
   return sent;
 }

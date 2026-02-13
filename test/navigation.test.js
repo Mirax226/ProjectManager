@@ -196,8 +196,46 @@ test('global to project database drill-down keeps navigation callbacks', async (
 
 test('breadcrumb helper renders expected format', () => {
   const header = __test.buildScopedHeader('PROJECT: Alpha', 'Main → Databases → Alpha → Database');
-  assert.match(header, /Scope: PROJECT: Alpha/);
+  assert.match(header, /🧩 Project: Alpha/);
+  assert.match(header, /📦 Scope: Project/);
   assert.match(header, /Breadcrumb: Main → Databases → Alpha → Database/);
+});
+
+test('delete callback deletes exact targeted message and answers callback first', async () => {
+  const calls = { answer: 0, deleteMessage: [] };
+  const ctx = {
+    from: { id: 99 },
+    callbackQuery: { id: 'cb-delete' },
+    answerCallbackQuery: async () => {
+      calls.answer += 1;
+    },
+    telegram: {
+      deleteMessage: async (chatId, messageId) => {
+        calls.deleteMessage.push([chatId, messageId]);
+      },
+    },
+  };
+  const result = await __test.handleDeleteMessageCallback(ctx, 'msg:delete:123:456');
+  assert.equal(calls.answer, 1);
+  assert.deepEqual(calls.deleteMessage, [[123, 456]]);
+  assert.equal(result.ok, true);
+  assert.equal(result.mode, 'deleted');
+});
+
+test('delete callback treats not-found as success', async () => {
+  const ctx = {
+    callbackQuery: { id: 'cb-delete' },
+    answerCallbackQuery: async () => {},
+    telegram: {
+      deleteMessage: async () => {
+        const error = new Error('Bad Request: message to delete not found');
+        throw error;
+      },
+    },
+  };
+  const result = await __test.handleDeleteMessageCallback(ctx, 'msg:delete:123:456');
+  assert.equal(result.ok, true);
+  assert.equal(result.mode, 'already_deleted');
 });
 
 const { pushSnapshot, clearStack } = require('../navigationStackStore');
