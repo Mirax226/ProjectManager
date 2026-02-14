@@ -34,7 +34,23 @@ function normalizePostgresDsn(dsn) {
     }
     rebuilt = `postgresql://${auth}${parsed.host}${parsed.pathname}${parsed.search}`;
   } catch (_error) {
-    warnings.push('DSN could not be fully parsed; kept best-effort normalized protocol.');
+    const withoutProtocol = withProtocol.replace(/^postgresql:\/\//, '');
+    const atIndex = withoutProtocol.indexOf('@');
+    const slashIndex = withoutProtocol.indexOf('/');
+    if (atIndex > 0 && (slashIndex === -1 || atIndex < slashIndex)) {
+      const userInfo = withoutProtocol.slice(0, atIndex);
+      const hostAndPath = withoutProtocol.slice(atIndex + 1);
+      const sepIndex = userInfo.indexOf(':');
+      const rawUser = sepIndex >= 0 ? userInfo.slice(0, sepIndex) : userInfo;
+      const rawPassword = sepIndex >= 0 ? userInfo.slice(sepIndex + 1) : '';
+      const safeUser = encodeURIComponent(rawUser);
+      const safePassword = rawPassword ? encodeURIComponent(rawPassword) : '';
+      const safeAuth = safePassword ? `${safeUser}:${safePassword}` : safeUser;
+      rebuilt = `postgresql://${safeAuth}@${hostAndPath}`;
+      warnings.push('Credentials had reserved characters and were percent-encoded.');
+    } else {
+      warnings.push('DSN could not be fully parsed; kept best-effort normalized protocol.');
+    }
   }
   return { dsn: rebuilt, warnings };
 }

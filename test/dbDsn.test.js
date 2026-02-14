@@ -31,3 +31,11 @@ test('validate postgres dsn', () => {
   const valid = validatePostgresDsn('postgresql://user:pass@localhost:5432/main');
   assert.equal(valid.ok, true);
 });
+
+
+test('normalize percent-encodes reserved credentials in fallback path', () => {
+  const input = 'postgres://user:name:p@ss@db.example.com:5432/app';
+  const normalized = normalizePostgresDsn(input);
+  assert.equal(normalized.dsn.startsWith('postgresql://'), true);
+  assert.equal(normalized.dsn.includes('%40ss@'), true);
+});
