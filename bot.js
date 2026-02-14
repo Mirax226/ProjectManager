@@ -2301,9 +2301,6 @@ function buildScopedHeader(scopeLabel, breadcrumb) {
   } else if (normalizedScope) {
     lines.push('🌍 Scope: Global');
   }
-  if (breadcrumb) {
-    lines.push(`Breadcrumb: ${breadcrumb}`);
-  }
   if (lines.length) {
     lines.push('');
   }
@@ -13012,11 +13009,9 @@ async function buildProjectOverviewView(project, globalSettings, notice) {
 
   const lines = [
     buildScopedHeader(`PROJECT: ${name}||${project.id}`, `Main → Projects → ${name} → 🧾 Overview`),
-    `🧩 Project: ${isDefault ? '⭐ ' : ''}${name}`,
-    `🆔 ID: ${project.id}`,
-    '📦 Scope: Project',
     notice || null,
     '',
+    `🧩 Project default: ${isDefault ? 'yes ⭐' : 'no'}`,
     `🧭 Project type: ${projectTypeLabel}`,
     '',
     '📦 Repo:',
@@ -13069,9 +13064,6 @@ function buildProjectHubView(project, notice) {
   const name = project.name || project.id;
   const lines = [
     buildScopedHeader(`PROJECT: ${name}||${project.id}`, `Main → Projects → ${name} → 📦 Project`),
-    `🧩 Project: ${name}`,
-    `🆔 ID: ${project.id}`,
-    '📦 Scope: Project',
     notice || null,
   ].filter(Boolean);
   const inline = new InlineKeyboard()

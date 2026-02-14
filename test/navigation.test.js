@@ -194,11 +194,21 @@ test('global to project database drill-down keeps navigation callbacks', async (
   assert.match(renderedText, /Database/);
 });
 
-test('breadcrumb helper renders expected format', () => {
+test('project scoped header renders only 3-line project header', () => {
   const header = __test.buildScopedHeader('PROJECT: Alpha', 'Main → Databases → Alpha → Database');
   assert.match(header, /🧩 Project: Alpha/);
+  assert.match(header, /🆔 ID: Alpha/);
   assert.match(header, /📦 Scope: Project/);
-  assert.match(header, /Breadcrumb: Main → Databases → Alpha → Database/);
+  assert.doesNotMatch(header, /Breadcrumb:/);
+});
+
+test('project hub view renders single project header block without breadcrumb', () => {
+  const view = __test.buildProjectHubView({ id: 'DailyManager', name: 'Daily Manager' });
+  const body = view.text;
+  assert.equal((body.match(/🧩 Project:/g) || []).length, 1);
+  assert.equal((body.match(/🆔 ID:/g) || []).length, 1);
+  assert.equal((body.match(/📦 Scope: Project/g) || []).length, 1);
+  assert.doesNotMatch(body, /Breadcrumb:/);
 });
 
 test('delete callback deletes exact targeted message and answers callback first', async () => {
