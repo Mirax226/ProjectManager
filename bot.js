@@ -645,9 +645,35 @@ function getCronNotificationLevels(project) {
   return normalized.length ? normalized : ['info', 'warning', 'error'];
 }
 
+function normalizeCronProvider(provider, hasToken = Boolean(CRON_API_TOKEN)) {
+  const normalized = String(provider || '').trim().toLowerCase();
+  if (normalized === 'local' || normalized === 'none') return 'none';
+  if (normalized === 'cronjob_org') return 'cronjob_org';
+  return hasToken ? 'cronjob_org' : 'none';
+}
+
 async function getEffectiveCronSettings() {
   const settings = await loadCronSettings();
-  return settings || { enabled: true, defaultTimezone: 'UTC' };
+  const effective = settings || { enabled: true, defaultTimezone: 'UTC' };
+  return {
+    ...effective,
+    provider: normalizeCronProvider(effective.provider, Boolean(CRON_API_TOKEN)),
+  };
+}
+
+function isCronProviderEnabled(cronSettings) {
+  return normalizeCronProvider(cronSettings?.provider, Boolean(CRON_API_TOKEN)) === 'cronjob_org';
+}
+
+function getCronProviderGuidance(cronSettings) {
+  const provider = normalizeCronProvider(cronSettings?.provider, Boolean(CRON_API_TOKEN));
+  if (provider === 'none') {
+    return 'Cron provider is set to none/local. Use VPS/system cron/systemd timers or set CRON_PROVIDER=cronjob_org.';
+  }
+  if (!CRON_API_TOKEN) {
+    return 'Cron provider requires CRON_API_TOKEN (or CRON_API_KEY/CRONJOB_API_KEY).';
+  }
+  return null;
 }
 
 function normalizeTelegramExtra(extra) {
@@ -1090,6 +1116,17 @@ async function sendDismissibleMessage(ctx, text, extra = {}) {
   return sendTransientNotice(ctx, text, { ttlSec: 10, deleteButton: true, extraMarkup: extra.reply_markup, extra });
 }
 
+async function sendTransientMessage(ctx, text, options = {}) {
+  const ttlMs = Number.isFinite(options.ttlMs) ? Number(options.ttlMs) : 10000;
+  const ttlSec = Math.max(0, Math.round(ttlMs / 1000));
+  return sendTransientNotice(ctx, text, {
+    ttlSec,
+    deleteButton: true,
+    extraMarkup: options.reply_markup || options.extraMarkup,
+    extra: options,
+  });
+}
+
 
 function codexTaskShortId(id) {
   return String(id || '').slice(0, 8);
@@ -1171,7 +1208,7 @@ async function renderCodexTaskDetails(ctx, id, notice, options = {}) {
   const inline = new InlineKeyboard()
     .text('📋 Copy task', `codex_tasks:copy:${task.id}:${options.projectId || ''}`)
     .row()
-    .text('✅ Mark as Done', `codex_tasks:done:${task.id}:${options.projectId || ''}`)
+    .text('✅ Mark fixed', `codex_tasks:done:${task.id}:${options.projectId || ''}`)
     .text('🗑 Delete task', `codex_tasks:delete:${task.id}:${options.projectId || ''}`)
     .row()
     .text('↩ Back', options.projectId ? `proj:codex_tasks:${options.projectId}` : 'nav:back');
@@ -1258,11 +1295,32 @@ function summarizeRoutineCandidates(matches) {
 
 async function handleDeleteMessageCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
-  const [, , chatIdRaw, messageIdRaw] = String(data).split(':');
-  const chatId = Number(chatIdRaw);
-  const messageId = Number(messageIdRaw);
+  const parts = String(data).split(':');
+  let ownerId = null;
+  let chatId = null;
+  let messageId = null;
+
+  if (parts[2] === 'pending') {
+    const fallback = ctx?.callbackQuery?.message;
+    chatId = Number(fallback?.chat?.id);
+    messageId = Number(fallback?.message_id);
+  } else if (parts.length >= 5) {
+    ownerId = Number(parts[2]);
+    chatId = Number(parts[3]);
+    messageId = Number(parts[4]);
+  } else {
+    chatId = Number(parts[2]);
+    messageId = Number(parts[3]);
+  }
+
   if (!chatId || !messageId) {
     return { ok: false, reason: 'invalid_target' };
+  }
+
+  const actorId = Number(ctx?.from?.id);
+  const callbackChatId = Number(ctx?.callbackQuery?.message?.chat?.id);
+  if (ownerId && actorId && ownerId !== actorId && callbackChatId > 0) {
+    return { ok: true, mode: 'forbidden' };
   }
   const api = ctx?.telegram || ctx?.api || bot.api;
   try {
@@ -1273,8 +1331,7 @@ async function handleDeleteMessageCallback(ctx, data) {
       return { ok: true, mode: 'already_deleted' };
     }
     if (isDeleteMessageForbiddenError(error)) {
-      await ensureAnswerCallback(ctx, { text: "Can't delete this message." });
-      return { ok: false, reason: 'forbidden' };
+      return { ok: true, mode: 'forbidden' };
     }
     const refId = buildDeleteRefId();
     console.error('[msgdel] delete failed', {
@@ -1283,8 +1340,7 @@ async function handleDeleteMessageCallback(ctx, data) {
       messageId,
       error: error?.message || error?.description || 'unknown',
     });
-    await ensureAnswerCallback(ctx, { text: "Can't delete this message." });
-    return { ok: false, reason: 'error', refId };
+    return { ok: true, mode: 'error', refId };
   }
 }
 
@@ -1609,7 +1665,7 @@ function normalizeCronErrorMessage(error) {
   return truncateText(reason || error?.message || 'request failed', 300);
 }
 
-function shouldEmitCronErrorSignature(signature, windowMs = 5 * 60 * 1000) {
+function shouldEmitCronErrorSignature(signature, windowMs = 60 * 1000) {
   const now = Date.now();
   const existing = cronErrorDedupeCache.get(signature);
   if (existing && now - existing < windowMs) {
@@ -1633,9 +1689,6 @@ function logCronApiError({ operation, error, userId, projectId, correlationId, j
     projectId,
     jobId,
   });
-  if (!['create', 'update', 'delete', 'toggle'].includes(String(operation || '').toLowerCase())) {
-    return;
-  }
   const signature = [operation, error?.method || '-', error?.path || '-', error?.status || '-', message].join('|');
   if (!shouldEmitCronErrorSignature(signature)) {
     return;
@@ -1647,6 +1700,7 @@ function logCronApiError({ operation, error, userId, projectId, correlationId, j
     method: error?.method || null,
     status: error?.status || null,
     message,
+    excerpt: responseBody || null,
     projectId: projectId || null,
     jobId: jobId || null,
     userId: userId || null,
@@ -3318,8 +3372,8 @@ async function dispatchCallbackData(ctx, data, options = {}) {
     await goHome(ctx);
     return;
   }
-  if (callbackData.startsWith('msg:delete:')) {
-    await handleDeleteMessageCallback(ctx, callbackData);
+  if (callbackData.startsWith('msg:delete:') || callbackData.startsWith('msgdel:')) {
+    await handleDeleteMessageCallback(ctx, callbackData.replace(/^msgdel:/, 'msg:delete:'));
     return;
   }
   if (callbackData.startsWith('routine:')) {
@@ -4908,16 +4962,17 @@ async function handleCronCallback(ctx, data) {
       break;
     }
     case 'create':
-      if (!CRON_API_TOKEN) {
-        await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
-          reply_markup: buildBackKeyboard('main:back'),
-        });
-        return;
-      }
       {
         const cronSettings = await getEffectiveCronSettings();
         if (!cronSettings.enabled) {
           await renderOrEdit(ctx, 'Cron integration is disabled in settings.', {
+            reply_markup: buildBackKeyboard('main:back'),
+          });
+          return;
+        }
+        const guidance = getCronProviderGuidance(cronSettings);
+        if (guidance) {
+          await renderOrEdit(ctx, guidance, {
             reply_markup: buildBackKeyboard('main:back'),
           });
           return;
@@ -4976,6 +5031,28 @@ async function handleCronCallback(ctx, data) {
     case 'edit_timezone':
       await promptCronTimezoneInput(ctx, jobId, 'cron:job:' + jobId);
       break;
+
+    case 'test_all': {
+      try {
+        const response = await fetchCronJobs();
+        const jobs = (response.jobs || []).filter((job) => job?.url).slice(0, 5);
+        if (!jobs.length) {
+          await sendTransientMessage(ctx, 'No cron jobs with target URL found.');
+          break;
+        }
+        const results = [];
+        for (const job of jobs) {
+          const result = await runCronTargetReachabilityTest(job.url);
+          results.push(`#${job.id} HTTP ${result.status != null ? result.status : '-'} · ${result.latencyMs}ms · ${result.category}`);
+        }
+        await sendTransientMessage(ctx, `🧪 Cron test (first ${jobs.length} job(s))\n${results.join('\n')}`);
+      } catch (error) {
+        const correlationId = buildCronCorrelationId();
+        logCronApiError({ operation: 'test', error, userId: ctx.from?.id, projectId: null, correlationId });
+        await sendTransientMessage(ctx, formatCronApiErrorNotice('Failed to test cron jobs', error, correlationId));
+      }
+      break;
+    }
     case 'test': {
       try {
         const job = await fetchCronJob(jobId);
@@ -5758,6 +5835,30 @@ async function handleProjectCronCallback(ctx, data) {
     case 'unlink_confirm':
       await unlinkProjectCronJob(ctx, projectId, extra);
       break;
+
+    case 'test': {
+      const type = extra;
+      const projects = await loadProjects();
+      const project = findProjectById(projects, projectId);
+      const jobId = type === 'deploy' ? project?.cronDeployHookJobId : project?.cronKeepAliveJobId;
+      if (!jobId) {
+        await sendTransientMessage(ctx, 'Cron job not linked for this target.');
+        break;
+      }
+      try {
+        const job = await fetchCronJob(jobId);
+        if (!job?.url) {
+          await sendTransientMessage(ctx, 'Cron job target URL is missing.');
+          break;
+        }
+        await renderCronTargetTestResult(ctx, jobId, job.url, `projcron:menu:${projectId}`);
+      } catch (error) {
+        const correlationId = buildCronCorrelationId();
+        logCronApiError({ operation: 'test', error, userId: ctx.from?.id, projectId, correlationId, jobId });
+        await sendTransientMessage(ctx, formatCronApiErrorNotice('Failed to test cron job', error, correlationId));
+      }
+      break;
+    }
     case 'alerts_toggle':
       await toggleProjectCronAlerts(ctx, projectId);
       break;
@@ -7418,6 +7519,63 @@ function parseScheduleInput(input) {
   return { cron: raw, label: raw };
 }
 
+function buildRangeStep(step, max, start = 0) {
+  const out = [];
+  for (let value = start; value <= max; value += step) out.push(value);
+  return out;
+}
+
+function normalizeCronSchedulePayload(schedule, timezone) {
+  const tz = timezone || 'UTC';
+  if (schedule && typeof schedule === 'object' && !Array.isArray(schedule)) {
+    if (Array.isArray(schedule.minutes) || Array.isArray(schedule.hours) || Array.isArray(schedule.mdays)
+      || Array.isArray(schedule.months) || Array.isArray(schedule.wdays)) {
+      return {
+        timezone: schedule.timezone || tz,
+        minutes: normalizeScheduleArray(schedule.minutes),
+        hours: normalizeScheduleArray(schedule.hours),
+        mdays: normalizeScheduleArray(schedule.mdays),
+        months: normalizeScheduleArray(schedule.months),
+        wdays: normalizeScheduleArray(schedule.wdays),
+      };
+    }
+    if (typeof schedule.cron === 'string' || typeof schedule.expression === 'string') {
+      return normalizeCronSchedulePayload(schedule.cron || schedule.expression, schedule.timezone || tz);
+    }
+  }
+
+  const cronExpr = String(schedule || '').trim();
+  const parts = cronExpr.split(/\s+/);
+  if (parts.length !== 5) {
+    throw new Error('Unsupported cron format. Accepted: */N * * * *, 0 */N * * *, 0 0 * * * and simple fixed values.');
+  }
+  const [m,h,md,mo,wd]=parts;
+
+  function parseField(value, min, max, allowAny=true) {
+    if (value === '*') return [-1];
+    if (/^\*\/\d+$/.test(value)) {
+      const step = Number(value.slice(2));
+      if (!Number.isFinite(step) || step <= 0) throw new Error('Invalid step in cron expression.');
+      return buildRangeStep(step, max, min);
+    }
+    if (/^\d+$/.test(value)) {
+      const num = Number(value);
+      if (num < min || num > max) throw new Error('Cron value out of range.');
+      return [num];
+    }
+    throw new Error('Unsupported cron format. Accepted: */N * * * *, 0 */N * * *, 0 0 * * * and simple fixed values.');
+  }
+
+  return {
+    timezone: tz,
+    minutes: parseField(m, 0, 59),
+    hours: parseField(h, 0, 23),
+    mdays: parseField(md, 1, 31),
+    months: parseField(mo, 1, 12),
+    wdays: parseField(wd, 0, 6),
+  };
+}
+
 function getCronJobId(job) {
   return job?.jobId ?? job?.id ?? job?.job_id ?? null;
 }
@@ -7591,18 +7749,7 @@ function buildCronJobUpdatePayload(job, overrides = {}) {
 }
 
 function buildCronJobPayload({ name, url, schedule, timezone, enabled }) {
-  let schedulePayload = null;
-  if (schedule && typeof schedule === 'object') {
-    schedulePayload = { ...schedule };
-    if (!schedulePayload.timezone) {
-      schedulePayload.timezone = timezone || 'UTC';
-    }
-  } else {
-    schedulePayload = {
-      timezone: timezone || 'UTC',
-      cron: schedule,
-    };
-  }
+  const schedulePayload = normalizeCronSchedulePayload(schedule, timezone);
   return {
     title: name,
     url,
@@ -8189,7 +8336,7 @@ async function attemptCronWizardCreate(ctx, state) {
     const created = await createJob(payload);
     clearCronJobsCache();
     clearUserState(ctx.from.id);
-    await ctx.reply(`Cron job created (id: #${created.id}, title: ${jobName}).`);
+    await sendTransientMessage(ctx, `Cron job created (id: #${created.id}, title: ${jobName}).`);
     await renderCronMenu(ctx);
   } catch (error) {
     setCronWizardStep(state, 'confirm', 'confirm');
@@ -8212,8 +8359,9 @@ async function renderCronMenu(ctx) {
     });
     return;
   }
-  if (!CRON_API_TOKEN) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
+  const guidance = getCronProviderGuidance(cronSettings);
+  if (guidance) {
+    await renderOrEdit(ctx, guidance, {
       reply_markup: buildBackKeyboard('main:back'),
     });
     return;
@@ -8263,14 +8411,18 @@ async function renderCronMenu(ctx) {
     .row()
     .text('🔎 Filter by project', 'cronlink:filter_menu')
     .row()
+    .text('🧪 Test all jobs', 'cron:test_all')
+    .row()
     .text('⬅️ Back', 'main:back');
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderCronJobList(ctx, options = {}) {
-  if (!CRON_API_TOKEN) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
+  const cronSettings = await getEffectiveCronSettings();
+  const guidance = getCronProviderGuidance(cronSettings);
+  if (guidance) {
+    await renderOrEdit(ctx, guidance, {
       reply_markup: buildBackKeyboard('main:back'),
     });
     return;
@@ -8436,8 +8588,9 @@ function groupCronJobs(jobs, projects, linkMap) {
 }
 
 async function renderCronLinkMenu(ctx) {
-  if (!CRON_API_TOKEN) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
+  const guidance = getCronProviderGuidance(await getEffectiveCronSettings());
+  if (guidance) {
+    await renderOrEdit(ctx, guidance, {
       reply_markup: buildBackKeyboard('cron:menu'),
     });
     return;
@@ -8554,14 +8707,15 @@ async function handleCronLinkLabelInput(ctx, state) {
 
 
 function sanitizeCronTargetSnippet(text, maxLen = 200) {
-  const compact = String(text || '').replace(/\s+/g, ' ').trim();
+  const withoutHtml = String(text || '').replace(/<[^>]*>/g, ' ');
+  const compact = withoutHtml.replace(/\s+/g, ' ').trim();
   return truncateText(compact, maxLen);
 }
 
 async function runCronTargetReachabilityTest(url) {
   const startedAt = Date.now();
   try {
-    const response = await fetch(url, { method: 'GET', timeout: 5000, redirect: 'follow' });
+    const response = await fetch(url, { method: 'GET', timeout: 10000, redirect: 'follow' });
     const body = await response.text();
     return {
       ok: response.ok,
@@ -9073,7 +9227,7 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
     }
     await saveProjects(projects);
     clearUserState(ctx.from.id);
-    await ctx.reply(`Cron job created. ID: ${created.id}`);
+    await sendTransientMessage(ctx, `Cron job created. ID: ${created.id}`);
     await renderProjectCronBindings(ctx, project.id);
   } catch (error) {
     const correlationId = buildCronCorrelationId();
@@ -9114,7 +9268,7 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
       await ctx.reply(formatCronCreateErrorPanel({ error, correlationId }), { reply_markup: inline });
       return;
     }
-    await ctx.reply(formatCronApiErrorNotice('Failed to create cron job', error, correlationId));
+    await sendTransientMessage(ctx, formatCronApiErrorNotice('Failed to create cron job', error, correlationId));
   }
 }
 
@@ -9919,7 +10073,7 @@ async function finalizeProjectWizard(ctx, state) {
 
   await sendDismissibleMessage(
     ctx,
-    `✅ Project created.\n🏷️ Name: ${project.name}\n🆔 ID: ${project.id}`,
+    `✅ Project created.\n🧩 Name: ${project.name}\n🆔 ID: ${project.id}`,
   );
   await renderProjectsList(ctx);
 }
@@ -13096,6 +13250,14 @@ async function renderProjectScopedSettings(ctx, projectId, notice) {
     notice || null,
   ].filter(Boolean);
   const inline = new InlineKeyboard()
+    .text('🧾 Overview', `proj:overview:${project.id}`)
+    .row()
+    .text('✏️ Edit name', `proj:rename:${project.id}`)
+    .text('🆔 Edit ID', `proj:edit_id:${project.id}`)
+    .row()
+    .text('🧭 Apply path / working dir', `proj:working_dir:${project.id}`)
+    .row()
+    .text('🌐 Repository', `proj:repo_menu:${project.id}`)
     .text('⚙️ Preferences', `proj:preferences:${project.id}`)
     .row()
     .text('🧠 Codex Tasks', `proj:codex_tasks:${project.id}`)
@@ -19443,8 +19605,9 @@ async function renderProjectCronBindings(ctx, projectId) {
     });
     return;
   }
-  if (!CRON_API_TOKEN) {
-    await renderOrEdit(ctx, 'Cron integration is not configured (CRON_API_TOKEN missing).', {
+  const guidance = getCronProviderGuidance(cronSettings);
+  if (guidance) {
+    await renderOrEdit(ctx, guidance, {
       reply_markup: buildBackKeyboard(`proj:server_menu:${projectId}`),
     });
     return;
@@ -19481,6 +19644,9 @@ async function renderProjectCronBindings(ctx, projectId) {
     .row()
     .text('⚙️ Alert levels', `projcron:alerts_levels:${projectId}`)
     .row()
+    .text('🧪 Test keep-alive', `projcron:test:${projectId}:keepalive`)
+    .text('🧪 Test deploy', `projcron:test:${projectId}:deploy`)
+    .row()
     .text('⬅️ Back', `proj:server_menu:${projectId}`);
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
@@ -19504,6 +19670,8 @@ async function handleProjectCronJobAction(ctx, projectId, type) {
       .text('♻️ Recreate job', `projcron:${type}_recreate:${projectId}`)
       .row()
       .text('🗑 Unlink job', `projcron:${type}_unlink:${projectId}`)
+      .row()
+      .text('🧪 Test cron', `projcron:test:${projectId}:${type}`)
       .row()
       .text('⬅️ Back', `projcron:menu:${projectId}`);
     await renderOrEdit(
@@ -21189,6 +21357,7 @@ function buildHelpPages() {
     shadow: 'Shadow runs provide a dry plan before dangerous execute actions.\nWhere: migration/sync/env bulk workflows.\nUse: inspect operations and confirm execute.\nSafety: no destructive action without confirm.',
     templates: 'Templates apply best-practice defaults for new projects.\nWhere: Main Menu -> Templates.\nUse: preview changes, shadow run, then execute.\nSafety: scoped defaults only.',
     guest: 'Guest role is read-only for status, logs, timeline, and runbooks.\nWhere: Settings -> Access controls.\nUse: observer access without mutation rights.\nSafety: write actions blocked.',
+    cron: 'Cron providers: CRON_PROVIDER=cronjob_org|none (default: cronjob_org when token exists, else none).\nRequired for cronjob_org: CRON_API_TOKEN (or CRON_API_KEY/CRONJOB_API_KEY).\nWhen provider=none/local, PM keeps menus but external scheduler calls are disabled and guidance is shown.',
   };
 }
 
@@ -21207,6 +21376,8 @@ async function renderHelpMenu(ctx) {
     .row()
     .text('🧩 Templates', 'help:templates')
     .text('👀 Guest Access', 'help:guest')
+    .row()
+    .text('⏱️ Cron providers', 'help:cron')
     .row()
     .text('⬅️ Back', 'main:back');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: keyboard });

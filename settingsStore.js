@@ -5,7 +5,9 @@ const { forwardSelfLog } = require('./logger');
 
 const SETTINGS_FILE = path.join(__dirname, 'globalSettings.json');
 const ENV_DEFAULT_BASE = process.env.DEFAULT_BASE_BRANCH || 'main';
-const DEFAULT_CRON_SETTINGS = { enabled: true, defaultTimezone: 'UTC' };
+const DEFAULT_CRON_PROVIDER = process.env.CRON_PROVIDER
+  || ((process.env.CRON_API_TOKEN || process.env.CRON_API_KEY || process.env.CRONJOB_API_KEY) ? 'cronjob_org' : 'none');
+const DEFAULT_CRON_SETTINGS = { enabled: true, defaultTimezone: 'UTC', provider: DEFAULT_CRON_PROVIDER };
 const DEFAULT_GLOBAL_SETTINGS = {
   defaultBaseBranch: ENV_DEFAULT_BASE,
   defaultProjectId: undefined,
@@ -157,6 +159,9 @@ async function loadCronSettings() {
   return {
     enabled: typeof settings.enabled === 'boolean' ? settings.enabled : DEFAULT_CRON_SETTINGS.enabled,
     defaultTimezone: settings.defaultTimezone || DEFAULT_CRON_SETTINGS.defaultTimezone,
+    provider: ['cronjob_org', 'none', 'local'].includes(String(settings.provider || '').toLowerCase())
+      ? (String(settings.provider || '').toLowerCase() === 'local' ? 'none' : String(settings.provider || '').toLowerCase())
+      : DEFAULT_CRON_SETTINGS.provider,
   };
 }
 
@@ -164,6 +169,9 @@ async function saveCronSettings(settings) {
   const payload = {
     enabled: typeof settings?.enabled === 'boolean' ? settings.enabled : DEFAULT_CRON_SETTINGS.enabled,
     defaultTimezone: settings?.defaultTimezone || DEFAULT_CRON_SETTINGS.defaultTimezone,
+    provider: ['cronjob_org', 'none', 'local'].includes(String(settings?.provider || '').toLowerCase())
+      ? (String(settings.provider || '').toLowerCase() === 'local' ? 'none' : String(settings.provider || '').toLowerCase())
+      : DEFAULT_CRON_SETTINGS.provider,
   };
   try {
     await configStore.saveJson('cronSettings', payload);
