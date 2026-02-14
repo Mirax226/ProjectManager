@@ -260,13 +260,24 @@ async function loadCronjobs() {
     elements.cronList.innerHTML = `<div class="list-item">${data.error || 'Cronjobs unavailable.'}</div>`;
     return;
   }
+  const summary = data.summary || {};
+  const summaryItems = [
+    {
+      title: `Total jobs (unique): ${summary.totalJobsUnique != null ? summary.totalJobsUnique : (data.jobs || []).length}`,
+      subtitle: summary.duplicatesHidden > 0 ? `Duplicates hidden: ${summary.duplicatesHidden}` : 'No duplicates hidden',
+      detail: 'Global defaults are used when project has no keepalive schedule.',
+    },
+  ];
   renderList(
     elements.cronList,
-    data.jobs.map((job) => ({
-      title: job.title,
-      subtitle: `${job.enabled ? '✅ Enabled' : '⏸️ Paused'} • ${job.schedule || '—'}`,
-      detail: job.url || '',
-    })),
+    [
+      ...summaryItems,
+      ...(data.jobs || []).map((job) => ({
+        title: job.title,
+        subtitle: `${job.enabled ? '✅ Enabled' : '⏸️ Paused'} • ${job.schedule || '—'}`,
+        detail: job.url || '',
+      })),
+    ],
   );
 }
 

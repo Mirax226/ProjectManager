@@ -191,7 +191,7 @@ const { syncPair } = require('./src/dbSyncEngine');
 const { ensureDbHubSchema, upsertProjectConnection, listProjectConnections } = require('./src/db/hubStore');
 const { getDbClient } = require('./src/db/router');
 const { createMigrationJob, getMigrationJob, updateMigrationJob } = require('./src/db/migrationJobs');
-const { validatePostgresDsn, maskPostgresDsn } = require('./src/db/dsn');
+const { validatePostgresDsn, maskPostgresDsn, fingerprintPostgresDsn } = require('./src/db/dsn');
 const { createOpsTimelineStore } = require('./src/opsTimeline');
 const { createSafeModeController } = require('./src/safeMode');
 const { buildProjectSnapshot, calculateDrift } = require('./src/driftDetector');
@@ -373,6 +373,8 @@ const safeMode = createSafeModeController({});
 const driftBaselines = new Map();
 const pendingLogTests = new Map();
 let httpServerPromise = null;
+let httpListeningLogged = false;
+let healthzReadyLogged = false;
 let miniSiteWarmupSummary = {
   warmUpReady: false,
   lastWarmUpAt: null,
@@ -2597,7 +2599,7 @@ async function runConfigDbWarmup(reason = 'scheduled') {
   const attemptCount = getConfigDbSnapshot().attempts;
 
   try {
-    const status = await probeConfigDbConnection();
+    const status = await withDbTimeout(probeConfigDbConnection(), `config_db_warmup:${reason}`);
     if (!status.configured) {
       const message = sanitizeDbErrorMessage(status.message) || 'not configured';
       recordDbError('UNKNOWN_DB_ERROR', message);
@@ -5040,7 +5042,9 @@ async function handleCronCallback(ctx, data) {
     case 'test_all': {
       try {
         const response = await fetchCronJobs();
-        const jobs = (response.jobs || []).filter((job) => job?.url).slice(0, 5);
+        const rawJobs = (response.jobs || []).filter((job) => job?.url);
+        const deduped = dedupeCronJobsByJobKey(rawJobs, new Map(), []);
+        const jobs = deduped.slice(0, 5);
         if (!jobs.length) {
           await sendTransientMessage(ctx, 'No cron jobs with target URL found.');
           break;
@@ -5048,7 +5052,8 @@ async function handleCronCallback(ctx, data) {
         const results = [];
         for (const job of jobs) {
           const result = await runCronTargetReachabilityTest(job.url);
-          results.push(`#${job.id} HTTP ${result.status != null ? result.status : '-'} · ${result.latencyMs}ms · ${result.category}`);
+          const displayName = getCronJobDisplayName(job);
+          results.push(`${displayName} · status ${result.status != null ? result.status : '-'} · latency ${result.latencyMs}ms · ${result.category}`);
         }
         await sendTransientMessage(ctx, `🧪 Cron test (first ${jobs.length} job(s))\n${results.join('\n')}`);
       } catch (error) {
@@ -8546,9 +8551,14 @@ async function renderCronMenu(ctx) {
     return;
   }
   let jobs = [];
+  let dedupedJobs = [];
   try {
     const response = await fetchCronJobs();
     jobs = response.jobs;
+    const links = await listCronJobLinks();
+    const linkMap = new Map(links.map((link) => [String(link.cronJobId), link]));
+    const projects = await loadProjects();
+    dedupedJobs = dedupeCronJobsByJobKey(jobs, linkMap, projects);
   } catch (error) {
     const correlationId = buildCronCorrelationId();
     logCronApiError({
@@ -8573,7 +8583,14 @@ async function renderCronMenu(ctx) {
     return;
   }
 
-  const lines = ['⏱ Cron Jobs', buildScopedHeader('GLOBAL', 'Main → Cron Jobs'), `Total jobs: ${jobs.length}`];
+  const duplicatesHidden = Math.max(0, jobs.length - dedupedJobs.length);
+  const lines = [
+    '⏱ Cron Jobs',
+    buildScopedHeader('GLOBAL', 'Main → Cron Jobs'),
+    `Total jobs (unique): ${dedupedJobs.length || jobs.length}`,
+    duplicatesHidden > 0 ? `Duplicates hidden: ${duplicatesHidden}` : null,
+    'Global cron defaults apply to keepalive schedule when a project has no keepalive schedule.',
+  ].filter(Boolean);
   const inline = new InlineKeyboard()
     .text('📋 List jobs', 'cron:list')
     .row()
@@ -8584,7 +8601,7 @@ async function renderCronMenu(ctx) {
     .text('⏸ Pause all', 'cron:pause_all')
     .text('▶️ Resume all', 'cron:resume_all')
     .row()
-    .text('⚙️ Global cron defaults', 'gsettings:defaults')
+    .text('⚙️ Keepalive defaults', 'gsettings:defaults')
     .row()
     .text('🧹 Show “Other” only', 'cronlink:other')
     .row()
@@ -8643,8 +8660,13 @@ async function renderCronJobList(ctx, options = {}) {
   const deduped = dedupeCronJobsByJobKey(jobs, linkMap, projects);
   const filtered = filterCronJobsByProject(deduped, projects, linkMap, options);
   const grouped = groupCronJobs(filtered, projects, linkMap);
+  const duplicatesHidden = Math.max(0, jobs.length - deduped.length);
 
-  const lines = ['Cron jobs:'];
+  const lines = [
+    'Cron jobs:',
+    `Total jobs (unique): ${deduped.length}`,
+    duplicatesHidden > 0 ? `Duplicates hidden: ${duplicatesHidden}` : null,
+  ].filter(Boolean);
   if (!grouped.length) {
     lines.push('No cron jobs found.');
   }
@@ -8930,12 +8952,19 @@ async function runCronTargetReachabilityTest(url) {
 
 async function renderCronTargetTestResult(ctx, jobId, url, backCallback = `cron:job:${jobId}`) {
   const result = await runCronTargetReachabilityTest(url);
+  let jobLabel = String(jobId);
+  try {
+    const job = await fetchCronJob(jobId);
+    jobLabel = getCronJobDisplayName(job);
+  } catch (_error) {
+    jobLabel = `Job ${jobId}`;
+  }
   const lines = [
     '🧪 Cron target reachability test',
-    `Job: #${jobId}`,
+    `Job: ${jobLabel}`,
     `URL: ${url}`,
     `Category: ${result.category}`,
-    `HTTP status: ${result.status != null ? result.status : '-'}`,
+    `Status code: ${result.status != null ? result.status : '-'}`,
     `Latency: ${result.latencyMs}ms`,
     `Body (first 200 chars): ${result.snippet || '-'}`,
   ];
@@ -13159,6 +13188,37 @@ function resolveProjectFeatureFlag(project, key) {
   return undefined;
 }
 
+function isProjectDbRequired(project) {
+  if (!project) return false;
+  return (
+    project.dbSectionOpened === true ||
+    Boolean(project.dbSectionOpenedAt) ||
+    resolveProjectFeatureFlag(project, 'databaseEnabled') === true ||
+    project?.databaseEnabled === true ||
+    project?.dbEnabled === true ||
+    project?.dualDbEnabled === true ||
+    project?.dbDualMode === true ||
+    project?.migrationEnabled === true ||
+    project?.dbMigrationEnabled === true ||
+    project?.miniAppEnabled === true ||
+    project?.dbMiniEnabled === true
+  );
+}
+
+async function buildProjectDbStatusLine(project, keyName, label) {
+  const sources = await resolveEnvValueSources(project, keyName);
+  const effective = selectEffectiveEnvValue(sources);
+  const value = String(effective?.value || '').trim();
+  if (!value) {
+    return `${label}: missing`;
+  }
+  const probe = await probeAdhocDbHealth(value);
+  if (probe?.ok) {
+    return `${label}: ok (${probe.latencyMs}ms)`;
+  }
+  return `${label}: err`;
+}
+
 async function getMissingRequirements(project) {
   const missing = [];
   const runModeRaw = project?.runMode || project?.run_mode || '';
@@ -13168,10 +13228,7 @@ async function getMissingRequirements(project) {
     resolveProjectFeatureFlag(project, 'logAlertsEnabled') === true ||
     project?.logAlertsEnabled === true ||
     getEffectiveProjectLogForwarding(project).enabled === true;
-  const databaseEnabled =
-    resolveProjectFeatureFlag(project, 'databaseEnabled') === true ||
-    project?.databaseEnabled === true ||
-    project?.dbEnabled === true;
+  const databaseEnabled = isProjectDbRequired(project);
   const supabaseEnabled = resolveSupabaseEnabled(project);
   const healthPath = project?.healthPath || project?.health_path;
   const servicePort =
@@ -13238,14 +13295,18 @@ async function getMissingRequirements(project) {
     }
   }
 
-  if (databaseEnabled && isMissingRequirementValue(project?.databaseUrl)) {
+  if (databaseEnabled) {
+    const dbSources = await resolveEnvValueSources(project, 'DATABASE_URL');
+    const dbEffective = selectEffectiveEnvValue(dbSources);
+    if (isMissingRequirementValue(dbEffective.value)) {
     missing.push({
       key: 'databaseUrl',
       title: 'Database URL missing',
-      description: 'Add DB connection to use Database UI/SQL runner.',
+      description: 'Add Primary DB URL to use Database UI/SQL runner.',
       severity: 'required',
       fixAction: 'FIX_DATABASE_URL',
     });
+    }
   }
 
   if (supabaseEnabled) {
@@ -13328,8 +13389,11 @@ function getProjectMissingSetup(project, globalSettings) {
     }
   }
 
-  if (project[rules.databaseModuleEnabledKey] === true && !project[rules.databaseUrlKey]) {
-    addMissing('databaseUrl', 'Database URL', '🗄️', `envvault:menu:${project.id}`);
+  if (isProjectDbRequired(project)) {
+    const hasProjectDb = String(project[rules.databaseUrlKey] || '').trim();
+    if (!hasProjectDb) {
+      addMissing('databaseUrl', 'Database URL', '🗄️', `envvault:menu:${project.id}`);
+    }
   }
 
   if (project[rules.cronModuleEnabledKey] === true) {
@@ -13358,6 +13422,8 @@ async function buildProjectOverviewView(project, globalSettings, notice) {
   const projectTypeLabel = getProjectTypeLabel(project);
   const missingSetup = await getMissingRequirements(project);
   const workingDirLabel = formatWorkingDirDisplay(project);
+  const dbPrimaryStatus = await buildProjectDbStatusLine(project, 'DATABASE_URL', 'DB Primary');
+  const dbSecondaryStatus = await buildProjectDbStatusLine(project, 'DATABASE_URL_PM_SECONDARY', 'DB Secondary');
 
   const lines = [
     buildScopedHeader(`PROJECT: ${name}||${project.id}`, `Main → Projects → ${name} → 🧾 Overview`),
@@ -13387,6 +13453,8 @@ async function buildProjectOverviewView(project, globalSettings, notice) {
     `- Supabase project ref: ${project.supabaseProjectRef || '-'}`,
     `- Supabase URL: ${project.supabaseUrl || '-'}`,
     `- Supabase API key: ${getSupabaseKeyMask(project)} (${project.supabaseKeyType || '-'})`,
+    `- ${dbPrimaryStatus}`,
+    `- ${dbSecondaryStatus}`,
   ].filter((line) => line !== null);
 
   const inline = new InlineKeyboard()
@@ -19267,9 +19335,14 @@ async function buildWebCronJobsPayload() {
   const linkMap = new Map(links.map((link) => [String(link.cronJobId), link]));
   const projects = await loadProjects();
   const deduped = dedupeCronJobsByJobKey(jobs, linkMap, projects);
+  const duplicatesHidden = Math.max(0, jobs.length - deduped.length);
   return {
     ok: true,
     someFailed,
+    summary: {
+      totalJobsUnique: deduped.length,
+      duplicatesHidden,
+    },
     jobs: deduped.map((job) => ({
       id: String(job.id || ''),
       title: job.name || 'Cron job',
@@ -21327,6 +21400,12 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
     return;
   }
 
+  if (project.dbSectionOpened !== true) {
+    project.dbSectionOpened = true;
+    project.dbSectionOpenedAt = new Date().toISOString();
+    await saveProjects(projects);
+  }
+
   const envSetId = await ensureProjectEnvSet(projectId);
   const envStatus = await buildEnvVaultDbStatus(project, envSetId);
   const supabaseStatus = await buildSupabaseBindingStatus(project);
@@ -21481,14 +21560,20 @@ async function startDatabaseImportFlow(ctx, projectId) {
     });
     return;
   }
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  const dbKey = project?.databaseUrlEnvKey || 'DATABASE_URL';
   setUserState(ctx.from.id, {
     type: 'db_import_url',
     projectId,
+    dbKey,
     messageContext: getMessageTargetFromCtx(ctx),
   });
   await renderOrEdit(
     ctx,
-    'Send the DB URL to store in Env Vault as DATABASE_URL.\n(Use Env Vault if you want to map a custom key.)\n(Or press Cancel)',
+    `Send the DB URL to store in Env Vault as ${dbKey}.
+(Use Env Vault if you want to map a custom key.)
+(Or press Cancel)`,
     { reply_markup: buildCancelKeyboard() },
   );
 }
@@ -21508,16 +21593,49 @@ async function handleDatabaseImportInput(ctx, state) {
     await ctx.reply('DB URL must include a scheme (for example: postgres://...).');
     return;
   }
-  const envSetId = await ensureProjectEnvSet(state.projectId);
-  try {
-    await upsertEnvVar(state.projectId, 'DATABASE_URL', raw, envSetId);
-  } catch (error) {
-    console.error('[db] Failed to import DB URL', error);
-    await ctx.reply(`Failed to save DB URL: ${error.message}`);
+
+  const dbKey = state.dbKey || 'DATABASE_URL';
+  const validation = validatePostgresDsn(raw);
+  if (!validation.ok) {
+    await ctx.reply(
+      [
+        'Invalid DB URL.',
+        ...validation.errors,
+        'Fix hint: percent-encode username/password',
+        `Suggested (masked): ${maskPostgresDsn(validation.normalizedDsn) || 'postgresql://***'}`,
+      ].join('\n'),
+    );
     return;
   }
+
+  const envSetId = await ensureProjectEnvSet(state.projectId);
+  try {
+    await upsertEnvVar(state.projectId, dbKey, validation.normalizedDsn, envSetId);
+  } catch (error) {
+    const refId = buildDbRefId('DBSAVE');
+    console.error('[db] Failed to import DB URL', { refId, projectId: state.projectId, key: dbKey, error: error?.message });
+    await ctx.reply(`Failed to save DB URL. RefId: ${refId}\nCopy debug: ${error?.message || 'unknown error'}`);
+    return;
+  }
+
+  let saved;
+  try {
+    saved = await getEnvVarValue(state.projectId, dbKey, envSetId);
+  } catch (error) {
+    const refId = buildDbRefId('DBREAD');
+    console.error('[db] Failed to read DB URL after save', { refId, projectId: state.projectId, key: dbKey, error: error?.message });
+    await ctx.reply(`Saved but read-back failed. RefId: ${refId}\nCopy debug: ${error?.message || 'unknown error'}`);
+    return;
+  }
+
   clearUserState(ctx.from.id);
-  await renderDatabaseBindingMenu(ctx, state.projectId, '✅ DB URL imported into Env Vault.');
+  const finalDsn = saved || validation.normalizedDsn;
+  const fingerprint = fingerprintPostgresDsn(finalDsn).slice(0, 12);
+  await renderDatabaseBindingMenu(
+    ctx,
+    state.projectId,
+    `✅ Saved ${dbKey} · ${fingerprint}\n${maskPostgresDsn(finalDsn) || 'postgresql://***'}`,
+  );
 }
 
 
@@ -24759,7 +24877,7 @@ function startHttpServer() {
         return;
       }
       if (req.method === 'GET' && url.pathname === '/healthz') {
-        const payload = await buildHealthzPayloadSafely();
+        const payload = { ok: true, ts: new Date().toISOString() };
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(payload));
         return;
@@ -25202,7 +25320,14 @@ function startHttpServer() {
 
     server
       .listen(PORT, () => {
-        console.error(`[boot] http listening on ${PORT}`);
+        if (!httpListeningLogged) {
+          console.error(`Listening on :${PORT}`);
+          httpListeningLogged = true;
+        }
+        if (!healthzReadyLogged) {
+          console.error('healthz ready');
+          healthzReadyLogged = true;
+        }
         resolve();
       })
       .on('error', (err) => {
@@ -25257,8 +25382,8 @@ async function startBotPolling() {
 
 async function startBot() {
   console.error('[boot] starting bot init');
-  await loadOpsState();
   await startHttpServer();
+  await loadOpsState();
   startConfigDbWarmup();
   await startOpsScanner();
   console.error('[boot] db warmup started');
