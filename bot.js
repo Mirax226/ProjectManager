@@ -188,6 +188,10 @@ const { createLogIngestService, formatContext, shouldRouteBySeverity } = require
 const { getDefaultGithubToken, setDefaultGithubToken } = require('./userGithubTokenStore');
 const { createLogsRouter, parseAllowedProjects } = require('./src/routes/logs.ts');
 const { syncPair } = require('./src/dbSyncEngine');
+const { ensureDbHubSchema, upsertProjectConnection, listProjectConnections } = require('./src/db/hubStore');
+const { getDbClient } = require('./src/db/router');
+const { createMigrationJob, getMigrationJob, updateMigrationJob } = require('./src/db/migrationJobs');
+const { validatePostgresDsn, maskPostgresDsn } = require('./src/db/dsn');
 const { createOpsTimelineStore } = require('./src/opsTimeline');
 const { createSafeModeController } = require('./src/safeMode');
 const { buildProjectSnapshot, calculateDrift } = require('./src/driftDetector');
@@ -18849,7 +18853,8 @@ async function buildMiniPingPayload() {
 }
 
 async function handleMiniApiRequest(req, res, url) {
-  if (!url.pathname.startsWith('/api/mini')) return false;
+  if (!url.pathname.startsWith('/api/mini') && !url.pathname.startsWith('/api/db')) return false;
+  const pathParts = url.pathname.split('/').filter(Boolean);
 
   let body = {};
   if (req.method !== 'GET') {
@@ -18963,6 +18968,121 @@ async function handleMiniApiRequest(req, res, url) {
     }
     updateMiniJob(job, { abortRequested: true, stepTitle: 'Abort requested' });
     miniApiJson(res, 200, { ok: true });
+    return true;
+  }
+
+
+  if (req.method === 'GET' && url.pathname === '/api/db/health') {
+    const projectId = String(url.searchParams.get('projectId') || '').trim();
+    if (!projectId) {
+      miniApiJson(res, 400, { ok: false, error: 'projectId is required.' });
+      return true;
+    }
+    const primary = await getProjectConnectionByRole(projectId, 'primary');
+    const secondary = await getProjectConnectionByRole(projectId, 'secondary');
+    const ping = async (connection) => {
+      if (!connection) return { status: 'missing' };
+      const started = Date.now();
+      try {
+        const pool = getMiniSitePool(connection.dsn, resolveProjectDbSslSettings({ dbSslMode: connection.sslMode }, { dsn: connection.dsn }));
+        await runMiniSiteQuery(pool, 'SELECT 1', []);
+        return { status: 'ok', latencyMs: Date.now() - started };
+      } catch (error) {
+        return { status: 'error', error: sanitizeDbErrorMessage(error?.message || 'failed') };
+      }
+    };
+    miniApiJson(res, 200, { ok: true, primary: await ping(primary), secondary: await ping(secondary) });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/db/connections') {
+    const projectId = String(url.searchParams.get('projectId') || '').trim();
+    if (!projectId) {
+      miniApiJson(res, 400, { ok: false, error: 'projectId is required.' });
+      return true;
+    }
+    const rows = await listProjectConnections(projectId);
+    miniApiJson(res, 200, { ok: true, connections: rows.map((row) => ({ ...row, dsn: undefined })) });
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/db/connections') {
+    const status = getDbConsoleGuardStatus();
+    if (!status.ok) {
+      miniApiJson(res, 400, { ok: false, code: status.code, error: status.message });
+      return true;
+    }
+    const result = await upsertProjectConnection({
+      projectId: String(body.projectId || '').trim(),
+      label: String(body.label || body.role || 'Connection').trim(),
+      role: String(body.role || 'extra').trim(),
+      dsn: String(body.dsn || '').trim(),
+      sslMode: String(body.sslMode || ''),
+      enabled: body.enabled !== false,
+    });
+    miniApiJson(res, result.ok ? 200 : 400, result);
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/db/sql') {
+    const projectId = String(body.projectId || '').trim();
+    const sql = String(body.sql || '').trim();
+    const connRole = String(body.connRole || 'primary');
+    if (!projectId || !sql) {
+      miniApiJson(res, 400, { ok: false, error: 'projectId and sql are required.' });
+      return true;
+    }
+    const isReadOnly = /^\s*select\b/i.test(sql);
+    if (!isReadOnly && !(body.allowWrite === true)) {
+      miniApiJson(res, 403, { ok: false, error: 'Safe mode enabled. Only SELECT allowed.' });
+      return true;
+    }
+    const connection = await getProjectConnectionByRole(projectId, connRole);
+    if (!connection) {
+      miniApiJson(res, 404, { ok: false, error: 'Connection not found.' });
+      return true;
+    }
+    try {
+      const pool = getMiniSitePool(connection.dsn, resolveProjectDbSslSettings({ dbSslMode: connection.sslMode }, { dsn: connection.dsn }));
+      const result = await runMiniSiteQuery(pool, sql, []);
+      miniApiJson(res, 200, { ok: true, rowCount: result.rowCount || 0, rows: (result.rows || []).slice(0, 100) });
+    } catch (error) {
+      miniApiJson(res, 400, { ok: false, error: 'SQL execution failed.' });
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/db/migrate/start') {
+    const payload = {
+      projectId: String(body.projectId || '').trim(),
+      sourceConnId: String(body.sourceConnId || '').trim(),
+      targetConnId: String(body.targetConnId || '').trim(),
+      mode: String(body.mode || 'schema_and_data'),
+      selectedTables: Array.isArray(body.selectedTables) ? body.selectedTables : null,
+    };
+    const created = await createMigrationJob(payload);
+    await updateMigrationJob(created.id, { status: 'running', progress: 10, currentStep: 'Queued worker' });
+    miniApiJson(res, 202, { ok: true, jobId: created.id });
+    return true;
+  }
+
+  if (req.method === 'GET' && pathParts.length === 4 && pathParts[1] === 'db' && pathParts[2] === 'migrate') {
+    const jobId = decodeURIComponent(pathParts[3]);
+    const job = await getMigrationJob(jobId);
+    miniApiJson(res, job ? 200 : 404, job ? { ok: true, job } : { ok: false, error: 'Job not found.' });
+    return true;
+  }
+
+  if (req.method === 'POST' && pathParts.length === 5 && pathParts[1] === 'db' && pathParts[2] === 'migrate' && pathParts[4] === 'cancel') {
+    const jobId = decodeURIComponent(pathParts[3]);
+    await updateMigrationJob(jobId, { status: 'cancel_requested', currentStep: 'Cancellation requested' });
+    miniApiJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/mini/db') {
+    res.writeHead(302, { Location: MINI_APP_ROUTE });
+    res.end();
     return true;
   }
 
@@ -19191,6 +19311,27 @@ function getConnectionPoolFromConfig(connection) {
     { dsn: connection.dsn },
   );
   return getMiniSitePool(connection.dsn, sslSettings);
+}
+
+
+async function getProjectConnectionByRole(projectId, role) {
+  const rows = await listProjectConnections(projectId, { includeDsn: true });
+  return rows.find((entry) => entry.role === role && entry.enabled) || null;
+}
+
+function buildDbRefId(prefix = 'DB') {
+  return `${prefix}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+function getDbConsoleGuardStatus() {
+  const configDbReady = getConfigDbSnapshot().ready;
+  if (!configDbReady) {
+    return { ok: false, code: 'CONFIG_DB_NOT_CONFIGURED', message: 'Config DB not configured.' };
+  }
+  if (!process.env.PM_KMS_KEY) {
+    return { ok: false, code: 'PM_KMS_KEY_MISSING', message: 'PM_KMS_KEY missing.' };
+  }
+  return { ok: true };
 }
 
 async function buildWebDbConnectionsPayload() {
@@ -20215,6 +20356,14 @@ async function resolveProjectDbCardInfo(project) {
 async function buildDataCenterView() {
   const projects = await loadProjects();
   const lines = [`${buildDegradedBanner()}🗄 Databases`, buildScopedHeader('GLOBAL', 'Main → Databases'), `Status: ${appState.dbReady ? '✅ UP' : '🔴 DOWN'}`];
+  const projectConnections = await Promise.all(projects.map(async (project) => ({
+    project,
+    connections: await listProjectConnections(project.id).catch(() => []),
+  })));
+  const primaryCount = projectConnections.filter((entry) => entry.connections.some((c) => c.role === 'primary' && c.enabled)).length;
+  const secondaryCount = projectConnections.filter((entry) => entry.connections.some((c) => c.role === 'secondary' && c.enabled)).length;
+  lines.push(`🌍 Projects with primary: ${primaryCount}/${projects.length}`);
+  lines.push(`🌍 Projects with secondary: ${secondaryCount}/${projects.length}`);
   if (appState.degradedMode) {
     lines.push('Mode: ⚠️ Degraded (config DB unavailable)');
   }
@@ -20669,7 +20818,27 @@ async function handleDatabaseMenuCallback(ctx, data) {
     return;
   }
   if (action === 'open' && projectId) {
-    await renderDatabaseProjectPanel(ctx, projectId);
+    const guard = getDbConsoleGuardStatus();
+    if (!guard.ok) {
+      const refId = buildDbRefId('DBOPEN');
+      await renderOrEdit(ctx, `⚠️ ${guard.message}
+Ref: ${refId}
+Suggested action: configure Config DB and PM_KMS_KEY before adding connections.`, {
+        reply_markup: new InlineKeyboard().text('⬅️ Back', 'dbmenu:list'),
+      });
+      return;
+    }
+    try {
+      await renderDatabaseProjectPanel(ctx, projectId);
+    } catch (error) {
+      const refId = buildDbRefId('DBOPEN');
+      console.warn('[dbmenu] open project panel failed', { projectId, refId, error: error?.message });
+      await renderOrEdit(ctx, `⚠️ Unable to open Project DB.
+Ref: ${refId}
+Suggested action: verify DB connections and try again.` , {
+        reply_markup: new InlineKeyboard().text('⬅️ Back', 'dbmenu:list'),
+      });
+    }
     return;
   }
   if (action === 'sync_all') {
@@ -24581,7 +24750,7 @@ function startHttpServer() {
       if (await handleMiniApiRequest(req, res, url)) {
         return;
       }
-      if (req.method === 'GET' && (url.pathname === MINI_APP_ROUTE || url.pathname === `${MINI_APP_ROUTE}/`)) {
+      if (req.method === 'GET' && (url.pathname === MINI_APP_ROUTE || url.pathname === `${MINI_APP_ROUTE}/` || url.pathname === '/mini/db' || url.pathname === '/mini/db/')) {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(renderMiniAppPage());
         return;
@@ -25094,6 +25263,9 @@ async function startBot() {
   await startOpsScanner();
   console.error('[boot] db warmup started');
   await getCachedSettings(true);
+  await ensureDbHubSchema().catch((error) => {
+    console.warn('[db-hub] schema ensure failed', error?.message || error);
+  });
   if (!LOG_API_ENABLED) {
     try {
       await bot.api.sendMessage(
