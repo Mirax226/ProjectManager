@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { loadJson, saveJson } = require('./configStore');
+const { ingestLog, listLogs, setLogStatus, autoResolveLogs } = require('./src/logsHubStore');
 
 const EVENT_LIMIT = 500;
 const NON_REPORTABLE = new Set(['INVALID_URL', 'ENV_MISCONFIG', 'MISSING_DSN']);
@@ -58,7 +59,7 @@ async function persistOpsState() {
   ]);
 }
 
-async function appendEvent({ level = 'info', source = 'pm', category = 'GENERAL', messageShort = '', meta = null }) {
+async function appendEvent({ level = 'info', source = 'pm', category = 'GENERAL', messageShort = '', messageFull = '', projectId = null, meta = null }) {
   let safeMeta = null;
   if (meta != null) {
     try {
@@ -67,19 +68,17 @@ async function appendEvent({ level = 'info', source = 'pm', category = 'GENERAL'
       safeMeta = { masked: maskSecrets(meta) };
     }
   }
-  const event = {
+  const upserted = await ingestLog({
     id: crypto.randomUUID(),
-    ts: new Date().toISOString(),
     level,
-    source,
     category,
     message_short: String(messageShort || '').slice(0, 800),
-    meta_json: safeMeta,
-  };
-  memory.eventLog.unshift(event);
-  if (memory.eventLog.length > EVENT_LIMIT) memory.eventLog.length = EVENT_LIMIT;
-  await saveJson('ops_event_log', memory.eventLog);
-  return event;
+    message_full: String(messageFull || messageShort || '').slice(0, 4000),
+    meta_json: { ...(safeMeta || {}), source },
+    projectId: projectId || safeMeta?.projectId || safeMeta?.project_id || null,
+  });
+  memory.eventLog = (await listLogs({})).slice(0, EVENT_LIMIT);
+  return upserted.event;
 }
 
 function getDbHealthSnapshot() {
@@ -160,4 +159,7 @@ module.exports = {
   shouldRouteEvent,
   computeDestinations,
   shouldNotifyRecovery,
+  listOpsEvents: listLogs,
+  setOpsEventStatus: setLogStatus,
+  autoResolveOpsEvents: autoResolveLogs,
 };
