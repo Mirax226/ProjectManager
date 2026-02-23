@@ -4,6 +4,7 @@ const { resolveGithubCapability } = require('./githubMapping');
 const rules = [
   require('./rules/nonMenuDeleteButton'),
   require('./rules/genericSomethingWrong'),
+  require('./rules/supabaseFetchFailed'),
   require('./rules/workdirOutsideRepo'),
   require('./rules/cronCreate500'),
   require('./rules/invalidDsn'),
@@ -57,12 +58,20 @@ function detectSignals(text) {
 
 function buildMatchContext(input = {}) {
   const rawText = String(input.rawText || '');
+  const messageText = String(input.message || rawText || '');
+  const stackText = String(input.stack || '');
   const normalizedText = normalizeText(rawText);
+  const normalizedMessage = normalizeText(messageText);
+  const normalizedStack = normalizeText(stackText);
   const refId = input.refId || extractRefId(rawText) || null;
   const category = input.category || null;
   return {
     rawText,
+    messageText,
+    stackText,
     normalizedText,
+    normalizedMessage,
+    normalizedStack,
     refId,
     category,
     signals: detectSignals(normalizedText),

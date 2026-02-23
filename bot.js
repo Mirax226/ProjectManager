@@ -1176,6 +1176,28 @@ async function createCodexTaskAndNotify(ctx, payload) {
   return result;
 }
 
+function trackRoutineOutput(userId, payload) {
+  if (!userId || !payload) return;
+  routineOutputsByUser.set(String(userId), {
+    ...payload,
+    ts: Date.now(),
+  });
+}
+
+function buildRoutineOutputKeyboard(ctx, payload, backCallback) {
+  const copyPayload = encodeRoutinePayload({ task: payload.task });
+  const savePayload = payload.projectId ? encodeRoutinePayload(payload) : null;
+  const inline = new InlineKeyboard();
+  if (copyPayload) {
+    inline.text('📋 Copy Codex Task', `routine:copy:${copyPayload}`).row();
+  }
+  if (savePayload) {
+    inline.text('🧠 Save to Codex Tasks', `routine:save:${savePayload}`).row();
+  }
+  inline.text('⬅️ Back', backCallback || 'gsettings:routine_menu');
+  return inline;
+}
+
 async function renderCodexTasksMenu(ctx, notice, options = {}) {
   await purgeOldDoneCodexTasks();
   const projectId = options.projectId || null;
@@ -1297,6 +1319,8 @@ async function renderRoutineOutput(ctx, rendered, options = {}) {
     ruleId: rendered.ruleId,
     task: rendered.task,
     templateText: rendered.templateText,
+    title: rendered.title,
+    projectId: options.projectId || null,
   };
   trackRoutineOutput(ctx.from?.id, payload);
   const keyboard = buildRoutineOutputKeyboard(ctx, payload, backCallback);
@@ -2409,10 +2433,17 @@ function decodeRoutinePayload(id) {
   return entry.payload || null;
 }
 
-function buildRoutineFixButton(text, category, refId) {
+function buildRoutineFixButton(text, category, refId, extra = {}) {
   const blockedCategories = new Set(['INVALID_URL', 'ENV_MISCONFIG', 'MISSING_DSN']);
   if (blockedCategories.has(String(category || '').toUpperCase())) return null;
-  const payload = encodeRoutinePayload({ text: String(text || '').slice(0, 1200), category: category || null, refId: refId || null });
+  const payload = encodeRoutinePayload({
+    text: String(text || '').slice(0, 1200),
+    message: String(extra.message || text || '').slice(0, 2400),
+    stack: String(extra.stack || '').slice(0, 4000),
+    category: category || null,
+    refId: refId || null,
+    projectId: extra.projectId || null,
+  });
   if (!payload) return null;
   return { text: '🛠 Fix (routine)', callback_data: `routinefix:${payload}` };
 }
@@ -2784,7 +2815,11 @@ async function sendOpsAlertByDestinations(destinations, event, extra = {}) {
   const sends = [];
   const envelope = buildErrorEnvelope(event);
   const text = buildOpsAlertText(event, envelope);
-  const routineButton = buildRoutineFixButton(text, envelope.category, envelope.refId);
+  const routineButton = buildRoutineFixButton(text, envelope.category, envelope.refId, {
+    projectId: event?.meta_json?.projectId || event?.meta_json?.project_id || null,
+    message: event?.message_short || text,
+    stack: event?.meta_json?.stack || event?.meta_json?.errorStack || '',
+  });
   const debugPayload = Buffer.from(JSON.stringify(envelope)).toString('base64url');
   const keyboard = [
     ...(routineButton ? [[routineButton]] : []),
@@ -3362,6 +3397,123 @@ bot.callbackQuery(/ops:recover:(.+)/, wrapCallbackHandler(async (ctx) => {
 }, 'ops_recover_ack'));
 
 
+function buildRoutineFixRefId(payload = {}) {
+  const base = String(payload.refId || '').trim();
+  if (base) return base;
+  return `ROUTINE-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+function formatRoutineFixFailureMessage(details) {
+  const lines = [
+    '⚠️ Routine fix was not applied.',
+    `RefId: ${details.refId}`,
+    `Detected category: ${details.category || 'UNKNOWN'}`,
+    `Reason: ${details.reason}`,
+  ];
+  if (details.nextSteps) lines.push(`Next: ${details.nextSteps}`);
+  return lines.join('\n');
+}
+
+async function logRoutineFixError(meta) {
+  await appendEvent({
+    level: 'error',
+    source: 'routine-fix',
+    category: 'ROUTINE_FIX_ERROR',
+    messageShort: `${meta.reason || 'Routine fix pipeline failure'} (step=${meta.step || 'unknown'})`,
+    meta,
+  });
+}
+
+async function resolveRoutineFixPrerequisite(payload = {}) {
+  const configDbReady = getConfigDbSnapshot().ready;
+  if (!configDbReady) {
+    return { ok: false, reason: 'Config DB not ready; finish Config DB setup and redeploy.', code: 'CONFIG_DB_NOT_READY' };
+  }
+  if (!process.env.PM_KMS_KEY) {
+    return { ok: false, reason: 'PM_KMS_KEY missing; set it then redeploy.', code: 'PM_KMS_KEY_MISSING' };
+  }
+  if (payload.projectId) {
+    const projects = await loadProjects();
+    const project = findProjectById(projects, payload.projectId);
+    if (!project) {
+      return { ok: false, reason: 'Project binding missing; open Project -> Database binding.', code: 'PROJECT_NOT_RESOLVABLE' };
+    }
+  }
+  return { ok: true };
+}
+
+async function maybeSendRoutineFixFromButton(ctx, payloadId) {
+  await ensureAnswerCallback(ctx);
+  const payload = decodeRoutinePayload(payloadId);
+  const refId = buildRoutineFixRefId(payload);
+  const baseCategory = payload?.category || 'UNKNOWN';
+  if (!payload) {
+    const reason = 'Routine payload expired; reopen the alert and tap Fix (routine) again.';
+    await logRoutineFixError({ refId, projectId: null, userId: String(ctx?.from?.id || ''), step: 'decode_payload', errorName: 'RoutinePayloadExpired', errorMessage: reason, reason });
+    await sendDismissibleMessage(ctx, formatRoutineFixFailureMessage({ refId, category: baseCategory, reason, nextSteps: 'Reopen the alert and retry.' }));
+    return;
+  }
+  const detectedCategory = payload.category || 'UNKNOWN';
+  try {
+    const prereq = await resolveRoutineFixPrerequisite(payload);
+    if (!prereq.ok) {
+      await logRoutineFixError({
+        refId,
+        projectId: payload.projectId || null,
+        userId: String(ctx?.from?.id || ''),
+        step: 'prerequisite',
+        errorName: prereq.code,
+        errorMessage: prereq.reason,
+        reason: prereq.reason,
+      });
+      await sendDismissibleMessage(ctx, formatRoutineFixFailureMessage({
+        refId,
+        category: detectedCategory,
+        reason: prereq.reason,
+        nextSteps: 'Fix prerequisite and tap Fix (routine) again.',
+      }));
+      return;
+    }
+
+    const match = matchRoutineFix({
+      rawText: payload.text || payload.message || '',
+      message: payload.message || payload.text || '',
+      stack: payload.stack || '',
+      refId,
+      category: detectedCategory,
+    }, ROUTINE_BUTTON_THRESHOLD);
+
+    if (!match.accepted) {
+      const reason = 'No routine fix available for this incident signature.';
+      await sendDismissibleMessage(ctx, formatRoutineFixFailureMessage({
+        refId,
+        category: detectedCategory,
+        reason,
+        nextSteps: 'Open Diagnostics -> Routine Fixes -> Paste error/log text for manual matching.',
+      }));
+      return;
+    }
+    await renderRoutineOutput(ctx, match.accepted, { backCallback: 'gsettings:routine_menu', projectId: payload.projectId || null });
+  } catch (error) {
+    const reason = String(error?.message || 'internal exception');
+    await logRoutineFixError({
+      refId,
+      projectId: payload.projectId || null,
+      userId: String(ctx?.from?.id || ''),
+      step: 'pipeline',
+      errorName: error?.name || 'Error',
+      errorMessage: reason,
+      reason,
+    });
+    await sendDismissibleMessage(ctx, formatRoutineFixFailureMessage({
+      refId,
+      category: detectedCategory,
+      reason,
+      nextSteps: 'Retry. If it persists, open Diagnostics and copy debug details.',
+    }));
+  }
+}
+
 async function handleRoutineCallback(ctx, data) {
   const parts = String(data || '').split(':');
   const action = parts[1];
@@ -3372,6 +3524,22 @@ async function handleRoutineCallback(ctx, data) {
       return;
     }
     await sendDismissibleMessage(ctx, `\`\`\`text\n${payload.task}\n\`\`\``);
+    await ensureAnswerCallback(ctx);
+    return;
+  }
+  if (action === 'save') {
+    const payload = decodeRoutinePayload(parts[2]);
+    if (!payload?.task) {
+      await ensureAnswerCallback(ctx, { text: 'Expired routine payload', show_alert: true });
+      return;
+    }
+    await createCodexTaskAndNotify(ctx, {
+      title: payload.title || 'Routine fix Codex task',
+      body: payload.task,
+      projectId: payload.projectId || null,
+      sourceType: 'routine_fix',
+      sourceRef: payload.ruleId || null,
+    });
     await ensureAnswerCallback(ctx);
   }
 }
