@@ -201,6 +201,7 @@ const { createMigrationJob, getMigrationJob, updateMigrationJob } = require('./s
 const { validatePostgresDsn, maskPostgresDsn, fingerprintPostgresDsn } = require('./src/db/dsn');
 const { createOpsTimelineStore } = require('./src/opsTimeline');
 const { createSafeModeController } = require('./src/safeMode');
+const { runDeploy } = require('./src/deploy/workflow');
 const { buildProjectSnapshot, calculateDrift, calculateDbDrift } = require('./src/driftDetector');
 const { generateRunbooksFromRoutineRules, searchRunbooks } = require('./src/runbooks');
 const { planRiskyOperation } = require('./src/shadowRuns');
@@ -13275,17 +13276,26 @@ async function triggerRenderDeploy(ctx, projectId) {
     await ctx.reply('No deploy hook URL configured for this project.');
     return;
   }
-  const start = Date.now();
-  try {
-    const response = await requestUrl('POST', project.renderDeployHookUrl);
-    const durationMs = Date.now() - start;
-    const bodySnippet = response.body ? response.body.slice(0, 200) : '';
-    const details = bodySnippet ? `\nBody: ${bodySnippet}` : '';
-    await ctx.reply(`Render deploy hook: HTTP ${response.status} in ~${durationMs} ms${details}`);
-  } catch (error) {
-    await ctx.reply(`Render deploy hook failed: ${error.message}`);
+  const result = await runDeploy({
+    project: {
+      id: project.id,
+      deployHookUrl: project.renderDeployHookUrl,
+      renderServiceUrl: project.renderServiceUrl || null,
+    },
+    trigger: 'manual',
+    timeline: opsTimeline,
+    deps: { requestUrl },
+  });
+  if (result.ok) {
+    await ctx.reply(`✅ Deploy live. RefId: ${result.deploy.refId}`);
+    return;
   }
+  const reason = result.deploy?.error_short || 'Deploy failed';
+  await ctx.reply(`❌ Deploy failed. RefId: ${result.deploy?.refId || '-'}
+Next: Open Deploy Hub details, run Verify health, then Fix (routine).
+Reason: ${reason}`);
 }
+
 
 async function getProjectById(projectId, ctx) {
   const projects = await loadProjects();
