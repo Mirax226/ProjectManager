@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { respond } = require('../bot');
+const { respond, __test } = require('../bot');
 
 test('respond edits message for callback queries', async () => {
   let edited = false;
@@ -38,4 +38,12 @@ test('respond replies in message context', async () => {
   await respond(ctx, 'hi', {});
 
   assert.equal(replied, true);
+});
+
+test('ephemeral guard phrases are forced even with inline keyboard unless overridden', () => {
+  const inline = { reply_markup: { inline_keyboard: [[{ text: 'x', callback_data: 'x' }]] } };
+  assert.equal(__test.shouldUseEphemeralForRespond('Completed (100%)', inline), true);
+  assert.equal(__test.shouldUseEphemeralForRespond('Failed at step build', inline), true);
+  assert.equal(__test.shouldUseEphemeralForRespond('Reason: network', inline), true);
+  assert.equal(__test.shouldUseEphemeralForRespond('Completed (100%)', { ...inline, forcePersistent: true }), false);
 });

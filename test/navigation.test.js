@@ -225,7 +225,7 @@ test('delete callback deletes exact targeted message and answers callback first'
       },
     },
   };
-  const result = await __test.handleDeleteMessageCallback(ctx, 'msg:delete:123:456');
+  const result = await __test.handleDeleteMessageCallback(ctx, 'delete_msg:123:456');
   assert.equal(calls.answer, 1);
   assert.deepEqual(calls.deleteMessage, [[123, 456]]);
   assert.equal(result.ok, true);
@@ -243,7 +243,7 @@ test('delete callback treats not-found as success', async () => {
       },
     },
   };
-  const result = await __test.handleDeleteMessageCallback(ctx, 'msg:delete:123:456');
+  const result = await __test.handleDeleteMessageCallback(ctx, 'delete_msg:123:456');
   assert.equal(result.ok, true);
   assert.equal(result.mode, 'already_deleted');
 });

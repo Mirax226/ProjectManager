@@ -850,6 +850,12 @@ async function respond(ctx, text, extra) {
       console.error('[UI] editMessageText failed, fallback to reply', err);
     }
   }
+  if (shouldUseEphemeralForRespond(text, safeExtra)) {
+    return sendEphemeral(ctx, text, {
+      extra: safeExtra,
+      includeDelete: true,
+    });
+  }
   const response = await replySafely(ctx, text, safeExtra);
   return response;
 }
@@ -1052,36 +1058,42 @@ async function clearEphemeralMessages(ctx, reason) {
 }
 
 async function sendEphemeralMessage(ctx, text, extra) {
-  const settings = await getCachedSettings();
-  const cleanup = normalizeUiCleanupSettings(settings);
-  const response = await replySafely(ctx, text, extra);
-  if (response?.chat?.id && response?.message_id) {
-    const chatId = response.chat.id;
-    const messageId = response.message_id;
-    trackEphemeralMessage(chatId, messageId);
-    if (cleanup.ephemeralTtlSec > 0) {
-      if (!ephemeralTimersByChat.has(chatId)) {
-        ephemeralTimersByChat.set(chatId, new Map());
-      }
-      const timer = setTimeout(() => {
-        safeDeleteMessage(ctx, chatId, messageId, 'ephemeral_ttl');
-        const set = ephemeralMessageIdsByChat.get(chatId);
-        if (set) {
-          set.delete(messageId);
-        }
-        clearEphemeralTimer(chatId, messageId);
-      }, cleanup.ephemeralTtlSec * 1000);
-      ephemeralTimersByChat.get(chatId).set(messageId, timer);
-    }
-  }
-  return response;
+  return sendEphemeral(ctx, text, { extra, includeDelete: true });
 }
 
-async function sendTransientNotice(ctx, text, options = {}) {
-  const ttlSec = Number.isFinite(options.ttlSec) ? Number(options.ttlSec) : 10;
+function shouldForceEphemeralByText(text) {
+  const normalized = String(text || '');
+  return (
+    normalized.includes('Completed (')
+    || normalized.includes('Failed at step')
+    || normalized.includes('Reason:')
+  );
+}
+
+function shouldUseEphemeralForRespond(text, extra) {
+  if (extra?.ephemeral === false || extra?.forcePersistent === true) return false;
+  if (extra?.ephemeral === true) return true;
+  const hasInlineKeyboard = Boolean(extra?.reply_markup?.inline_keyboard);
+  if (!hasInlineKeyboard) return true;
+  return shouldForceEphemeralByText(text);
+}
+
+function sanitizeEphemeralSendExtra(extra) {
+  if (!extra || typeof extra !== 'object') return extra;
+  const next = { ...extra };
+  delete next.ephemeral;
+  delete next.forcePersistent;
+  return next;
+}
+
+async function sendEphemeral(ctx, text, options = {}) {
+  const ttlSecFromOptions = Number(options.ttlSec);
+  const ttlSec = Number.isFinite(ttlSecFromOptions)
+    ? Math.max(0, ttlSecFromOptions)
+    : 10;
   const deleteButton = options.includeDelete !== false && options.deleteButton !== false;
   const extraMarkup = sanitizeReplyMarkup(options.extraMarkup || options.reply_markup);
-  const extra = { ...(options.extra || {}) };
+  const extra = sanitizeEphemeralSendExtra({ ...(options.extra || {}) });
   if (options.disable_web_page_preview != null) {
     extra.disable_web_page_preview = options.disable_web_page_preview;
   }
@@ -1101,7 +1113,7 @@ async function sendTransientNotice(ctx, text, options = {}) {
         ephemeralTimersByChat.set(response.chat.id, new Map());
       }
       const timer = setTimeout(() => {
-        safeDeleteMessage(ctx, response.chat.id, response.message_id, 'transient_ttl');
+        safeDeleteMessage(ctx, response.chat.id, response.message_id, 'ephemeral_ttl');
         const set = ephemeralMessageIdsByChat.get(response.chat.id);
         if (set) set.delete(response.message_id);
         clearEphemeralTimer(response.chat.id, response.message_id);
@@ -1125,6 +1137,10 @@ async function sendTransientNotice(ctx, text, options = {}) {
     }
   }
   return response;
+}
+
+async function sendTransientNotice(ctx, text, options = {}) {
+  return sendEphemeral(ctx, text, options);
 }
 
 async function sendDismissibleMessage(ctx, text, extra = {}) {
@@ -1334,7 +1350,10 @@ function summarizeRoutineCandidates(matches) {
 
 async function handleDeleteMessageCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
-  const parts = String(data).split(':');
+  const normalizedData = String(data || '')
+    .replace(/^msgdel:/, 'msg:delete:')
+    .replace(/^delete_msg:/, 'msg:delete:');
+  const parts = normalizedData.split(':');
   let ownerId = null;
   let chatId = null;
   let messageId = null;
@@ -2408,7 +2427,7 @@ function withDeleteButton(replyMarkup, options = {}) {
     : [];
   const hasDelete = existingRows.some((row) => Array.isArray(row) && row.some((button) => button?.text === '🗑 Delete'));
   if (!hasDelete) {
-    existingRows.push([{ text: '🗑 Delete', callback_data: 'msg:delete:pending' }]);
+    existingRows.push([{ text: '🗑 Delete', callback_data: 'delete_msg:pending' }]);
   }
   return { inline_keyboard: existingRows };
 }
@@ -2473,9 +2492,9 @@ function buildDeleteButton(ctx, target) {
   const chatId = Number(resolvedTarget?.chatId);
   const messageId = Number(resolvedTarget?.messageId);
   if (!chatId || !messageId) {
-    return { text: '🗑 Delete', callback_data: 'msg:delete:pending' };
+    return { text: '🗑 Delete', callback_data: 'delete_msg:pending' };
   }
-  return { text: '🗑 Delete', callback_data: `msg:delete:${chatId}:${messageId}` };
+  return { text: '🗑 Delete', callback_data: `delete_msg:${chatId}:${messageId}` };
 }
 
 function isDeleteMessageNotFoundError(error) {
@@ -3555,8 +3574,8 @@ async function dispatchCallbackData(ctx, data, options = {}) {
     await goHome(ctx);
     return;
   }
-  if (callbackData.startsWith('msg:delete:') || callbackData.startsWith('msgdel:')) {
-    await handleDeleteMessageCallback(ctx, callbackData.replace(/^msgdel:/, 'msg:delete:'));
+  if (callbackData.startsWith('msg:delete:') || callbackData.startsWith('msgdel:') || callbackData.startsWith('delete_msg:')) {
+    await handleDeleteMessageCallback(ctx, callbackData);
     return;
   }
   if (callbackData.startsWith('routine:')) {
@@ -26031,6 +26050,7 @@ module.exports = {
     dispatchCallbackData,
     buildCronJobKey,
     dedupeCronJobsByJobKey,
+    shouldUseEphemeralForRespond,
   },
 };
 
