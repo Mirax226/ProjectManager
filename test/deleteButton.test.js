@@ -21,7 +21,7 @@ function createCtx(userId = 10) {
 
 test('delete button returns invalid target for malformed payload', async () => {
   const { ctx, calls } = createCtx(11);
-  const result = await __test.handleDeleteMessageCallback(ctx, 'msg:delete:pending');
+  const result = await __test.handleDeleteMessageCallback(ctx, 'delete_msg:pending');
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'invalid_target');
   assert.equal(calls.deleteMessage.length, 0);
@@ -29,7 +29,7 @@ test('delete button returns invalid target for malformed payload', async () => {
 
 test('delete button deletes target message', async () => {
   const { ctx, calls } = createCtx(10);
-  const result = await __test.handleDeleteMessageCallback(ctx, 'msg:delete:1:100');
+  const result = await __test.handleDeleteMessageCallback(ctx, 'delete_msg:1:100');
   assert.equal(result.ok, true);
   assert.equal(result.mode, 'deleted');
   assert.deepEqual(calls.deleteMessage[0], [1, 100]);
@@ -40,7 +40,7 @@ test('delete button treats not found as success', async () => {
   ctx.telegram.deleteMessage = async () => {
     throw new Error('Bad Request: message to delete not found');
   };
-  const result = await __test.handleDeleteMessageCallback(ctx, 'msg:delete:1:100');
+  const result = await __test.handleDeleteMessageCallback(ctx, 'delete_msg:1:100');
   assert.equal(result.ok, true);
   assert.equal(result.mode, 'already_deleted');
   assert.equal(calls.answer.length, 1);
