@@ -7,7 +7,7 @@ const SETTINGS_FILE = path.join(__dirname, 'globalSettings.json');
 const ENV_DEFAULT_BASE = process.env.DEFAULT_BASE_BRANCH || 'main';
 const DEFAULT_CRON_PROVIDER = process.env.CRON_PROVIDER
   || ((process.env.CRON_API_TOKEN || process.env.CRON_API_KEY || process.env.CRONJOB_API_KEY) ? 'cronjob_org' : 'none');
-const DEFAULT_CRON_SETTINGS = { enabled: true, defaultTimezone: 'UTC', provider: DEFAULT_CRON_PROVIDER };
+const DEFAULT_CRON_SETTINGS = { enabled: true, defaultTimezone: 'UTC', provider: DEFAULT_CRON_PROVIDER, defaultKeepaliveIntervalMinutes: 5, defaultRetryPolicy: 'bounded', defaultTimeoutMs: 8000 };
 const DEFAULT_GLOBAL_SETTINGS = {
   defaultBaseBranch: ENV_DEFAULT_BASE,
   defaultProjectId: undefined,
@@ -162,6 +162,9 @@ async function loadCronSettings() {
     provider: ['cronjob_org', 'none', 'local'].includes(String(settings.provider || '').toLowerCase())
       ? (String(settings.provider || '').toLowerCase() === 'local' ? 'none' : String(settings.provider || '').toLowerCase())
       : DEFAULT_CRON_SETTINGS.provider,
+    defaultKeepaliveIntervalMinutes: Number(settings.defaultKeepaliveIntervalMinutes) || DEFAULT_CRON_SETTINGS.defaultKeepaliveIntervalMinutes,
+    defaultRetryPolicy: settings.defaultRetryPolicy || DEFAULT_CRON_SETTINGS.defaultRetryPolicy,
+    defaultTimeoutMs: Number(settings.defaultTimeoutMs) || DEFAULT_CRON_SETTINGS.defaultTimeoutMs,
   };
 }
 
@@ -172,6 +175,9 @@ async function saveCronSettings(settings) {
     provider: ['cronjob_org', 'none', 'local'].includes(String(settings?.provider || '').toLowerCase())
       ? (String(settings.provider || '').toLowerCase() === 'local' ? 'none' : String(settings.provider || '').toLowerCase())
       : DEFAULT_CRON_SETTINGS.provider,
+    defaultKeepaliveIntervalMinutes: Number(settings?.defaultKeepaliveIntervalMinutes) || DEFAULT_CRON_SETTINGS.defaultKeepaliveIntervalMinutes,
+    defaultRetryPolicy: settings?.defaultRetryPolicy || DEFAULT_CRON_SETTINGS.defaultRetryPolicy,
+    defaultTimeoutMs: Number(settings?.defaultTimeoutMs) || DEFAULT_CRON_SETTINGS.defaultTimeoutMs,
   };
   try {
     await configStore.saveJson('cronSettings', payload);

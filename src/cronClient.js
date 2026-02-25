@@ -1,162 +1,56 @@
-const fetch = require('node-fetch');
-const { createPmLogger, createPmFetch } = require('./pmLogger');
+const { loadCronSettings } = require('../settingsStore');
+const { resolveCronProvider } = require('./cronProviders');
+
+async function getActiveProvider() {
+  const settings = await loadCronSettings();
+  const providerName = settings?.provider || 'none';
+  return resolveCronProvider(providerName);
+}
+
+function normalizeNotFound(error) {
+  if (error?.status === 404) {
+    throw new Error('Cron job not found or invalid request');
+  }
+  throw error;
+}
 
 const CRON_API_TOKEN =
   process.env.CRON_API_TOKEN || process.env.CRON_API_KEY || process.env.CRONJOB_API_KEY;
 const CRON_API_BASE = process.env.CRONJOB_API_BASE || 'https://api.cron-job.org';
-const pmLogger = createPmLogger();
-const pmFetch = createPmFetch(fetch, pmLogger);
-
-function assertCronApiKey() {
-  if (!CRON_API_TOKEN) {
-    throw new Error('CRON_API_TOKEN not configured');
-  }
-}
-
-function buildCronError({ method, path, status, body, message }) {
-  const summary = message || `Cron API ${method} ${path} failed`;
-  const error = new Error(summary);
-  error.status = status;
-  error.body = body;
-  error.method = method;
-  error.path = path;
-  return error;
-}
 
 async function callCronApi(method, path, body) {
-  assertCronApiKey();
-  const url = `${CRON_API_BASE}${path}`;
-  const requestBody = body ?? null;
-  const options = {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${CRON_API_TOKEN}`,
-    },
-  };
-  if (body) {
-    const payload = ['POST', 'PUT', 'PATCH'].includes(method) ? { job: body } : body;
-    options.body = JSON.stringify(payload);
+  const provider = await getActiveProvider();
+  if (typeof provider.callCronApi !== 'function') {
+    throw new Error('Active provider does not support raw API calls');
   }
-
-  let response;
-  let text = '';
-  try {
-    response = await pmFetch(url, options);
-    text = await response.text();
-  } catch (error) {
-    console.error('[cronClient] Network error', { method, path, error: error.message });
-    throw buildCronError({
-      method,
-      path,
-      message: `Cron API ${method} ${path} failed: ${error.message}`,
-    });
-  }
-
-  if (!response.ok) {
-    const excerpt = text ? text.slice(0, 200) : '';
-    console.error('[cronClient] Cron API error', {
-      method,
-      path,
-      status: response.status,
-      body: requestBody,
-      responseText: text,
-    });
-    if (response.status === 429) {
-      throw buildCronError({
-        method,
-        path,
-        status: response.status,
-        body: text,
-        message: 'Cron API rate limited (429)',
-      });
-    }
-    const message = `Cron API ${method} ${path} failed (${response.status}): ${
-      excerpt || 'request failed'
-    }`;
-    throw buildCronError({
-      method,
-      path,
-      status: response.status,
-      body: text,
-      message,
-    });
-  }
-
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch (error) {
-    console.error('[cronClient] Failed to parse response JSON', {
-      method,
-      path,
-      error: error.message,
-    });
-    throw buildCronError({
-      method,
-      path,
-      status: response.status,
-      body: text,
-      message: `Cron API ${method} ${path} returned invalid JSON.`,
-    });
-  }
+  return provider.callCronApi(method, path, body);
 }
 
 async function listJobs() {
-  try {
-    const data = await callCronApi('GET', '/jobs');
-    return {
-      jobs: Array.isArray(data?.jobs) ? data.jobs : [],
-      someFailed: data?.someFailed === true,
-    };
-  } catch (error) {
-    throw error;
-  }
+  const provider = await getActiveProvider();
+  return provider.listJobs();
 }
 
 async function getJob(jobId) {
+  const provider = await getActiveProvider();
   try {
-    const data = await callCronApi('GET', `/jobs/${jobId}`);
-    return data?.jobDetails || data?.job || data;
+    return await provider.getJob(jobId);
   } catch (error) {
-    if (error?.status === 404) {
-      throw new Error('Cron job not found or invalid request');
-    }
-    throw error;
+    normalizeNotFound(error);
   }
 }
 
 async function createJob(payload) {
-  const attempts = [
-    { method: 'POST', path: '/jobs' },
-    { method: 'PUT', path: '/jobs' },
-  ];
-  let lastError = null;
-  for (let index = 0; index < attempts.length; index += 1) {
-    const attempt = attempts[index];
-    try {
-      const data = await callCronApi(attempt.method, attempt.path, payload);
-      const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
-      return { id: id != null ? String(id) : null };
-    } catch (error) {
-      lastError = error;
-      const canFallback = index < attempts.length - 1 && (error?.status === 404 || error?.status === 405);
-      if (!canFallback) {
-        throw error;
-      }
-    }
-  }
-  throw lastError;
+  const provider = await getActiveProvider();
+  return provider.createJob(payload);
 }
 
 async function updateJob(jobId, patch) {
+  const provider = await getActiveProvider();
   try {
-    await callCronApi('PATCH', `/jobs/${jobId}`, patch);
+    return await provider.updateJob(jobId, patch);
   } catch (error) {
-    if (error?.status === 404) {
-      throw new Error('Cron job not found or invalid request');
-    }
-    throw error;
+    normalizeNotFound(error);
   }
 }
 
@@ -165,14 +59,17 @@ async function toggleJob(jobId, enabled) {
 }
 
 async function deleteJob(jobId) {
+  const provider = await getActiveProvider();
   try {
-    await callCronApi('DELETE', `/jobs/${jobId}`);
+    return await provider.deleteJob(jobId);
   } catch (error) {
-    if (error?.status === 404) {
-      throw new Error('Cron job not found or invalid request');
-    }
-    throw error;
+    normalizeNotFound(error);
   }
+}
+
+async function pingProvider() {
+  const provider = await getActiveProvider();
+  return provider.ping();
 }
 
 module.exports = {
@@ -185,4 +82,5 @@ module.exports = {
   updateJob,
   toggleJob,
   deleteJob,
+  pingProvider,
 };

@@ -129,6 +129,7 @@ const {
   listCronJobLinks,
   getCronJobLink,
   getCronJobLinkByJobKey,
+  listCronJobLinksByFingerprint,
   upsertCronJobLink,
   renameCronJobLinkProjectId,
 } = require('./cronJobLinksStore');
@@ -225,6 +226,7 @@ const {
   toggleJob,
   deleteJob,
 } = require('./src/cronClient');
+const { buildCronFingerprint, buildCronDisplayName } = require('./src/cronDomain');
 const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbackData');
 const { paginateRepos, mapRepoButton, listAllGithubRepos } = require('./src/repoPicker');
 const { createPmLogger } = require('./src/pmLogger');
@@ -1733,7 +1735,7 @@ function shouldEmitCronErrorSignature(signature, windowMs = 60 * 1000) {
   return true;
 }
 
-function logCronApiError({ operation, error, userId, projectId, correlationId, jobId = null }) {
+function logCronApiError({ operation, error, userId, projectId, correlationId, jobId = null, displayName = null }) {
   const responseBody = truncateText(error?.body ?? '', 500);
   const message = normalizeCronErrorMessage(error);
   console.error('[cron] API error', {
@@ -1746,6 +1748,7 @@ function logCronApiError({ operation, error, userId, projectId, correlationId, j
     userId,
     projectId,
     jobId,
+    displayName,
   });
   const signature = [operation, error?.method || '-', error?.path || '-', error?.status || '-', message].join('|');
   if (!shouldEmitCronErrorSignature(signature)) {
@@ -1762,6 +1765,7 @@ function logCronApiError({ operation, error, userId, projectId, correlationId, j
     projectId: projectId || null,
     jobId: jobId || null,
     userId: userId || null,
+    displayName: displayName || null,
   }).catch((emitError) => {
     console.warn('[cron] failed to emit CRON_ERROR event', emitError?.message);
   });
@@ -2382,7 +2386,7 @@ function buildMainMenuInlineKeyboard() {
     .text('📦 Projects', 'main:projects')
     .text('🗄 Database Hub', 'main:database')
     .row()
-    .text('⏱ Cron Jobs', 'main:cronjobs')
+    .text('⏱ Cron Hub', 'main:cronjobs')
     .text('🚀 Deployments', 'main:deploy')
     .row()
     .text('🧾 Logs', 'main:logs')
@@ -3245,7 +3249,7 @@ bot.hears('⚙️ Settings', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'settings');
 });
 
-bot.hears('⏱ Cron Jobs', async (ctx) => {
+bot.hears('⏱ Cron Hub', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, 'cronjobs');
 });
 
@@ -5242,7 +5246,7 @@ async function handleCronCallback(ctx, data) {
         const response = await fetchCronJobs();
         const rawJobs = (response.jobs || []).filter((job) => job?.url);
         const deduped = dedupeCronJobsByJobKey(rawJobs, new Map(), []);
-        const jobs = deduped.slice(0, 5);
+        const jobs = deduped;
         if (!jobs.length) {
           await sendTransientMessage(ctx, 'No cron jobs with target URL found.');
           break;
@@ -5251,9 +5255,9 @@ async function handleCronCallback(ctx, data) {
         for (const job of jobs) {
           const result = await runCronTargetReachabilityTest(job.url);
           const displayName = getCronJobDisplayName(job);
-          results.push(`${displayName} · status ${result.status != null ? result.status : '-'} · latency ${result.latencyMs}ms · ${result.category}`);
+          results.push(`${result.ok ? '✅' : '❌'} ${displayName} · status ${result.status != null ? result.status : '-'} · latency ${result.latencyMs}ms · ${new Date().toISOString()}`);
         }
-        await sendTransientMessage(ctx, `🧪 Cron test (first ${jobs.length} job(s))\n${results.join('\n')}`);
+        await sendTransientMessage(ctx, `🧪 Cron test (global, ${jobs.length} job(s))\n${results.join('\n')}`);
       } catch (error) {
         const correlationId = buildCronCorrelationId();
         logCronApiError({ operation: 'test', error, userId: ctx.from?.id, projectId: null, correlationId });
@@ -5287,7 +5291,7 @@ async function handleCronCallback(ctx, data) {
       const inline = new InlineKeyboard()
         .text('✅ Yes, delete', `cron:delete_confirm:${jobId}`)
         .text('⬅️ No', `cron:job:${jobId}`);
-      await renderOrEdit(ctx, `Delete cron job #${jobId}?`, { reply_markup: inline });
+      await renderOrEdit(ctx, `Delete this cron job?`, { reply_markup: inline });
       break;
     }
     case 'cleanup_duplicates': {
@@ -6053,6 +6057,27 @@ async function handleProjectCronCallback(ctx, data) {
       await unlinkProjectCronJob(ctx, projectId, extra);
       break;
 
+    case 'test_all': {
+      const projects = await loadProjects();
+      const project = findProjectById(projects, projectId);
+      const jobIds = [project?.cronKeepAliveJobId, project?.cronDeployHookJobId].filter(Boolean);
+      if (!jobIds.length) {
+        await sendTransientMessage(ctx, 'No project cron jobs linked.');
+        break;
+      }
+      for (const jobId of jobIds) {
+        try {
+          const job = await fetchCronJob(jobId);
+          if (job?.url) {
+            await renderCronTargetTestResult(ctx, jobId, job.url, `projcron:menu:${projectId}`);
+          }
+        } catch (error) {
+          const correlationId = buildCronCorrelationId();
+          logCronApiError({ operation: 'test', error, userId: ctx.from?.id, projectId, correlationId, jobId });
+        }
+      }
+      break;
+    }
     case 'test': {
       const type = extra;
       const projects = await loadProjects();
@@ -7802,6 +7827,8 @@ function getCronJobTitle(job) {
 }
 
 function getCronJobDisplayName(job) {
+  const displayName = job?.displayName || job?.display_name || null;
+  if (displayName) return displayName;
   const title = getCronJobTitle(job);
   return title ? title : '(unnamed)';
 }
@@ -8076,23 +8103,28 @@ function dedupeCronJobsByJobKey(jobs, linksMap, projects) {
     const link = linksMap.get(String(job.id));
     const projectId = resolveCronProjectId(job, link, projects);
     const inferredType = (job.name || '').includes(':deploy') ? 'deploy' : 'keepalive';
-    const jobKey = link?.jobKey
-      || parseJobKeyFromTitle(job.name)
-      || buildCronJobKey({
-        projectId,
-        type: inferredType,
-        targetUrl: job.url,
-        schedule: normalizeCronJobSchedule(job),
-      });
+    const scheduleNormalized = normalizeCronJobSchedule(job);
+    const fallbackFingerprint = buildCronFingerprint({
+      projectId,
+      type: inferredType,
+      schedule: scheduleNormalized,
+      targetUrl: job.url,
+      provider: link?.provider || 'cronjob_org',
+      headers: {},
+      body: {},
+    });
+    const fingerprint = link?.fingerprint || fallbackFingerprint;
     const enriched = {
       ...job,
-      jobKey,
+      jobKey: link?.jobKey || parseJobKeyFromTitle(job.name),
+      fingerprint,
       duplicatesDetected: false,
+      duplicateCount: 1,
       lastUpdatedAt: link?.lastUpdatedAt || null,
+      displayName: link?.displayName || job.displayName || null,
     };
-    const key = jobKey || `__id__:${job.id}`;
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push(enriched);
+    if (!grouped.has(fingerprint)) grouped.set(fingerprint, []);
+    grouped.get(fingerprint).push(enriched);
   }
   const deduped = [];
   for (const items of grouped.values()) {
@@ -8106,6 +8138,7 @@ function dedupeCronJobsByJobKey(jobs, linksMap, projects) {
   }
   return deduped;
 }
+
 
 function cronJobLooksLikeType(job, type) {
   const lower = String(job?.name || '').toLowerCase();
@@ -8783,14 +8816,14 @@ async function renderCronMenu(ctx) {
 
   const duplicatesHidden = Math.max(0, jobs.length - dedupedJobs.length);
   const lines = [
-    '⏱ Cron Jobs',
+    '⏱ Cron Hub',
     buildScopedHeader('GLOBAL', 'Main → Cron Jobs'),
-    `Total jobs (unique): ${dedupedJobs.length || jobs.length}`,
+    `Total jobs: unique=${dedupedJobs.length || jobs.length} raw=${jobs.length}`,
     duplicatesHidden > 0 ? `Duplicates hidden: ${duplicatesHidden}` : null,
     'Global cron defaults apply to keepalive schedule when a project has no keepalive schedule.',
   ].filter(Boolean);
   const inline = new InlineKeyboard()
-    .text('📋 List jobs', 'cron:list')
+    .text('📋 Jobs (Global)', 'cron:list')
     .row()
     .text('➕ Create job', 'cron:create')
     .row()
@@ -8799,13 +8832,13 @@ async function renderCronMenu(ctx) {
     .text('⏸ Pause all', 'cron:pause_all')
     .text('▶️ Resume all', 'cron:resume_all')
     .row()
-    .text('⚙️ Keepalive defaults', 'gsettings:defaults')
+    .text('⚙️ Defaults', 'gsettings:defaults')
     .row()
-    .text('🧹 Show “Other” only', 'cronlink:other')
+    .text('🧾 Errors', 'ops:timeline')
     .row()
     .text('🔎 Filter by project', 'cronlink:filter_menu')
     .row()
-    .text('🧪 Test all jobs', 'cron:test_all')
+    .text('🧪 Test (Global)', 'cron:test_all')
     .row()
     .text('⬅️ Back', 'main:back');
 
@@ -8862,7 +8895,7 @@ async function renderCronJobList(ctx, options = {}) {
 
   const lines = [
     'Cron jobs:',
-    `Total jobs (unique): ${deduped.length}`,
+    `Total jobs: totalUnique=${deduped.length} totalRaw=${jobs.length}`,
     duplicatesHidden > 0 ? `Duplicates hidden: ${duplicatesHidden}` : null,
   ].filter(Boolean);
   if (!grouped.length) {
@@ -8871,7 +8904,7 @@ async function renderCronJobList(ctx, options = {}) {
   grouped.forEach((group) => {
     group.jobs.forEach((job) => {
       const schedule = describeCronSchedule(job);
-      const duplicateNote = job.duplicatesDetected ? ` (deduped${job.duplicateCount ? `, ${job.duplicateCount}x` : ''})` : '';
+      const duplicateNote = job.duplicatesDetected ? ` (x${job.duplicateCount || 2} duplicates detected)` : '';
       lines.push(
         `[${group.label}] — ${getCronJobDisplayName(job)} — ${job.enabled ? 'Enabled' : 'Disabled'} — ${schedule}${duplicateNote}`,
       );
@@ -9150,21 +9183,20 @@ async function runCronTargetReachabilityTest(url) {
 
 async function renderCronTargetTestResult(ctx, jobId, url, backCallback = `cron:job:${jobId}`) {
   const result = await runCronTargetReachabilityTest(url);
-  let jobLabel = String(jobId);
+  let jobLabel = 'Unknown cron job';
   try {
     const job = await fetchCronJob(jobId);
     jobLabel = getCronJobDisplayName(job);
   } catch (_error) {
-    jobLabel = `Job ${jobId}`;
+    jobLabel = 'Unknown cron job';
   }
   const lines = [
-    '🧪 Cron target reachability test',
+    `${result.ok ? '✅' : '❌'} Cron test result`,
     `Job: ${jobLabel}`,
-    `URL: ${url}`,
-    `Category: ${result.category}`,
     `Status code: ${result.status != null ? result.status : '-'}`,
     `Latency: ${result.latencyMs}ms`,
-    `Body (first 200 chars): ${result.snippet || '-'}`,
+    `When: ${new Date().toISOString()}`,
+    `Response: ${result.snippet || '-'}`,
   ];
   await sendTransientNotice(ctx, lines.join('\n'), {
     ttlSec: 10,
@@ -9226,7 +9258,6 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
     `Title: ${getCronJobDisplayName(job)}`,
     `Project: ${projectLabel}`,
     `Enabled: ${job?.enabled ? 'Yes' : 'No'}`,
-    `URL: ${url}`,
     'Schedule:',
     ...scheduleDetails,
     `Schedule summary: ${schedule}`,
@@ -9588,9 +9619,22 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
   }
   const targetNormalized = normalizeCronJobTarget(targetUrl);
   const jobKey = buildCronJobKey({ projectId: project.id, type, targetUrl, schedule: scheduleNormalized });
-  const jobName = isKeepAlive
-    ? `PM:${jobKey} path-applier:${project.id}:keep-alive`
-    : `PM:${jobKey} path-applier:${project.id}:deploy`;
+  const displayName = buildCronDisplayName({
+    projectName: project.name || project.id,
+    type,
+    schedule: scheduleNormalized,
+    projectId: project.id,
+  });
+  const fingerprint = buildCronFingerprint({
+    projectId: project.id,
+    type,
+    schedule: scheduleNormalized,
+    targetUrl,
+    provider: cronSettings.provider,
+    headers: {},
+    body: {},
+  });
+  const jobName = `${displayName} PM:${jobKey}`;
 
   const urlValidation = validateCronUrlInput(targetUrl);
   if (!urlValidation.valid) {
@@ -9608,8 +9652,19 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
 
   try {
     let providerJobId = null;
+    const existingByFingerprint = await listCronJobLinksByFingerprint(fingerprint);
+    const existingActive = existingByFingerprint.find((item) => item.providerJobId);
+    if (existingActive?.providerJobId && !recreate) {
+      await sendTransientMessage(ctx, `Already exists: ${displayName}`);
+      await renderProjectCronBindings(ctx, project.id);
+      return;
+    }
+    if (existingActive?.providerJobId) {
+      providerJobId = String(existingActive.providerJobId);
+    }
+
     const existingByKey = await getCronJobLinkByJobKey(jobKey);
-    if (existingByKey?.providerJobId) {
+    if (!providerJobId && existingByKey?.providerJobId) {
       providerJobId = String(existingByKey.providerJobId);
     }
 
@@ -9649,10 +9704,13 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
       enabled: true,
       scheduleNormalized,
       targetNormalized,
+      fingerprint,
+      provider: cronSettings.provider,
+      displayName,
       lastUpdatedAt: new Date().toISOString(),
     });
     clearUserState(ctx.from.id);
-    await sendTransientMessage(ctx, `Cron job saved. ID: ${providerJobId}`);
+    await sendTransientMessage(ctx, `Cron job saved: ${displayName}`);
     await renderProjectCronBindings(ctx, project.id);
   } catch (error) {
     const correlationId = buildCronCorrelationId();
@@ -13670,7 +13728,7 @@ async function buildProjectOverviewView(project, globalSettings, notice) {
     .text('🌐 Repository', `proj:repo_menu:${project.id}`)
     .text('🗄 Database', `dbmenu:open:${project.id}`)
     .row()
-    .text('⏱ Cron Jobs', `projcron:menu:${project.id}`)
+    .text('⏱ Cron Hub', `projcron:menu:${project.id}`)
     .text('🚀 Deploy', `deploy:open:${project.id}`)
     .row()
     .text('🧾 Logs', `logmenu:open:${project.id}`)
@@ -13701,7 +13759,7 @@ function buildProjectHubView(project, notice) {
     .text('🌐 Repository', `proj:repo_menu:${project.id}`)
     .text('🗄 Database', `dbmenu:open:${project.id}`)
     .row()
-    .text('⏱ Cron Jobs', `projcron:menu:${project.id}`)
+    .text('⏱ Cron Hub', `projcron:menu:${project.id}`)
     .text('🚀 Deploy', `deploy:open:${project.id}`)
     .row()
     .text('🧾 Logs', `logmenu:open:${project.id}`)
@@ -20496,8 +20554,8 @@ async function renderProjectCronBindings(ctx, projectId) {
   const levels = getCronNotificationLevels(project).join(' / ');
   const lines = [
     `Cron for project ${project.name || project.id}:`,
-    `- Keep-alive job: ${project.cronKeepAliveJobId || 'none'}`,
-    `- Deploy hook job: ${project.cronDeployHookJobId || 'none'}`,
+    `- Keep-alive job: ${project.cronKeepAliveJobId ? 'configured' : 'none'}`,
+    `- Deploy hook job: ${project.cronDeployHookJobId ? 'configured' : 'none'}`,
     `- Notifications: ${project.cronNotificationsEnabled ? 'on' : 'off'}`,
     `- Levels: ${levels}`,
   ];
@@ -20517,8 +20575,7 @@ async function renderProjectCronBindings(ctx, projectId) {
     .row()
     .text('⚙️ Alert levels', `projcron:alerts_levels:${projectId}`)
     .row()
-    .text('🧪 Test keep-alive', `projcron:test:${projectId}:keepalive`)
-    .text('🧪 Test deploy', `projcron:test:${projectId}:deploy`)
+    .text('🧪 Test all', `projcron:test_all:${projectId}`)
     .row()
     .text('⬅️ Back', `proj:server_menu:${projectId}`);
 
@@ -20549,7 +20606,7 @@ async function handleProjectCronJobAction(ctx, projectId, type) {
       .text('⬅️ Back', `projcron:menu:${projectId}`);
     await renderOrEdit(
       ctx,
-      `${type === 'keepalive' ? 'Keep-alive' : 'Deploy'} cron job: ${jobId}`,
+      `${type === 'keepalive' ? 'Keep-alive' : 'Deploy'} cron job configured.`,
       { reply_markup: inline },
     );
     return;
