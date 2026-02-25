@@ -18,6 +18,9 @@ async function ensureCronJobLinksTable(db) {
       enabled BOOLEAN NOT NULL DEFAULT TRUE,
       schedule_normalized TEXT NULL,
       target_normalized TEXT NULL,
+      fingerprint TEXT NULL,
+      provider TEXT NULL,
+      display_name TEXT NULL,
       last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -28,8 +31,12 @@ async function ensureCronJobLinksTable(db) {
   await db.query('ALTER TABLE cron_job_links ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE');
   await db.query('ALTER TABLE cron_job_links ADD COLUMN IF NOT EXISTS schedule_normalized TEXT NULL');
   await db.query('ALTER TABLE cron_job_links ADD COLUMN IF NOT EXISTS target_normalized TEXT NULL');
+  await db.query('ALTER TABLE cron_job_links ADD COLUMN IF NOT EXISTS fingerprint TEXT NULL');
+  await db.query('ALTER TABLE cron_job_links ADD COLUMN IF NOT EXISTS provider TEXT NULL');
+  await db.query('ALTER TABLE cron_job_links ADD COLUMN IF NOT EXISTS display_name TEXT NULL');
   await db.query('ALTER TABLE cron_job_links ADD COLUMN IF NOT EXISTS last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()');
   await db.query('CREATE UNIQUE INDEX IF NOT EXISTS cron_job_links_job_key_uidx ON cron_job_links (job_key) WHERE job_key IS NOT NULL');
+  await db.query('CREATE INDEX IF NOT EXISTS cron_job_links_fingerprint_idx ON cron_job_links (fingerprint) WHERE fingerprint IS NOT NULL');
   tablesReady = true;
 }
 
@@ -48,7 +55,7 @@ async function listCronJobLinks() {
   }
   const { rows } = await db.query(
     `SELECT cron_job_id, provider_job_id, job_key, project_id, label, enabled,
-            schedule_normalized, target_normalized, last_updated_at
+            schedule_normalized, target_normalized, fingerprint, provider, display_name, last_updated_at
        FROM cron_job_links
       ORDER BY updated_at DESC`,
   );
@@ -61,6 +68,9 @@ async function listCronJobLinks() {
     enabled: row.enabled !== false,
     scheduleNormalized: row.schedule_normalized,
     targetNormalized: row.target_normalized,
+    fingerprint: row.fingerprint || null,
+    provider: row.provider || 'cronjob_org',
+    displayName: row.display_name || row.label || null,
     lastUpdatedAt: row.last_updated_at ? new Date(row.last_updated_at).toISOString() : null,
   }));
 }
@@ -72,7 +82,7 @@ async function getCronJobLink(cronJobId) {
   }
   const { rows } = await db.query(
     `SELECT cron_job_id, provider_job_id, job_key, project_id, label, enabled,
-            schedule_normalized, target_normalized, last_updated_at
+            schedule_normalized, target_normalized, fingerprint, provider, display_name, last_updated_at
        FROM cron_job_links
       WHERE cron_job_id = $1
       LIMIT 1`,
@@ -88,6 +98,9 @@ async function getCronJobLink(cronJobId) {
     enabled: rows[0].enabled !== false,
     scheduleNormalized: rows[0].schedule_normalized,
     targetNormalized: rows[0].target_normalized,
+    fingerprint: rows[0].fingerprint || null,
+    provider: rows[0].provider || 'cronjob_org',
+    displayName: rows[0].display_name || rows[0].label || null,
     lastUpdatedAt: rows[0].last_updated_at ? new Date(rows[0].last_updated_at).toISOString() : null,
   };
 }
@@ -100,7 +113,7 @@ async function getCronJobLinkByJobKey(jobKey) {
   }
   const { rows } = await db.query(
     `SELECT cron_job_id, provider_job_id, job_key, project_id, label, enabled,
-            schedule_normalized, target_normalized, last_updated_at
+            schedule_normalized, target_normalized, fingerprint, provider, display_name, last_updated_at
        FROM cron_job_links
       WHERE job_key = $1
       LIMIT 1`,
@@ -116,6 +129,9 @@ async function getCronJobLinkByJobKey(jobKey) {
     enabled: rows[0].enabled !== false,
     scheduleNormalized: rows[0].schedule_normalized,
     targetNormalized: rows[0].target_normalized,
+    fingerprint: rows[0].fingerprint || null,
+    provider: rows[0].provider || 'cronjob_org',
+    displayName: rows[0].display_name || rows[0].label || null,
     lastUpdatedAt: rows[0].last_updated_at ? new Date(rows[0].last_updated_at).toISOString() : null,
   };
 }
@@ -132,6 +148,9 @@ async function upsertCronJobLink(cronJobId, projectId, label, metadata = {}) {
     enabled: metadata.enabled !== false,
     scheduleNormalized: metadata.scheduleNormalized || null,
     targetNormalized: metadata.targetNormalized || null,
+    fingerprint: metadata.fingerprint || null,
+    provider: metadata.provider || 'cronjob_org',
+    displayName: metadata.displayName || label || null,
     lastUpdatedAt: metadata.lastUpdatedAt || nowIso,
   };
   if (!db) {
@@ -169,10 +188,13 @@ async function upsertCronJobLink(cronJobId, projectId, label, metadata = {}) {
                 enabled = $6,
                 schedule_normalized = $7,
                 target_normalized = $8,
-                last_updated_at = $9,
+                fingerprint = $9,
+                provider = $10,
+                display_name = $11,
+                last_updated_at = $12,
                 updated_at = NOW()
           WHERE job_key = $5`,
-        [entry.cronJobId, entry.providerJobId, entry.projectId, entry.label, entry.jobKey, entry.enabled, entry.scheduleNormalized, entry.targetNormalized, entry.lastUpdatedAt],
+        [entry.cronJobId, entry.providerJobId, entry.projectId, entry.label, entry.jobKey, entry.enabled, entry.scheduleNormalized, entry.targetNormalized, entry.fingerprint, entry.provider, entry.displayName, entry.lastUpdatedAt],
       );
     }
     await db.query(
@@ -182,10 +204,13 @@ async function upsertCronJobLink(cronJobId, projectId, label, metadata = {}) {
               enabled = $4,
               schedule_normalized = COALESCE($5, schedule_normalized),
               target_normalized = COALESCE($6, target_normalized),
-              last_updated_at = $7,
+              fingerprint = COALESCE($7, fingerprint),
+              provider = COALESCE($8, provider),
+              display_name = COALESCE($9, display_name),
+              last_updated_at = $10,
               updated_at = NOW()
         WHERE cron_job_id = $1`,
-      [entry.cronJobId, entry.providerJobId, entry.jobKey, entry.enabled, entry.scheduleNormalized, entry.targetNormalized, entry.lastUpdatedAt],
+      [entry.cronJobId, entry.providerJobId, entry.jobKey, entry.enabled, entry.scheduleNormalized, entry.targetNormalized, entry.fingerprint, entry.provider, entry.displayName, entry.lastUpdatedAt],
     );
   } catch (error) {
     console.error('[cronJobLinksStore] Failed to save cron job link', error);
@@ -233,10 +258,18 @@ async function renameCronJobLinkProjectId(oldProjectId, newProjectId) {
   }
 }
 
+
+async function listCronJobLinksByFingerprint(fingerprint) {
+  if (!fingerprint) return [];
+  const links = await listCronJobLinks();
+  return links.filter((item) => item.fingerprint === fingerprint);
+}
+
 module.exports = {
   listCronJobLinks,
   getCronJobLink,
   getCronJobLinkByJobKey,
+  listCronJobLinksByFingerprint,
   upsertCronJobLink,
   deleteCronJobLink,
   renameCronJobLinkProjectId,
