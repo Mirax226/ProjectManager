@@ -96,6 +96,7 @@ const execFileAsync = promisify(execFile);
 const { Bot, InlineKeyboard, Keyboard, InputFile } = require('grammy');
 const { Pool } = require('pg');
 const { ProgressReporter } = require('./progressReporter');
+const { listServiceDeploys, getService, parseDeploy } = require('./src/renderClient');
 
 const { loadProjects, saveProjects, findProjectById } = require('./projectsStore');
 const { setUserState, getUserState, clearUserState } = require('./state');
@@ -492,10 +493,13 @@ const RENDER_POLL_TIMEOUT_MS_DEFAULT = 8000;
 const RENDER_ENV_VAULT_PROJECT_ID = '__render_global__';
 const RENDER_WEBHOOK_RATE_LIMIT = { limit: 12, windowMs: 60 * 1000 };
 const RENDER_WEBHOOK_DEDUP_TTL_MS = 6 * 60 * 60 * 1000;
+const RENDER_DEPLOY_TRACKING_TTL_SEC_DEFAULT = 10;
+const RENDER_DEPLOY_TRACKING_DEDUPE_WINDOW_MS = 15_000;
 const renderWebhookRateLimits = new Map();
 const renderWebhookEventCache = new Map();
 const renderWebhookUnknownServiceNotices = new Map();
 const renderServiceDiscoveryCache = new Map();
+const deployTrackingSnapshotDedupe = new Map();
 const renderPollingLocks = new Set();
 let renderPollTimer = null;
 let renderPollSkipLogAt = 0;
@@ -14415,6 +14419,8 @@ function normalizeProjectDeploySettings(project) {
       notifyOnFail: typeof render.notifyOnFail === 'boolean' ? render.notifyOnFail : true,
       recentEvents: Array.isArray(render.recentEvents) ? render.recentEvents : [],
       eventsEnabled: Array.isArray(render.eventsEnabled) ? render.eventsEnabled.filter(Boolean) : null,
+      lastRenderCall: render.lastRenderCall || null,
+      lastParsed: render.lastParsed || null,
     },
     notifications: {
       enabled,
@@ -14553,6 +14559,8 @@ async function updateProjectDeploySettings(projectId, updater) {
       typeof next.render?.notifyOnFail === 'boolean' ? next.render.notifyOnFail : current.render.notifyOnFail,
     recentEvents: Array.isArray(next.render?.recentEvents) ? next.render.recentEvents : current.render.recentEvents,
     eventsEnabled: next.render?.eventsEnabled || current.render.eventsEnabled || null,
+    lastRenderCall: next.render?.lastRenderCall || current.render.lastRenderCall || null,
+    lastParsed: next.render?.lastParsed || current.render.lastParsed || null,
   };
   project.deployNotifications = {
     ...(project.deployNotifications || {}),
@@ -15083,12 +15091,16 @@ async function listRenderServices(renderSettings) {
 }
 
 async function listRenderServiceDeploys(serviceId, renderSettings) {
-  if (!serviceId) return [];
-  const path = `/services/${serviceId}/deploys?limit=5`;
-  const payload = await requestRenderApi({ method: 'GET', path, timeoutMs: renderSettings?.pollTimeoutMs });
-  if (Array.isArray(payload)) return payload;
-  if (payload?.data && Array.isArray(payload.data)) return payload.data;
-  return [];
+  if (!serviceId) {
+    return { deploys: [], diagnostics: null };
+  }
+  const apiKeyStatus = await getRenderApiKeyStatus();
+  const result = await listServiceDeploys(serviceId, {
+    limit: 5,
+    timeoutMs: renderSettings?.pollTimeoutMs,
+    apiKey: apiKeyStatus.key,
+  });
+  return result;
 }
 
 function normalizeRenderDeployPayload(deploy) {
@@ -15113,6 +15125,52 @@ function normalizeRenderDeployPayload(deploy) {
     dashboardUrl: dashboardUrl ? String(dashboardUrl) : null,
   };
 }
+function resolveDeployTrackingTtlSec(settings) {
+  const fromSettings = Number(settings?.renderDeploy?.deployTrackingTransientTtlSec);
+  const fromEnv = Number(process.env.RENDER_DEPLOY_TRACKING_TRANSIENT_TTL_SEC);
+  const value = Number.isFinite(fromEnv) && fromEnv >= 0
+    ? fromEnv
+    : Number.isFinite(fromSettings) && fromSettings >= 0
+      ? fromSettings
+      : RENDER_DEPLOY_TRACKING_TTL_SEC_DEFAULT;
+  return Math.max(0, Math.round(value));
+}
+
+function shouldSkipDeployTrackingSnapshotDedupe(chatId, projectId, messageText) {
+  if (!chatId || !projectId || !messageText) return false;
+  const key = `${chatId}:${projectId}`;
+  const now = Date.now();
+  const previous = deployTrackingSnapshotDedupe.get(key);
+  if (previous && previous.text === messageText && now - previous.at < RENDER_DEPLOY_TRACKING_DEDUPE_WINDOW_MS) {
+    return true;
+  }
+  deployTrackingSnapshotDedupe.set(key, { text: messageText, at: now });
+  return false;
+}
+
+function buildDeployTrackingSnapshotMessage(project, deploySettings, parsedDeploy, diagnostics) {
+  const lines = [
+    '🧪 Deploy tracking snapshot',
+    `Project: ${project.name || project.id}`,
+    `Service: ${deploySettings.render.serviceName || deploySettings.render.serviceId || 'missing'}`,
+  ];
+  if (!parsedDeploy) {
+    lines.push('No deploys found for this service yet.');
+  } else {
+    lines.push(`DeployId: ${shortenRenderId(parsedDeploy.deployId)}`);
+    lines.push(`Status: ${parsedDeploy.status || 'unknown'}`);
+    lines.push(`Updated: ${parsedDeploy.updatedAt || 'unknown'}`);
+    if (parsedDeploy.commitId) lines.push(`Commit: ${shortenRenderId(parsedDeploy.commitId)}`);
+    if (parsedDeploy.trigger) lines.push(`Trigger: ${parsedDeploy.trigger}`);
+    if (parsedDeploy.image) lines.push(`Image: ${parsedDeploy.image}`);
+  }
+  if (diagnostics) {
+    lines.push('');
+    lines.push(`Debug: ${diagnostics.endpoint || '-'} · ${diagnostics.httpStatus || '-'} · ${diagnostics.durationMs || 0}ms · count=${diagnostics.returnedCount ?? 0}`);
+  }
+  return lines.join('\n');
+}
+
 
 async function pollRenderDeploysOnce() {
   if (renderPollingLocks.has('tick')) return;
@@ -15162,7 +15220,7 @@ async function pollRenderDeploysOnce() {
       const serviceId = deploySettings.render.serviceId;
       if (!serviceId) continue;
       try {
-        const deploys = await listRenderServiceDeploys(serviceId, settings);
+        const { deploys } = await listRenderServiceDeploys(serviceId, settings);
         const latestRaw = deploys[0] || null;
         const normalized = normalizeRenderDeployPayload(latestRaw);
         if (!normalized) continue;
@@ -21368,6 +21426,12 @@ async function renderDeployProjectPanel(ctx, projectId, notice) {
     formatRenderPollingStatusLine(renderSettings, await getRenderApiKeyStatus()),
     formatRenderWebhookStatusLine(renderSettings, webhookSettings),
     formatDeployLastEventLine(settings.render),
+    settings.render.lastRenderCall
+      ? `Last Render call: ${settings.render.lastRenderCall.endpoint || '-'} · ${settings.render.lastRenderCall.httpStatus || '-'} · ${settings.render.lastRenderCall.durationMs || 0}ms · count=${settings.render.lastRenderCall.returnedCount ?? 0}`
+      : null,
+    settings.render.lastParsed
+      ? `Last parsed: ${shortenRenderId(settings.render.lastParsed.deployId)} · ${settings.render.lastParsed.status || '-'} · ${settings.render.lastParsed.updatedAt || '-'}`
+      : null,
   ].filter(Boolean);
   const inline = new InlineKeyboard()
     .text('⚙️ Setup/Map service', `deploy:setup:${project.id}`)
@@ -21377,6 +21441,8 @@ async function renderDeployProjectPanel(ctx, projectId, notice) {
     .text('🧪 Test deploy tracking', `deploy:test:${project.id}`)
     .row()
     .text('📜 Recent events', `deploy:recent:${project.id}`)
+    .row()
+    .text('✅ Validate mapping', `deploy:validate:${project.id}`)
     .row()
     .text('⬅️ Back', 'deploy:list');
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
@@ -21500,6 +21566,7 @@ async function renderDeployServiceSetupMenu(ctx, projectId, notice) {
   }
   inline.text('✍️ Enter serviceId manually', `deploy:set_service:${project.id}`).row();
   if (deploySettings.render.serviceId) {
+    inline.text('✅ Validate mapping', `deploy:validate:${project.id}`).row();
     inline.text('🧹 Clear mapping', `deploy:clear_service:${project.id}`).row();
   }
   inline.text('⬅️ Back', `deploy:open:${project.id}`);
@@ -22005,6 +22072,51 @@ async function handleDeployCallback(ctx, data) {
     await renderDeployEventsMenu(ctx, projectId, '✅ Updated.');
     return;
   }
+  if (action === 'validate' && projectId) {
+    const project = await getProjectById(projectId, ctx);
+    if (!project) return;
+    const deploySettings = normalizeProjectDeploySettings(project);
+    if (!deploySettings.render.serviceId) {
+      await renderDeployProjectPanel(ctx, projectId, '⚠️ Set Render serviceId first.');
+      return;
+    }
+    try {
+      const apiKeyStatus = await getRenderApiKeyStatus();
+      const settings = resolveRenderGlobalSettings(await getCachedSettings());
+      const { service } = await getService(deploySettings.render.serviceId, {
+        timeoutMs: settings.pollTimeoutMs,
+        apiKey: apiKeyStatus.key,
+      });
+      const normalizedService = normalizeRenderServiceEntry(service);
+      if (!normalizedService.id) {
+        throw new Error('Service mapping is invalid or inaccessible for this API key.');
+      }
+      await updateProjectDeploySettings(projectId, (current) => ({
+        ...current,
+        render: {
+          ...current.render,
+          serviceId: normalizedService.id,
+          serviceName: normalizedService.name || current.render.serviceName || null,
+        },
+      }));
+      await renderDeployProjectPanel(
+        ctx,
+        projectId,
+        `✅ Mapping valid.
+Service: ${normalizedService.name || normalizedService.id}
+Type: ${normalizedService.type || 'unknown'}`,
+      );
+    } catch (error) {
+      await renderDeployProjectPanel(
+        ctx,
+        projectId,
+        `❌ Mapping validation failed.
+${error.message}
+Use Setup/Map service to re-bind serviceId.`,
+      );
+    }
+    return;
+  }
   if (action === 'test' && projectId) {
     const project = await getProjectById(projectId, ctx);
     if (!project) return;
@@ -22013,6 +22125,9 @@ async function handleDeployCallback(ctx, data) {
       await renderDeployProjectPanel(ctx, projectId, '⚠️ Set Render serviceId first.');
       return;
     }
+    const settingsCache = await getCachedSettings();
+    const renderSettings = resolveRenderGlobalSettings(settingsCache);
+    const ttlSec = resolveDeployTrackingTtlSec(settingsCache);
     const progress = createOperationProgress(ctx, `🧪 Test deploy tracking — ${project.name || project.id}`, 2);
     await updateProgressMessage(ctx, progress, {
       status: 'progressing',
@@ -22021,39 +22136,46 @@ async function handleDeployCallback(ctx, data) {
       nextStep: 'Reporting result',
     });
     try {
-      const renderSettings = resolveRenderGlobalSettings(await getCachedSettings());
-      const deploys = await listRenderServiceDeploys(deploySettings.render.serviceId, renderSettings);
+      const { deploys, diagnostics } = await listRenderServiceDeploys(deploySettings.render.serviceId, renderSettings);
       const latest = deploys[0] || null;
-      if (!latest) {
-        await updateProgressMessage(ctx, progress, {
-          status: 'failed',
-          completedSteps: 1,
-          currentStep: 'No deploys found',
-          nextStep: null,
-          reason: 'No deploys returned by Render API',
-        });
-        await renderDeployProjectPanel(ctx, projectId, '⚠️ No deploys found for this service.');
-        return;
-      }
-      const deployId = latest.id || latest.deployId || null;
-      const status = latest.status || latest.state || latest.result || null;
-      const timestamp = latest.updatedAt || latest.finishedAt || latest.createdAt || new Date().toISOString();
-      const message = [
-        '🧪 Deploy tracking snapshot',
-        `Project: ${project.name || project.id}`,
-        `Service: ${deploySettings.render.serviceName || deploySettings.render.serviceId || '-'}`,
-        `DeployId: ${shortenRenderId(deployId)}`,
-        `Status: ${status || '-'}`,
-        `Updated: ${timestamp}`,
-      ].join('\n');
-      await bot.api.sendMessage(ADMIN_TELEGRAM_ID, message, { disable_web_page_preview: true });
-      await updateProgressMessage(ctx, progress, {
+      const parsed = latest ? parseDeploy(latest) : null;
+      const lastParsed = parsed
+        ? { deployId: parsed.deployId || null, status: parsed.status || null, updatedAt: parsed.updatedAt || null }
+        : null;
+      await updateProjectDeploySettings(projectId, (current) => ({
+        ...current,
+        render: {
+          ...current.render,
+          lastRenderCall: diagnostics
+            ? {
+                endpoint: diagnostics.endpoint,
+                httpStatus: diagnostics.httpStatus,
+                durationMs: diagnostics.durationMs,
+                returnedCount: diagnostics.returnedCount,
+              }
+            : current.render.lastRenderCall || null,
+          lastParsed,
+        },
+      }));
+      const finalText = buildLogTestProgressText({
+        header: progress.header,
         status: 'success',
+        percent: 100,
         completedSteps: 2,
-        currentStep: 'Snapshot sent',
+        totalSteps: 2,
+        currentStep: latest ? 'Snapshot sent' : 'No deploys found',
         nextStep: null,
+        remainingSteps: 0,
       });
-      await renderDeployProjectPanel(ctx, projectId, '✅ Snapshot sent.');
+      if (progress.chatId && progress.messageId) {
+        await safeDeleteMessage(ctx, progress.chatId, progress.messageId, 'deploy_test_complete');
+      }
+      await sendTransientNotice(ctx, finalText, { ttlSec, includeDelete: true });
+      const snapshotMessage = buildDeployTrackingSnapshotMessage(project, deploySettings, parsed, diagnostics);
+      if (!shouldSkipDeployTrackingSnapshotDedupe(progress.chatId, projectId, snapshotMessage)) {
+        await sendTransientNotice(ctx, snapshotMessage, { ttlSec, includeDelete: true, disable_web_page_preview: true });
+      }
+      await renderDeployProjectPanel(ctx, projectId, latest ? '✅ Snapshot sent.' : 'ℹ️ No deploys found for this service yet.');
     } catch (error) {
       await updateProgressMessage(ctx, progress, {
         status: 'failed',
@@ -22062,7 +22184,8 @@ async function handleDeployCallback(ctx, data) {
         nextStep: null,
         reason: error.message,
       });
-      await renderDeployProjectPanel(ctx, projectId, `❌ Test failed.\n${error.message}`);
+      await renderDeployProjectPanel(ctx, projectId, `❌ Test failed.
+${error.message}`);
     }
     return;
   }
@@ -26284,6 +26407,7 @@ module.exports = {
     buildCronJobKey,
     dedupeCronJobsByJobKey,
     shouldUseEphemeralForRespond,
+    buildDeployTrackingSnapshotMessage,
   },
 };
 
