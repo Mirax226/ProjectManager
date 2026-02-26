@@ -367,9 +367,11 @@ const envScanCache = new Map();
 const cronCreateRetryCache = new Map();
 const cronErrorDetailsCache = new Map();
 const cronErrorDedupeCache = new Map();
+const internalBotErrorDedupeCache = new Map();
 const panelMessageHistoryByChat = new Map();
 const activePanelMessageIdByChat = new Map();
 const menuMessageRegistryMemory = new Map();
+const menuRegistryGoneMessageIdsByChat = new Map();
 let menuMessageRegistryLoaded = false;
 const navigationQueueByChat = new Map();
 const navigationLocksByChat = new Map();
@@ -552,6 +554,16 @@ function normalizeUiCleanupSettings(settings) {
   };
 }
 
+function normalizeInternalBotErrorsSettings(settings) {
+  const internal = settings?.internalBotErrors || {};
+  const dedupeWindowSec = Number(internal.dedupeWindowSec);
+  return {
+    enabled: internal.enabled === true,
+    strict: internal.strict === true,
+    dedupeWindowSec: Number.isFinite(dedupeWindowSec) ? Math.max(10, Math.min(3600, dedupeWindowSec)) : 300,
+  };
+}
+
 function normalizeSecuritySettings(settings) {
   const security = settings?.security || {};
   return {
@@ -712,6 +724,29 @@ function isMessageNotModifiedError(error) {
   return message.includes('message is not modified');
 }
 
+function extractTelegramErrorInfo(error) {
+  const telegramErrorCode = Number(
+    error?.error_code
+      || error?.response?.error_code
+      || error?.response?.parameters?.error_code
+      || error?.statusCode,
+  ) || null;
+  const description = String(error?.description || error?.response?.description || error?.message || '').trim();
+  return { telegramErrorCode, description };
+}
+
+function isMessageToEditNotFoundError(error) {
+  const { telegramErrorCode, description } = extractTelegramErrorInfo(error);
+  return telegramErrorCode === 400 && description.toLowerCase().includes('message to edit not found');
+}
+
+function getMenuRegistryGoneSet(chatId) {
+  if (!menuRegistryGoneMessageIdsByChat.has(chatId)) {
+    menuRegistryGoneMessageIdsByChat.set(chatId, new Set());
+  }
+  return menuRegistryGoneMessageIdsByChat.get(chatId);
+}
+
 async function handleTelegramUiError(ctx, error, fallbackText) {
   if (!isButtonDataInvalidError(error)) {
     throw error;
@@ -793,6 +828,10 @@ async function safeDeleteMessage(ctx, chatId, messageId, reason) {
   const api = ctx?.api || bot.api;
   try {
     await api.deleteMessage(chatId, messageId);
+    if (reason === 'ephemeral_ttl' || reason === 'panel_limit') {
+      getMenuRegistryGoneSet(chatId).add(messageId);
+    }
+    return true;
   } catch (error) {
     console.warn('[cleanup] Failed to delete message', {
       chatId,
@@ -800,6 +839,7 @@ async function safeDeleteMessage(ctx, chatId, messageId, reason) {
       reason,
       error: error?.message,
     });
+    return false;
   }
 }
 
@@ -938,31 +978,85 @@ async function persistMenuRegistry() {
 }
 
 async function markMessageStale(chatId, messageId) {
+  if (getMenuRegistryGoneSet(chatId).has(messageId)) {
+    return { gone: true };
+  }
   try {
     await bot.api.editMessageText(chatId, messageId, '(stale)', {
       reply_markup: { inline_keyboard: [] },
     });
-    return;
+    return { gone: false };
   } catch (error) {
+    const info = extractTelegramErrorInfo(error);
+    if (isMessageToEditNotFoundError(error)) {
+      getMenuRegistryGoneSet(chatId).add(messageId);
+      await emitInternalBotUiError({
+        category: 'BOT_UI_ERROR',
+        messageShort: `⚠️ BOT_UI_ERROR — stale message edit failed (message not found). chatId=${chatId}, msgId=${messageId}`,
+        chatId,
+        messageId,
+        action: 'editMessageText',
+        telegramErrorCode: info.telegramErrorCode,
+        description: info.description,
+      });
+      return { gone: true };
+    }
     if (!isMessageNotModifiedError(error)) {
       console.warn('[menu-registry] failed to mark stale text', { chatId, messageId, error: error?.message });
+      await emitInternalBotUiError({
+        category: 'BOT_UI_ERROR',
+        messageShort: `⚠️ BOT_UI_ERROR — stale message edit failed. chatId=${chatId}, msgId=${messageId}`,
+        chatId,
+        messageId,
+        action: 'editMessageText',
+        telegramErrorCode: info.telegramErrorCode,
+        description: info.description,
+      });
     }
   }
   try {
     await bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: { inline_keyboard: [] } });
   } catch (error) {
+    const info = extractTelegramErrorInfo(error);
+    if (isMessageToEditNotFoundError(error)) {
+      getMenuRegistryGoneSet(chatId).add(messageId);
+      await emitInternalBotUiError({
+        category: 'BOT_UI_ERROR',
+        messageShort: `⚠️ BOT_UI_ERROR — stale keyboard edit failed (message not found). chatId=${chatId}, msgId=${messageId}`,
+        chatId,
+        messageId,
+        action: 'editMessageReplyMarkup',
+        telegramErrorCode: info.telegramErrorCode,
+        description: info.description,
+      });
+      return { gone: true };
+    }
     if (!isMessageNotModifiedError(error)) {
       console.warn('[menu-registry] failed to disable stale keyboard', { chatId, messageId, error: error?.message });
+      await emitInternalBotUiError({
+        category: 'BOT_UI_ERROR',
+        messageShort: `⚠️ BOT_UI_ERROR — stale keyboard edit failed. chatId=${chatId}, msgId=${messageId}`,
+        chatId,
+        messageId,
+        action: 'editMessageReplyMarkup',
+        telegramErrorCode: info.telegramErrorCode,
+        description: info.description,
+      });
     }
   }
+  return { gone: false };
 }
 
 async function deleteOrStaleMenuMessage(chatId, messageId) {
   try {
     await bot.api.deleteMessage(chatId, messageId);
+    getMenuRegistryGoneSet(chatId).add(messageId);
     return true;
   } catch (error) {
-    await markMessageStale(chatId, messageId);
+    const staleResult = await markMessageStale(chatId, messageId);
+    if (staleResult?.gone) {
+      return true;
+    }
     return false;
   }
 }
@@ -1003,8 +1097,18 @@ async function trackPanelMessage(chatId, messageId, settings, userId) {
   await persistMenuRegistry();
 
   const staleTargets = merged.slice(1);
+  const goneSet = getMenuRegistryGoneSet(chatId);
   for (const oldId of staleTargets) {
-    await deleteOrStaleMenuMessage(chatId, oldId);
+    if (goneSet.has(oldId)) {
+      continue;
+    }
+    const removed = await deleteOrStaleMenuMessage(chatId, oldId);
+    if (removed) {
+      goneSet.add(oldId);
+      const current = menuMessageRegistryMemory.get(key) || [];
+      menuMessageRegistryMemory.set(key, current.filter((id) => id !== oldId));
+      await persistMenuRegistry();
+    }
   }
 
   if (!settings.autoCleanMenus) {
@@ -2874,6 +2978,78 @@ async function routeOpsAlert(event) {
   if (!shouldRouteEvent(prefs, event)) return;
   const destinations = computeDestinations(prefs, event.level);
   await sendOpsAlertByDestinations(destinations, event, { disable_web_page_preview: true });
+}
+
+function buildInternalBotErrorFingerprint(payload) {
+  return [
+    payload.category,
+    payload.action,
+    payload.chatId,
+    payload.messageId,
+    payload.description,
+  ].join('|');
+}
+
+function isInternalBotErrorAlertDeduped(fingerprint, dedupeWindowSec) {
+  const now = Date.now();
+  const previous = internalBotErrorDedupeCache.get(fingerprint) || 0;
+  internalBotErrorDedupeCache.set(fingerprint, now);
+  return previous > 0 && now - previous < dedupeWindowSec * 1000;
+}
+
+async function emitInternalBotUiError(payload) {
+  const settings = await getCachedSettings();
+  const internalSettings = normalizeInternalBotErrorsSettings(settings);
+  const strictCandidate = payload.telegramErrorCode === 400 && String(payload.description || '').toLowerCase().includes('message to edit not found');
+  const level = strictCandidate ? 'warn' : 'error';
+  const category = payload.category || 'BOT_UI_ERROR';
+  const event = await appendEvent({
+    level,
+    category,
+    source: 'menu-registry',
+    messageShort: payload.messageShort,
+    meta: {
+      chatId: payload.chatId,
+      messageId: payload.messageId,
+      action: payload.action,
+      telegramErrorCode: payload.telegramErrorCode,
+      description: payload.description,
+      refId: `BOTUI-${Date.now()}`,
+    },
+  });
+  opsTimeline.append({
+    scope: 'global',
+    projectId: null,
+    type: category,
+    severity: level,
+    title: payload.messageShort,
+    detailsMasked: maskDiagnosticText(`chatId=${payload.chatId};msgId=${payload.messageId};action=${payload.action};code=${payload.telegramErrorCode};description=${payload.description}`),
+    refId: event?.meta_json?.refId || null,
+  });
+  if (!internalSettings.enabled) return;
+  if (strictCandidate && !internalSettings.strict) return;
+  const fingerprint = buildInternalBotErrorFingerprint(payload);
+  if (isInternalBotErrorAlertDeduped(fingerprint, internalSettings.dedupeWindowSec)) return;
+  const prefs = await getUserAlertPrefs(ADMIN_TELEGRAM_ID || 'admin');
+  const destinations = {
+    ...computeDestinations(prefs, event.level),
+    admin_inbox: true,
+  };
+  await sendOpsAlertByDestinations(destinations, {
+    ...event,
+    level,
+    category,
+    message_short: payload.messageShort,
+    meta_json: {
+      ...(event?.meta_json || {}),
+      source: 'menu-registry',
+      chatId: payload.chatId,
+      messageId: payload.messageId,
+      action: payload.action,
+      telegramErrorCode: payload.telegramErrorCode,
+      description: payload.description,
+    },
+  }, { disable_web_page_preview: true });
 }
 
 async function emitOpsEvent(level, category, message, meta) {

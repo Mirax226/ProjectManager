@@ -50,6 +50,11 @@ const DEFAULT_GLOBAL_SETTINGS = {
     captionTemplate:
       'Project: {projectName} ({projectId})\\nNote: {title}\\nCategory: {category}\\nStatus: {status}\\nCreated: {createdAt}\\nNoteId: {noteId}',
   },
+  internalBotErrors: {
+    enabled: false,
+    strict: false,
+    dedupeWindowSec: 300,
+  },
 };
 
 function applySettingsDefaults(settings) {
@@ -88,6 +93,10 @@ function applySettingsDefaults(settings) {
     backups: {
       ...DEFAULT_GLOBAL_SETTINGS.backups,
       ...(payload.backups || {}),
+    },
+    internalBotErrors: {
+      ...DEFAULT_GLOBAL_SETTINGS.internalBotErrors,
+      ...(payload.internalBotErrors || {}),
     },
   };
 }
