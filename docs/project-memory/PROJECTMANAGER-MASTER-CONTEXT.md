@@ -39,3 +39,9 @@ Continue with fixture-based, non-production hardening. Keep typed jobs validatio
 - The Finalizer publishes external Plans and Review artifacts from repository-local plan sources after validation. External Plans are generated mirrors, not a second source of truth.
 - Desktop Review is append-only for normal finalization; previous Review artifacts are never deleted and timestamp collisions are handled safely.
 - Finalizer staging is created under the user's normal temporary directory and is deleted only after successful final artifact validation. Failed runs retain staging for diagnosis.
+
+## PJ-011B Real Excel Probe
+
+- The real Windows Excel host successfully opened disposable copies of Mirax.xlsm and Gozareshkar.xlsm through COM creation, configuration, `Workbooks.Open`, read probe, close, and quit.
+- Source hashes were unchanged before/after both probes, and probe-owned Excel processes exited. A pre-existing Excel process was left untouched.
+- The historical `EXCEL_OPEN_FAILED` did not reproduce; classify its root cause as unknown until a future recurrence supplies a first failing stage and safe HRESULT. Authoritative sync remains disabled.

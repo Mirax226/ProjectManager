@@ -36,11 +36,19 @@ test('PJ-011A classifies Workbooks.Open failure and timeout stage', async () => 
 test('PJ-011A preserves xlsm source hash and disposable-copy evidence', async () => {
   const f = fixture();
   const before = crypto.createHash('sha256').update(fs.readFileSync(f.source)).digest('hex');
-  const result = await executeExcelJob(f.job, f.profile, { probeOpenability: async (copy) => { assert.notEqual(copy, f.source); assert.match(copy, /Mirax\.xlsm$/); return { ok: true, openability: 'OPENABLE', failedStage: 'EXCEL_QUIT' }; } });
+  const result = await executeExcelJob(f.job, f.profile, { probeOpenability: async (copy) => { assert.notEqual(copy, f.source); assert.match(copy, /Mirax\.xlsm$/); return { ok: true, openability: 'OPENABLE' }; } });
   assert.equal(result.ok, true);
   assert.equal(result.result.sourceHashBefore, before);
   assert.equal(result.result.sourceHashAfter, before);
   assert.equal(result.result.sourceUnchanged, true);
   assert.equal(result.result.disposableCopyUsed, true);
+  assert.deepEqual(result.result.stages.map((entry) => entry.stage), ['ASSET_RESOLVE', 'SOURCE_EXISTS', 'SOURCE_HASH_BEFORE', 'COPY_CREATE', 'COPY_DELETE', 'SOURCE_HASH_AFTER']);
   assert.equal(fs.readFileSync(f.source).toString(), 'macro-enabled-fixture');
+});
+
+test('PJ-011A preserves real probe lifecycle stages when supplied by the COM adapter', async () => {
+  const f = fixture();
+  const result = await executeExcelJob(f.job, f.profile, { probeOpenability: async () => ({ ok: true, openability: 'OPENABLE', stages: ['COM_CREATE', 'EXCEL_CONFIGURE', 'WORKBOOK_OPEN_START', 'WORKBOOK_OPEN_SUCCESS', 'WORKBOOK_READ_PROBE', 'WORKBOOK_CLOSE', 'EXCEL_QUIT'] }) });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.result.stages.map((entry) => entry.stage), ['ASSET_RESOLVE', 'SOURCE_EXISTS', 'SOURCE_HASH_BEFORE', 'COPY_CREATE', 'COM_CREATE', 'EXCEL_CONFIGURE', 'WORKBOOK_OPEN_START', 'WORKBOOK_OPEN_SUCCESS', 'WORKBOOK_READ_PROBE', 'WORKBOOK_CLOSE', 'EXCEL_QUIT', 'COPY_DELETE', 'SOURCE_HASH_AFTER']);
 });
