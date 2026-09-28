@@ -31,3 +31,11 @@ Continue with fixture-based, non-production hardening. Keep typed jobs validatio
 - Update protocol: update `CURRENT-STATE.md`, `RECOVERY-CHECKPOINT.md`, or `ROADMAP.md` when verified state changes; add immutable phase evidence under `docs/handoffs/`; keep source contracts and tests authoritative for behavior.
 - Plans/PJ relationship: `C:\Users\Amir\Documents\GitHub\Plans\PJ\` is the owner-facing current-plan and transition log mirror. It summarizes the canonical repository state and does not replace repository memory or tests.
 - Repository handoff relationship: `docs/handoffs/` contains historical phase/checkpoint evidence. Handoffs are preserved rather than rewritten; the project-memory files point to the current recovery position.
+
+## Permanent Finalizer Workflow
+
+- Codex writes generated plans, changelogs, evidence, and handoffs only inside the canonical repository.
+- The owner explicitly executes `tools/finalize-task.ps1`; Codex does not publish directly to Desktop Review or external Plans.
+- The Finalizer publishes external Plans and Review artifacts from repository-local plan sources after validation. External Plans are generated mirrors, not a second source of truth.
+- Desktop Review is append-only for normal finalization; previous Review artifacts are never deleted and timestamp collisions are handled safely.
+- Finalizer staging is created under the user's normal temporary directory and is deleted only after successful final artifact validation. Failed runs retain staging for diagnosis.

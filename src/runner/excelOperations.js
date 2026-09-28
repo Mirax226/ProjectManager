@@ -10,7 +10,7 @@ const RECONCILIATION_STATUSES = Object.freeze(['MATCH', 'MISMATCH', 'ERROR', 'EX
 const SAFE_META_KEYS = Object.freeze(['code', 'message', 'component', 'source', 'reference', 'retryable', 'sourceHash', 'destinationHash']);
 
 function fail(error, code = 'EXCEL_OPERATION_INVALID') { return { ok: false, error, diagnosticCode: code }; }
-function eventFor(code) { return ({ EXCEL_FILE_NOT_FOUND: 'EXCEL_FILE_NOT_FOUND', EXCEL_FINGERPRINT_MISMATCH: 'EXCEL_FINGERPRINT_MISMATCH', EXCEL_OPEN_FAILED: 'EXCEL_OPEN_FAILED', EXCEL_BACKUP_HASH_MISMATCH: 'EXCEL_BACKUP_HASH_MISMATCH' })[code] || 'EXCEL_AGENT_ERROR'; }
+function eventFor(code) { return ({ EXCEL_FILE_NOT_FOUND: 'EXCEL_FILE_NOT_FOUND', EXCEL_FINGERPRINT_MISMATCH: 'EXCEL_FINGERPRINT_MISMATCH', EXCEL_OPEN_FAILED: 'EXCEL_OPEN_FAILED', COM_CREATE_FAILED: 'EXCEL_OPEN_FAILED', EXCEL_CONFIGURATION_FAILED: 'EXCEL_OPEN_FAILED', WORKBOOK_OPEN_FAILED: 'EXCEL_OPEN_FAILED', WORKBOOK_READ_FAILED: 'EXCEL_OPEN_FAILED', WORKBOOK_CLOSE_FAILED: 'EXCEL_OPEN_FAILED', EXCEL_QUIT_FAILED: 'EXCEL_OPEN_FAILED', TIMEOUT: 'EXCEL_OPEN_FAILED', COPY_CLEANUP_FAILED: 'EXCEL_OPEN_FAILED', EXCEL_BACKUP_HASH_MISMATCH: 'EXCEL_BACKUP_HASH_MISMATCH' })[code] || 'EXCEL_AGENT_ERROR'; }
 function safePath(value) {
   const candidate = String(value == null ? '' : value).trim();
   if (!candidate || UNSAFE_PATH.test(candidate) || /(^|[\\/])\.\.?([\\/]|$)/.test(candidate)) return null;
@@ -24,7 +24,7 @@ function sourcePath(asset) { return safePath(asset?.manualPath || asset?.sourceP
 function destinationPath(asset, profile, payload = {}) { return safePath(payload.destinationPath || asset?.backupPath || profile.backupLocation || profile.backupPath); }
 function safeMetadata(input) { const source = input && typeof input === 'object' ? input : {}; return Object.fromEntries(SAFE_META_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(source, key)).map((key) => [key, typeof source[key] === 'string' ? String(source[key]).slice(0, 500) : source[key]])); }
 
-const EXCEL_DESKTOP_PROBE = "$ErrorActionPreference='Stop'; $path=$env:PJ_EXCEL_PROBE_PATH; $before=@(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); $excel=$null; $book=$null; $owned=@(); try { $excel=New-Object -ComObject Excel.Application; $afterCreate=@(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); $owned=@($afterCreate | Where-Object { $before -notcontains $_ }); $excel.Visible=$false; $excel.DisplayAlerts=$false; $excel.AskToUpdateLinks=$false; $excel.EnableEvents=$false; $excel.AutomationSecurity=3; $book=$excel.Workbooks.Open($path, 0, $true); $version=[string]$excel.Version; $book.Close($false); $book=$null; $excel.Quit(); [pscustomobject]@{ ok=$true; version=$version; ownedProcessIds=@($owned) } | ConvertTo-Json -Compress } finally { if ($book) { try { $book.Close($false) } catch {} }; if ($excel) { try { $excel.Quit() } catch {}; try { [Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null } catch {} } }";
+const EXCEL_DESKTOP_PROBE = "$ErrorActionPreference='Stop'; $path=$env:PJ_EXCEL_PROBE_PATH; $before=@(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); $excel=$null; $book=$null; $owned=@(); $stage='COM_CREATE'; $started=[Diagnostics.Stopwatch]::StartNew(); function Safe([object]$e) { $h=$null; try { $h=('0x{0:X8}' -f ([uint32]$e.HResult)) } catch {}; [pscustomobject]@{ exceptionClass=([string]$e.GetType().FullName).Split('.')[-1]; message=(([string]$e.Message) -replace '[\r\n]+',' ' -replace '(?i)([A-Za-z]:\\|\\\\)[^ ]+','[PATH]'); hresult=$h } }; try { $excel=New-Object -ComObject Excel.Application; $afterCreate=@(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); $owned=@($afterCreate | Where-Object { $before -notcontains $_ }); $stage='EXCEL_CONFIGURE'; $excel.Visible=$false; $excel.DisplayAlerts=$false; $excel.AskToUpdateLinks=$false; $excel.EnableEvents=$false; $excel.AutomationSecurity=3; $stage='WORKBOOK_OPEN_START'; $book=$excel.Workbooks.Open($path, 0, $true); $stage='WORKBOOK_OPEN_SUCCESS'; $stage='WORKBOOK_READ_PROBE'; $version=[string]$excel.Version; $stage='WORKBOOK_CLOSE'; $book.Close($false); $book=$null; $stage='EXCEL_QUIT'; $excel.Quit(); $excel=$null; $started.Stop(); [pscustomobject]@{ ok=$true; version=$version; ownedProcessIds=@($owned); stage='EXCEL_QUIT'; durationMs=$started.ElapsedMilliseconds } | ConvertTo-Json -Compress } catch { $started.Stop(); [pscustomobject]@{ ok=$false; diagnosticCode=($(if($stage -eq 'COM_CREATE'){'COM_CREATE_FAILED'}elseif($stage -eq 'EXCEL_CONFIGURE'){'EXCEL_CONFIGURATION_FAILED'}elseif($stage -eq 'WORKBOOK_OPEN_START'){'WORKBOOK_OPEN_FAILED'}elseif($stage -eq 'WORKBOOK_READ_PROBE'){'WORKBOOK_READ_FAILED'}elseif($stage -eq 'WORKBOOK_CLOSE'){'WORKBOOK_CLOSE_FAILED'}elseif($stage -eq 'EXCEL_QUIT'){'EXCEL_QUIT_FAILED'}else{'EXCEL_OPEN_FAILED'})); failedStage=$stage; safeError=(Safe $_.Exception); durationMs=$started.ElapsedMilliseconds } | ConvertTo-Json -Compress } finally { if ($book) { try { $book.Close($false) } catch {} }; if ($excel) { try { $excel.Quit() } catch {}; try { [Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null } catch {} } }";
 
 function probeExcelDesktop(filePath, timeoutMs = 60_000) {
   if (process.platform !== 'win32') return Promise.resolve({ ok: false, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', openability: 'NOT_VERIFIED' });
@@ -36,13 +36,13 @@ function probeExcelDesktop(filePath, timeoutMs = 60_000) {
     const finish = (result) => { clearTimeout(timer); resolve(result); };
     child.on('error', () => finish({ ok: false, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', openability: 'NOT_VERIFIED' }));
     child.on('close', (code) => {
-      if (timedOut) return finish({ ok: false, diagnosticCode: 'EXCEL_OPEN_FAILED', openability: 'OPEN_FAILED' });
-      if (code !== 0) return finish({ ok: false, diagnosticCode: 'EXCEL_OPEN_FAILED', openability: 'OPEN_FAILED' });
+      if (timedOut) return finish({ ok: false, diagnosticCode: 'TIMEOUT', failedStage: 'TIMEOUT', openability: 'OPEN_FAILED' });
+      if (code !== 0) return finish({ ok: false, diagnosticCode: 'EXCEL_OPEN_FAILED', failedStage: 'COM_CREATE', openability: 'OPEN_FAILED' });
       try {
         const parsed = JSON.parse(stdout.trim());
-        if (!parsed.ok) return finish({ ok: false, diagnosticCode: 'EXCEL_OPEN_FAILED', openability: 'OPEN_FAILED' });
-        return finish({ ok: true, openability: 'OPENABLE', excelVersion: String(parsed.version || '').slice(0, 80), ownedExcelProcessIds: Array.isArray(parsed.ownedProcessIds) ? parsed.ownedProcessIds.slice(0, 8).map((id) => Number(id)).filter(Number.isInteger) : [] });
-      } catch (_) { return finish({ ok: false, diagnosticCode: stderr ? 'EXCEL_OPEN_FAILED' : 'EXCEL_DESKTOP_UNAVAILABLE', openability: 'NOT_VERIFIED' }); }
+        if (!parsed.ok) return finish({ ...parsed, openability: 'OPEN_FAILED' });
+        return finish({ ...parsed, ok: true, openability: 'OPENABLE', excelVersion: String(parsed.version || '').slice(0, 80), ownedExcelProcessIds: Array.isArray(parsed.ownedProcessIds) ? parsed.ownedProcessIds.slice(0, 8).map((id) => Number(id)).filter(Number.isInteger) : [] });
+      } catch (_) { return finish({ ok: false, diagnosticCode: stderr ? 'EXCEL_OPEN_FAILED' : 'EXCEL_DESKTOP_UNAVAILABLE', failedStage: 'COM_CREATE', openability: 'NOT_VERIFIED' }); }
     });
   });
 }
@@ -50,37 +50,40 @@ function probeExcelDesktop(filePath, timeoutMs = 60_000) {
 async function healthcheck(job, profile, options = {}) {
   const asset = assetFor(job, profile, options); if (!asset) return fail('Excel asset is not configured', 'EXCEL_ASSET_NOT_CONFIGURED');
   if (asset.projectId && String(asset.projectId).toLowerCase() !== String(job.projectId).toLowerCase()) return fail('Excel asset is outside the job project', 'PROJECT_SCOPE_DENIED');
-  const configuredPath = sourcePath(asset); const result = { projectId: job.projectId, assetId: String(job.payload?.assetId || ''), configurationPresent: true, path: configuredPath, pathExists: false, isFile: false, supportedExtension: false, size: null, modifiedAt: null, sha256: null, sourceHashBefore: null, sourceHashAfter: null, sourceUnchanged: null, excelDesktopAvailable: process.platform === 'win32', openability: 'NOT_CHECKED', disposableCopy: 'NOT_CREATED', ownedExcelProcessIds: [], macrosDisabled: true, eventsDisabled: true, linkUpdatesDisabled: true, expectedFingerprintStatus: 'NOT_CONFIGURED', diagnosticCode: null };
-  if (!configuredPath) return { ok: false, result: { ...result, configurationPresent: false, diagnosticCode: 'EXCEL_PATH_INVALID' }, diagnosticCode: 'EXCEL_PATH_INVALID', eventCategory: 'EXCEL_AGENT_ERROR' };
+  const startedAt = Date.now(); const stages = []; const mark = (stage) => { stages.push({ stage, atMs: Date.now() - startedAt }); };
+  mark('ASSET_RESOLVE'); const configuredPath = sourcePath(asset); const result = { projectId: job.projectId, assetId: String(job.payload?.assetId || ''), configurationPresent: true, path: configuredPath, pathExists: false, isFile: false, supportedExtension: false, size: null, modifiedAt: null, sha256: null, sourceHashBefore: null, sourceHashAfter: null, sourceUnchanged: null, excelDesktopAvailable: process.platform === 'win32', openability: 'NOT_CHECKED', disposableCopy: 'NOT_CREATED', disposableCopyUsed: false, ownedExcelProcessIds: [], macrosDisabled: true, eventsDisabled: true, linkUpdatesDisabled: true, expectedFingerprintStatus: 'NOT_CONFIGURED', diagnosticCode: null, operation: 'EXCEL_HEALTHCHECK', failedStage: null, safeErrorClass: null, durationMs: null, stages };
+  if (!configuredPath) return { ok: false, result: { ...result, configurationPresent: false, diagnosticCode: 'EXCEL_PATH_INVALID', durationMs: Date.now() - startedAt }, diagnosticCode: 'EXCEL_PATH_INVALID', eventCategory: 'EXCEL_AGENT_ERROR' };
+  mark('SOURCE_EXISTS');
   result.supportedExtension = SUPPORTED_EXTENSIONS.includes(path.extname(configuredPath).toLowerCase());
   if (job.payload?.requireExcelDesktop === true && !result.excelDesktopAvailable) return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE' }, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', eventCategory: 'EXCEL_DESKTOP_UNAVAILABLE' };
-  if (!fs.existsSync(configuredPath)) return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_FILE_NOT_FOUND' }, diagnosticCode: 'EXCEL_FILE_NOT_FOUND', eventCategory: eventFor('EXCEL_FILE_NOT_FOUND') };
+  if (!fs.existsSync(configuredPath)) return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_FILE_NOT_FOUND', durationMs: Date.now() - startedAt }, diagnosticCode: 'EXCEL_FILE_NOT_FOUND', eventCategory: eventFor('EXCEL_FILE_NOT_FOUND') };
   const stat = fs.statSync(configuredPath); result.pathExists = true; result.isFile = stat.isFile(); result.size = stat.size; result.modifiedAt = stat.mtime.toISOString();
   if (!result.isFile || !result.supportedExtension) return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_UNSUPPORTED_FILE' }, diagnosticCode: 'EXCEL_UNSUPPORTED_FILE', eventCategory: 'EXCEL_AGENT_ERROR' };
-  result.sha256 = await hashFile(configuredPath);
+  mark('SOURCE_HASH_BEFORE'); result.sha256 = await hashFile(configuredPath);
   result.sourceHashBefore = result.sha256;
-  const sourceAfter = async () => { result.sourceHashAfter = await hashFile(configuredPath); result.sourceUnchanged = result.sourceHashBefore === result.sourceHashAfter; return result; };
+  const sourceAfter = async () => { mark('SOURCE_HASH_AFTER'); result.sourceHashAfter = await hashFile(configuredPath); result.sourceUnchanged = result.sourceHashBefore === result.sourceHashAfter; return result; };
   if (asset.expectedFingerprint && String(asset.expectedFingerprint).toLowerCase() !== result.sha256) { result.expectedFingerprintStatus = 'MISMATCH'; await sourceAfter(); return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_FINGERPRINT_MISMATCH' }, diagnosticCode: 'EXCEL_FINGERPRINT_MISMATCH', eventCategory: eventFor('EXCEL_FINGERPRINT_MISMATCH') }; }
   result.expectedFingerprintStatus = asset.expectedFingerprint ? 'MATCH' : 'NOT_CONFIGURED';
   const shouldProbe = typeof options.probeOpenability === 'function' || job.payload?.requireExcelDesktop === true;
   if (shouldProbe) {
     let tempDir = null; let probePath = configuredPath;
     try {
-      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-excel-probe-'));
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-excel-probe-')); mark('COPY_CREATE');
       probePath = path.join(tempDir, path.basename(configuredPath));
       fs.copyFileSync(configuredPath, probePath);
-      result.disposableCopy = 'CREATED';
+      result.disposableCopy = 'CREATED'; result.disposableCopyUsed = true;
       const probed = typeof options.probeOpenability === 'function' ? await options.probeOpenability(probePath) : await probeExcelDesktop(probePath, options.probeTimeoutMs);
       if (typeof probed === 'string') result.openability = probed;
-      else if (probed && typeof probed === 'object') { result.openability = probed.openability || (probed.ok ? 'OPENABLE' : 'OPEN_FAILED'); result.excelVersion = probed.excelVersion || null; result.ownedExcelProcessIds = Array.isArray(probed.ownedExcelProcessIds) ? probed.ownedExcelProcessIds : []; }
+      else if (probed && typeof probed === 'object') { result.openability = probed.openability || (probed.ok ? 'OPENABLE' : 'OPEN_FAILED'); result.excelVersion = probed.excelVersion || null; result.ownedExcelProcessIds = Array.isArray(probed.ownedExcelProcessIds) ? probed.ownedExcelProcessIds : []; result.failedStage = probed.failedStage || null; result.safeErrorClass = probed.safeError?.exceptionClass || null; result.safeError = probed.safeError ? { exceptionClass: String(probed.safeError.exceptionClass || '').slice(0, 80), hresult: String(probed.safeError.hresult || '').slice(0, 20), message: String(probed.safeError.message || '').slice(0, 240) } : null; result.probeDurationMs = Number.isFinite(probed.durationMs) ? probed.durationMs : null; }
+      if (result.failedStage) mark(result.failedStage);
       if (probed && typeof probed === 'object' && probed.diagnosticCode === 'EXCEL_DESKTOP_UNAVAILABLE') { await sourceAfter(); return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE' }, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', eventCategory: 'EXCEL_DESKTOP_UNAVAILABLE' }; }
-      if (['OPEN_FAILED', 'FAILED', 'NOT_VERIFIED'].includes(String(result.openability).toUpperCase())) { await sourceAfter(); return { ok: false, result: { ...result, diagnosticCode: probed?.diagnosticCode || 'EXCEL_OPEN_FAILED' }, diagnosticCode: probed?.diagnosticCode || 'EXCEL_OPEN_FAILED', eventCategory: eventFor('EXCEL_OPEN_FAILED') }; }
-    } catch (_) { result.openability = 'OPEN_FAILED'; await sourceAfter(); return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_OPEN_FAILED' }, diagnosticCode: 'EXCEL_OPEN_FAILED', eventCategory: eventFor('EXCEL_OPEN_FAILED') }; }
-    finally { if (tempDir) { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {} } }
+      if (['OPEN_FAILED', 'FAILED', 'NOT_VERIFIED'].includes(String(result.openability).toUpperCase())) { await sourceAfter(); const code = probed?.diagnosticCode || 'EXCEL_OPEN_FAILED'; return { ok: false, result: { ...result, diagnosticCode: code, durationMs: Date.now() - startedAt }, diagnosticCode: code, eventCategory: eventFor(code) }; }
+    } catch (error) { result.openability = 'OPEN_FAILED'; result.failedStage = result.failedStage || 'COPY_CREATE'; result.safeErrorClass = error?.constructor?.name || 'Error'; await sourceAfter(); const code = result.failedStage === 'COPY_CREATE' ? 'COPY_CREATE_FAILED' : 'EXCEL_OPEN_FAILED'; return { ok: false, result: { ...result, diagnosticCode: code, durationMs: Date.now() - startedAt }, diagnosticCode: code, eventCategory: eventFor(code) }; }
+    finally { if (tempDir) { try { mark('COPY_DELETE'); fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) { result.cleanupDiagnosticCode = 'COPY_CLEANUP_FAILED'; } } }
   }
   await sourceAfter();
   if (!result.sourceUnchanged) return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_SOURCE_CHANGED' }, diagnosticCode: 'EXCEL_SOURCE_CHANGED', eventCategory: 'EXCEL_AGENT_ERROR' };
-  return { ok: true, result, eventCategory: 'EXCEL_HEALTH_RECOVERED' };
+  result.durationMs = Date.now() - startedAt; return { ok: true, result, eventCategory: 'EXCEL_HEALTH_RECOVERED' };
 }
 
 async function snapshotOrBackup(job, profile, options = {}) {
