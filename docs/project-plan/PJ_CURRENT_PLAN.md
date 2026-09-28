@@ -1,7 +1,7 @@
 # ProjectManager Current Plan
 
 - Canonical repository: `C:\Users\Amir\Documents\GitHub\cloned\ProjectManager`
-- Current commit: `645362a` plus PJ-011B pending commit (real-host Excel probe evidence)
+- Current commit: `e3d0bf1` (PJ-011B real-host probe evidence and lifecycle stage propagation)
 - Architecture: Control Plane plus a project-scoped Windows Runner; Excel operations remain typed, disposable-copy, non-production diagnostics.
 - Completed recovery: PJ-001 through PJ-010 recovery and operational foundations are preserved in `docs/handoffs/` and `docs/project-memory/`.
 - Current Excel diagnosis: real Windows probes for Mirax.xlsm and Gozareshkar.xlsm reached COM creation, configuration, workbook open, read probe, close, and quit successfully on disposable copies; both source hashes remained unchanged. The historical EXCEL_OPEN_FAILED remains unreproduced.
