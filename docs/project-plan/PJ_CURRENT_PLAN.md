@@ -1,7 +1,7 @@
 # ProjectManager Current Plan
 
 - Canonical repository: `C:\Users\Amir\Documents\GitHub\cloned\ProjectManager`
-- Current commit: `c0a9498028c495b36c7c5ea3ed9857947a949f02` (baseline for PJ-011A)
+- Current commit: `77732c6` (PJ-011A finalizer and stage-aware diagnostics)
 - Architecture: Control Plane plus a project-scoped Windows Runner; Excel operations remain typed, disposable-copy, non-production diagnostics.
 - Completed recovery: PJ-001 through PJ-010 recovery and operational foundations are preserved in `docs/handoffs/` and `docs/project-memory/`.
 - Current Excel diagnosis: source paths, existence, disposable copies, and source hashes are verified; COM/openability is the remaining boundary. PJ-011A records exact COM sub-stage evidence without claiming a root cause prematurely.
