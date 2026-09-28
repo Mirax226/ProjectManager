@@ -41,10 +41,11 @@ node src/bot.js
 7. Use **Ping test** to check GitHub API and git fetch latency.
 
 ## Project log forwarding
-External services can forward logs to Project Manager for per-project alerting:
+External services can forward logs to Project Manager for per-project alerting. The endpoint requires `Authorization: Bearer <LOG_INGEST_KEY>`; it is disabled when the key is not configured:
 
 ```
 POST https://<path-applier-host>/project-log/<projectId>
+Authorization: Bearer <LOG_INGEST_KEY>
 Content-Type: application/json
 
 {
@@ -60,7 +61,7 @@ Content-Type: application/json
 }
 ```
 
-If JSON is not convenient, send a plain text body; it will be treated as an error-level message. No authentication is required for now.
+If JSON is not convenient, send a plain text body; it will be treated as an error-level message. Do not put the key in a query string.
 
 ## PM database separation + Render Postgres migration
 

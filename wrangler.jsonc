@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "projectmanager-control-plane",
+  "main": "src/controlPlane/worker.js",
+  "compatibility_date": "2026-09-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "PG_CONTROL_PLANE_ADMIN_TOKEN": "set-locally-or-in-dashboard",
+    "PG_RUNNER_TOKENS_JSON": "{}",
+    "PG_PROJECT_TOKENS_JSON": "{}"
+  },
+  "d1_databases": [
+    { "binding": "CONTROL_PLANE_DB", "database_name": "projectmanager-control-plane", "database_id": "REPLACE_MANUALLY" }
+  ]
+}

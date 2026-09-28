@@ -9,7 +9,10 @@
   },
   "scripts": {
     "start": "node src/bot.js",
-    "test": "BOT_TOKEN=TEST ADMIN_TELEGRAM_ID=1 node --test"
+    "test": "node --require ./test/setup-env.js --test",
+    "runner": "node src/runner/index.js",
+    "dev:control": "node src/controlPlane/server.js",
+    "check": "node --check src/controlPlane/handler.js && node --check src/controlPlane/operationalState.js && node --check src/controlPlane/d1Store.js && node --check src/runner/jobExecutor.js && node --check src/runner/excelOperations.js && node --check src/dailySystemAdapter.js && node --check src/telegramOpsCenter.js"
   },
   "dependencies": {
     "@octokit/rest": "^20.1.1",

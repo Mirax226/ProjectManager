@@ -202,6 +202,13 @@ const { getDbClient, readQuery, writeQuery, pingConnection } = require('./src/db
 const { createMigrationJob, getMigrationJob, updateMigrationJob } = require('./src/db/migrationJobs');
 const { validatePostgresDsn, maskPostgresDsn, fingerprintPostgresDsn } = require('./src/db/dsn');
 const { createOpsTimelineStore } = require('./src/opsTimeline');
+const { listLogs, setLogStatus } = require('./src/logsHubStore');
+const {
+  buildIncidentCenterModel,
+  buildIncidentDetailModel,
+  buildRunnerDashboardModel,
+  isSafeOpsAction,
+} = require('./src/telegramOpsCenter');
 const { createSafeModeController } = require('./src/safeMode');
 const { runDeploy } = require('./src/deploy/workflow');
 const { buildProjectSnapshot, calculateDrift, calculateDbDrift } = require('./src/driftDetector');
@@ -4048,9 +4055,127 @@ async function handleMainCallback(ctx, data) {
   }
 }
 
+function buildIncidentCenterKeyboard(status, incidents) {
+  const keyboard = new InlineKeyboard()
+    .text('🔴 Active', 'ops:incidents:open')
+    .text('🟡 Acknowledged', 'ops:incidents:acknowledged')
+    .row()
+    .text('🟢 Recovered', 'ops:incidents:resolved')
+    .text('⬅️ Back', 'main:ops');
+  incidents.slice(0, 8).forEach((incident) => keyboard.row().text(`Details ${incident.category}`.slice(0, 60), `ops:incident:${incident.id}:details:${status}`));
+  return keyboard;
+}
+
+function buildIncidentDetailKeyboard(incident) {
+  const keyboard = new InlineKeyboard()
+    .text('🩺 Health Check', `ops:incident:${incident.id}:health:${incident.status}`)
+    .text('🕒 Timeline', 'ops:timeline')
+    .row()
+    .text('🧠 Create Codex Task', `ops:incident:${incident.id}:codex_task:${incident.status}`);
+  if (incident.status === 'open') keyboard.row().text('✅ Acknowledge', `ops:incident:${incident.id}:acknowledge:${incident.status}`);
+  keyboard.row().text('⬅️ Incidents', `ops:incidents:${incident.status}`);
+  return keyboard;
+}
+
+async function renderIncidentCenter(ctx, status = 'open', notice = null) {
+  const incidents = await listLogs({ status });
+  const model = buildIncidentCenterModel(incidents, status);
+  const text = notice ? `${notice}\n\n${model.text}` : model.text;
+  await renderOrEdit(ctx, text, { reply_markup: buildIncidentCenterKeyboard(status, model.incidents) });
+}
+
+async function renderIncidentDetail(ctx, id, notice = null) {
+  const incidents = await listLogs({});
+  const row = incidents.find((item) => String(item.id) === String(id) || String(item.fingerprint) === String(id));
+  if (!row) {
+    await renderIncidentCenter(ctx, 'open', 'Incident not found.');
+    return;
+  }
+  const model = buildIncidentDetailModel(row);
+  await renderOrEdit(ctx, notice ? `${notice}\n\n${model.text}` : model.text, { reply_markup: buildIncidentDetailKeyboard(model.incident) });
+}
+
+async function requestIncidentHealthCheck(incident) {
+  const baseUrl = String(process.env.PG_CONTROL_PLANE_URL || '').replace(/\/$/, '');
+  const token = String(process.env.PG_CONTROL_PLANE_ADMIN_TOKEN || '');
+  if (!baseUrl || !token || typeof fetch !== 'function') return { ok: false, message: 'Control Plane health checks are not configured in this environment.' };
+  try {
+    const response = await fetch(`${baseUrl}/api/v1/jobs`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ projectId: incident.project, type: 'HEALTHCHECK', idempotencyKey: `telegram-health:${incident.id}` }) });
+    const payload = await response.json();
+    return response.ok ? { ok: true, message: `Read-only health check queued for ${incident.project}. Job: ${payload.job?.id || '-'}` } : { ok: false, message: 'Control Plane rejected the health check request.' };
+  } catch (_) {
+    return { ok: false, message: 'Control Plane health check could not be reached.' };
+  }
+}
+
+async function renderRunnerDashboard(ctx, notice = null) {
+  const baseUrl = String(process.env.PG_CONTROL_PLANE_URL || '').replace(/\/$/, '');
+  const token = String(process.env.PG_CONTROL_PLANE_ADMIN_TOKEN || '');
+  let runners = [];
+  let jobs = [];
+  if (baseUrl && token && typeof fetch === 'function') {
+    try {
+      const headers = { authorization: `Bearer ${token}` };
+      const [statusResponse, jobsResponse] = await Promise.all([
+        fetch(`${baseUrl}/api/v1/status`, { headers }),
+        fetch(`${baseUrl}/api/v1/jobs`, { headers }),
+      ]);
+      if (statusResponse.ok) runners = (await statusResponse.json()).runners || [];
+      if (jobsResponse.ok) jobs = (await jobsResponse.json()).jobs || [];
+    } catch (_) {
+      notice = 'Runner dashboard is temporarily unavailable.';
+    }
+  } else {
+    notice = 'Runner dashboard requires a configured Control Plane endpoint.';
+  }
+  const model = buildRunnerDashboardModel(runners, jobs);
+  await renderOrEdit(ctx, notice ? `${notice}\n\n${model.text}` : model.text, { reply_markup: new InlineKeyboard().text('🔄 Refresh', 'ops:runners').row().text('⬅️ Back', 'main:ops') });
+}
+
 async function handleOpsCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
-  const [, action] = data.split(':');
+  const parts = data.split(':');
+  const [, action, value, requestedAction, requestedStatus] = parts;
+  if (action === 'incidents') {
+    await renderIncidentCenter(ctx, value || 'open');
+    return;
+  }
+  if (action === 'runners') {
+    await renderRunnerDashboard(ctx);
+    return;
+  }
+  if (action === 'incident') {
+    const role = await resolveAccessRoleForUser(ctx.from?.id);
+    const safeAction = String(requestedAction || 'details').toLowerCase();
+    if (!isSafeOpsAction(role, safeAction)) {
+      await renderIncidentDetail(ctx, value, 'This operational action is not permitted.');
+      return;
+    }
+    const incidents = await listLogs({});
+    const row = incidents.find((item) => String(item.id) === String(value) || String(item.fingerprint) === String(value));
+    if (!row) {
+      await renderIncidentCenter(ctx, 'open', 'Incident not found.');
+      return;
+    }
+    const incident = buildIncidentDetailModel(row).incident;
+    if (safeAction === 'acknowledge') {
+      await setLogStatus({ id: incident.id, status: 'acknowledged' });
+      await renderIncidentCenter(ctx, 'acknowledged', 'Incident acknowledged.');
+      return;
+    }
+    if (safeAction === 'health') {
+      const result = await requestIncidentHealthCheck(incident);
+      await renderIncidentDetail(ctx, incident.id, result.message);
+      return;
+    }
+    if (safeAction === 'codex_task') {
+      const task = await createCodexTask({ sourceType: 'incident', projectId: incident.project === 'global' ? null : incident.project, title: `Investigate ${incident.category}`, body: `Investigate the sanitized incident for ${incident.project}. Category: ${incident.category}. Component: ${incident.component}. Message: ${incident.message}`, refId: incident.id });
+      await renderIncidentDetail(ctx, incident.id, task.duplicate ? 'Codex task already exists for this incident.' : 'Read-only Codex task created.');
+      return;
+    }
+    await renderIncidentDetail(ctx, incident.id);
+    return;
+  }
   if (action === 'timeline') {
     const result = opsTimeline.query({ pageSize: 12 });
     const lines = ['🕒 Ops Timeline', ...result.items.map((e) => `• [${e.severity}] ${e.type}: ${e.title}${e.refId ? ` (${e.refId})` : ''}`)];
@@ -22748,6 +22873,9 @@ async function renderOpsMenu(ctx) {
     status.lastEnteredReason ? `Last reason: ${status.lastEnteredReason}` : null,
   ].filter(Boolean);
   const keyboard = new InlineKeyboard()
+    .text('🚨 Incidents', 'ops:incidents:open')
+    .text('🖥 Runners', 'ops:runners')
+    .row()
     .text('🕒 Timeline', 'ops:timeline')
     .text('🛡 Safe Mode', 'ops:safe_mode')
     .row()
@@ -26075,6 +26203,16 @@ function startHttpServer() {
 
       if (req.method === 'POST' && url.pathname.startsWith('/project-log/')) {
         try {
+          const expectedKey = process.env.LOG_INGEST_KEY || process.env.PATH_APPLIER_LOG_INGEST_KEY;
+          const providedKey = getBearerToken(req);
+          const expectedBuffer = Buffer.from(String(expectedKey || ''));
+          const providedBuffer = Buffer.from(String(providedKey || ''));
+          const authenticated = Boolean(expectedKey && providedKey && expectedBuffer.length === providedBuffer.length && crypto.timingSafeEqual(expectedBuffer, providedBuffer));
+          if (!authenticated) {
+            res.writeHead(expectedKey ? 401 : 503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: expectedKey ? 'Unauthorized.' : 'LOG_INGEST_KEY is not configured.' }));
+            return;
+          }
           const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
           const projects = await loadProjects();
           const project = findProjectById(projects, projectId);
@@ -26408,6 +26546,10 @@ module.exports = {
     dedupeCronJobsByJobKey,
     shouldUseEphemeralForRespond,
     buildDeployTrackingSnapshotMessage,
+    buildIncidentCenterModel,
+    buildIncidentDetailModel,
+    buildRunnerDashboardModel,
+    isSafeOpsAction,
   },
 };
 
