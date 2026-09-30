@@ -62,7 +62,7 @@ async function ingestLog(input = {}) {
   const now = new Date().toISOString();
   const candidate = normalizeStoredEvent({ ...input, first_seen_at: now, last_seen_at: now, status: 'open' });
   const logs = await loadLogs();
-  const index = logs.findIndex((row) => row.status === 'open' && row.fingerprint === candidate.fingerprint);
+  const index = logs.findIndex((row) => ['open', 'acknowledged'].includes(row.status) && row.fingerprint === candidate.fingerprint);
   if (index >= 0) {
     logs[index] = {
       ...logs[index],
@@ -110,6 +110,9 @@ async function autoResolveLogs({ now = Date.now(), enabled = true, windowMs = AU
   const changed = [];
   const next = logs.map((row) => {
     if (row.status !== 'open' && row.status !== 'acknowledged') return row;
+    // A Config DB outage is resolved by successful warmup, not by silence after
+    // the bounded retry cap. Otherwise the same outage can alert again forever.
+    if (row.meta_json?.source === 'config-db' && (row.category.startsWith('CONFIG_DB_') || row.category === 'UNKNOWN_DB_ERROR')) return row;
     const lastSeen = new Date(row.last_seen_at).getTime();
     if (Number.isNaN(lastSeen) || now - lastSeen < windowMs) return row;
     const resolved = { ...row, status: 'resolved' };

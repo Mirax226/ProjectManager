@@ -1,0 +1,84 @@
+{
+  "date": "2026-09-30",
+  "runtime": "local in-memory Control Plane / Windows Runner / real Excel COM",
+  "preexistingExcelProcessIds": [
+    2868
+  ],
+  "workbooks": [
+    {
+      "asset": "Mirax.xlsm",
+      "ok": false,
+      "jobStatus": "FAILED",
+      "eventCategory": "EXCEL_OPEN_FAILED",
+      "openability": "OPEN_FAILED",
+      "failedStage": "WORKBOOK_OPEN_START",
+      "diagnosticCode": "TIMEOUT",
+      "safeError": null,
+      "durationMs": 64097,
+      "probeDurationMs": null,
+      "excelVersion": null,
+      "disposableCopyUsed": true,
+      "sourceHashBefore": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "sourceHashAfter": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "sourceUnchanged": true,
+      "ownedExcelProcessIds": [
+        26220
+      ],
+      "excelProcessOwnershipVerified": true,
+      "excelProcessCleanupVerified": true,
+      "stages": [
+        "ASSET_RESOLVE",
+        "SOURCE_EXISTS",
+        "SOURCE_HASH_BEFORE",
+        "COPY_CREATE",
+        "COM_CREATE",
+        "EXCEL_CONFIGURE",
+        "WORKBOOK_OPEN_START",
+        "SOURCE_HASH_AFTER",
+        "COPY_DELETE"
+      ]
+    },
+    {
+      "asset": "Gozareshkar.xlsm",
+      "ok": true,
+      "jobStatus": "SUCCEEDED",
+      "eventCategory": "EXCEL_HEALTH_RECOVERED",
+      "openability": "OPENABLE",
+      "failedStage": null,
+      "diagnosticCode": null,
+      "safeError": null,
+      "durationMs": 26909,
+      "probeDurationMs": 18635,
+      "excelVersion": "16.0",
+      "disposableCopyUsed": true,
+      "sourceHashBefore": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "sourceHashAfter": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "sourceUnchanged": true,
+      "ownedExcelProcessIds": [
+        15284
+      ],
+      "excelProcessOwnershipVerified": true,
+      "excelProcessCleanupVerified": true,
+      "stages": [
+        "ASSET_RESOLVE",
+        "SOURCE_EXISTS",
+        "SOURCE_HASH_BEFORE",
+        "COPY_CREATE",
+        "COM_CREATE",
+        "EXCEL_CONFIGURE",
+        "WORKBOOK_OPEN_START",
+        "WORKBOOK_OPEN_SUCCESS",
+        "WORKBOOK_READ_PROBE",
+        "WORKBOOK_CLOSE",
+        "EXCEL_QUIT",
+        "COPY_DELETE",
+        "SOURCE_HASH_AFTER"
+      ]
+    }
+  ],
+  "finalExcelProcessIds": [
+    2868
+  ],
+  "preexistingProcessesPreserved": true,
+  "probeOwnedProcessesExited": true
+}

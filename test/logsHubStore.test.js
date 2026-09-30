@@ -15,6 +15,15 @@ test('logs hub deduplicates by fingerprint while open', async () => {
   assert.equal(rows.length, 1);
 });
 
+test('repeated Config DB DNS warnings update one incident fingerprint', async () => {
+  await saveJson('ops_event_log', []);
+  const first = await ingestLog({ projectId: null, level: 'warn', category: 'CONFIG_DB_DNS_FAILED', message_short: 'Config DB warmup failed: getaddrinfo ENOTFOUND db.example.com' });
+  const second = await ingestLog({ projectId: null, level: 'warn', category: 'CONFIG_DB_DNS_FAILED', message_short: 'Config DB warmup failed: getaddrinfo ENOTFOUND db.example.com' });
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.event.occurrence_count, 2);
+});
+
 test('resolved fingerprint creates new row on next occurrence', async () => {
   await saveJson('ops_event_log', []);
   const first = await ingestLog({ projectId: 'p2', level: 'error', category: 'CRON_ERROR', message_short: 'cron failed' });

@@ -1,14 +1,18 @@
 # ProjectManager Current Plan
 
-- Canonical repository: `C:\Users\Amir\Documents\GitHub\cloned\ProjectManager`
-- Current commit: `e3d0bf1` (PJ-011B real-host probe evidence and lifecycle stage propagation)
-- Architecture: Control Plane plus a project-scoped Windows Runner; Excel operations remain typed, disposable-copy, non-production diagnostics.
-- Completed recovery: PJ-001 through PJ-010 recovery and operational foundations are preserved in `docs/handoffs/` and `docs/project-memory/`.
-- Current Excel diagnosis: real Windows probes for Mirax.xlsm and Gozareshkar.xlsm reached COM creation, configuration, workbook open, read probe, close, and quit successfully on disposable copies; both source hashes remained unchanged. The historical EXCEL_OPEN_FAILED remains unreproduced.
-- Finalizer architecture: `tools/finalize-task.ps1` validates repository-local plan, changelog, and handoff evidence, stages locally, validates a ZIP, and publishes only when the owner explicitly runs it.
-- Review/Plans workflow: repository-local sources are authoritative; external Plans are mirrors and Desktop Review is append-only output. Codex uses `-DryRun` or fake destinations only.
-- Runner status: local Windows Runner boundary implemented; authoritative Excel sync/publication remains disabled.
-- DS adapter status: typed, sanitized, non-production adapter evidence only.
-- Telegram Ops status: operational status presentation and event contracts exist; no production enablement in this milestone.
-- Open security risks: owner review of external publication paths, Windows COM behavior, and production approval controls remain open; no secrets or workbooks belong in handoffs.
-- Next milestone: PJ-011B should use the stage evidence to resolve the confirmed COM/openability sub-stage and add only evidence-backed remediation.
+- Canonical repository: `C:\Users\Amir\Documents\GitHub\cloned\ProjectManager`.
+- Milestone: PJ-011B desktop resume, 2026-09-30. Repository hardening and safe diagnosis complete; live incident closure remains unverified.
+- Starting Git baseline: `6d4169e82e889f90f5390c9eb29bff307d01e902`, synchronized with origin/main; five interrupted modified files retained and repaired.
+- Architecture: separate legacy Node Telegram/PostgreSQL service, Cloudflare-compatible Worker/D1 Control Plane, and project-bound Windows Runner.
+- Runtime provenance: README and commit `ff15588` identify Render as the intended Node deployment. Actual active service remains `ACTIVE_NODE_HOST_UNKNOWN`. The configured Worker name is `projectmanager-control-plane`; its deployed existence/bindings are unverified. Worker source does not run Telegram or Config DB warmup.
+- Config DB: DATABASE_URL_PM takes precedence over PATH_APPLIER_CONFIG_DSN. Structural preflight, typed errors, repeat-safe credential encoding repair, bounded transient backoff, and active-incident warning deduplication are implemented. The reported tenant/user lookup error is a provider routing/authentication failure, distinct from DNS. The actual selected deployed variable/hostname and incorrect field cannot be confirmed without runtime metadata.
+- Excel: source hashes and VBA are preserved. Sandbox COM_CREATE fails with 0x80070520. Host Mirax repeatedly times out at WORKBOOK_OPEN_START; one refresh-suppressed copy reached open/read/close then stalled at quit, but later repeats still failed. Last Mirax run timed out at COM_CREATE. Refresh is a candidate, not a confirmed sole root cause. Gozareshkar has successful runs and recovered quit stalls; final verification timed out at WORKBOOK_READ_PROBE after successful open.
+- Diagnostics: disposable copies disable automatic query refresh; the separate Excel instance uses manual calculation, macros/events/link updates disabled. No business values or VBA are stored or changed. Five-second quit grace and independent PID/creation-time-checked cleanup preserve failures at earlier stages.
+- Cleanup exception: new automation PID 31620 appeared during a COM-creation timeout without a returned HWND. Its ownership cannot be securely proven; it remains untouched. Pre-existing PID 2868 remains untouched. Overall cleanup must not be claimed fully verified.
+- Runner: real local in-memory Control Plane -> authenticated claim/lease -> Windows Excel -> typed result/status exercised; Gozareshkar has SUCCEEDED and FAILED observations, Mirax FAILED. Cloud deployment E2E is not verified. EXCEL_SYNC remains disabled.
+- Security: CODEX_TASK has project binding, explicit sandbox/mode, environment allowlist, bounded capture, and redacted output. Edit remains disabled by default. CLI task execution and symlink containment are not newly certified.
+- Verification: final exact test/check/Finalizer evidence is recorded in docs/handoffs/PJ-011B/REVIEW.md.
+- Finalizer: repository sources only; Codex runs DryRun. Owner publishes append-only Review/Plans manually.
+- Next: PJ-012 runtime provenance and read-only deployed configuration verification, plus interactive-host COM/Excel investigation of unresolved Mirax and PID ownership. Any production configuration change/deployment requires a separate owner decision.
+
+Final verification: Gozareshkar also timed out at WORKBOOK_READ_PROBE after successful open; its owned process was cleaned up and source unchanged. Host instability remains unresolved. Release suite: 180/180 passed; syntax/check and diff checks passed.

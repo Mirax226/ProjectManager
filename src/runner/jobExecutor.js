@@ -4,6 +4,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const { JOB_TYPES, JOB_RISK, redact } = require('../controlPlane/contracts');
 const { executeExcelJob } = require('./excelOperations');
+const { sanitizeDbErrorMessage } = require('../../configDbErrors');
 
 const MAX_OUTPUT = 12000;
 const DEFAULT_PROFILE = {
@@ -47,9 +48,9 @@ function resolveRepoPath(profile, requested) {
 function runCommand(file, args, cwd, options = {}) {
   const timeoutMs = Math.min(15 * 60 * 1000, Math.max(1000, Number(options.timeoutMs || 120000)));
   return new Promise((resolve) => {
-    const child = spawn(file, args, { cwd, shell: false, windowsHide: true, env: { ...process.env, ...(options.env || {}) } });
+    const child = spawn(file, args, { cwd, shell: false, windowsHide: true, env: options.replaceEnv ? options.env : { ...process.env, ...(options.env || {}) } });
     let stdout = ''; let stderr = ''; let timedOut = false;
-    child.stdout?.on('data', (chunk) => { stdout += chunk; }); child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    child.stdout?.on('data', (chunk) => { stdout = (stdout + chunk).slice(0, MAX_OUTPUT); }); child.stderr?.on('data', (chunk) => { stderr = (stderr + chunk).slice(0, MAX_OUTPUT); });
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs);
     child.on('error', (error) => { clearTimeout(timer); resolve({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: truncate(error.message), timedOut }); });
     child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0 && !timedOut, exitCode: code, stdout: truncate(stdout), stderr: truncate(stderr), timedOut }); });
@@ -59,6 +60,7 @@ function runCommand(file, args, cwd, options = {}) {
 async function executeJob(job, options = {}) {
   if (!job || !supportedJob(job.type)) throw new Error('unsupported job type');
   const profile = { ...DEFAULT_PROFILE, ...(options.profile || {}) };
+  if (String(profile.projectId || profile.id).toLowerCase() !== String(job.projectId || '').toLowerCase()) return { ok: false, error: 'runner profile is not bound to the job project' };
   const run = options.runCommand || runCommand;
   const type = String(job.type).toUpperCase();
   if (['EXCEL_HEALTHCHECK', 'EXCEL_SNAPSHOT', 'EXCEL_BACKUP', 'EXCEL_RECONCILIATION', 'EXCEL_RECONCILIATION_CHECK', 'EXCEL_SYNC'].includes(type)) return executeExcelJob(job, profile, options);
@@ -80,12 +82,20 @@ async function executeJob(job, options = {}) {
   }
   if (type === 'CODEX_TASK') {
     const mode = String(job.payload?.mode || 'read-only').toLowerCase();
+    if (!['read-only', 'edit'].includes(mode)) return { ok: false, error: 'unsupported Codex mode' };
     if (mode === 'edit' && String(process.env.PG_ALLOW_CODEX_EDITS).toLowerCase() !== 'true') return { ok: false, error: 'Codex edit mode is disabled' };
     const task = String(job.payload?.task || '').trim().slice(0, 8000); if (!task) return { ok: false, error: 'task is required' };
-    const bin = String(process.env.CODEX_BIN || 'codex'); const args = ['exec']; if (process.env.CODEX_PROFILE) args.push('--profile', String(process.env.CODEX_PROFILE)); args.push(task);
-    return { ok: true, result: await run(bin, args, repoPath, { timeoutMs: job.payload?.timeoutMs || 15 * 60 * 1000 }) };
+    const bin = String(process.env.CODEX_BIN || 'codex'); const args = ['exec', '--sandbox', mode === 'edit' ? 'workspace-write' : 'read-only']; if (process.env.CODEX_PROFILE) args.push('--profile', String(process.env.CODEX_PROFILE)); args.push('--', task);
+    const env = codexChildEnvironment(process.env);
+    const result = await run(bin, args, repoPath, { timeoutMs: job.payload?.timeoutMs || 15 * 60 * 1000, replaceEnv: true, env });
+    return { ok: true, result: { ...result, stdout: redact(sanitizeDbErrorMessage(result.stdout) || ''), stderr: redact(sanitizeDbErrorMessage(result.stderr) || '') } };
   }
   return { ok: false, error: 'job type is not enabled' };
 }
 
-module.exports = { DEFAULT_PROFILE, JOB_RISK, supportedJob, commandFor, resolveRepoPath, runCommand, executeJob, redact };
+function codexChildEnvironment(input) {
+  const allowed = new Set(['path', 'pathext', 'systemroot', 'windir', 'comspec', 'temp', 'tmp', 'home', 'userprofile', 'appdata', 'localappdata', 'programfiles', 'programfiles(x86)', 'programdata']);
+  return Object.fromEntries(Object.entries(input).filter(([key]) => allowed.has(key.toLowerCase())));
+}
+
+module.exports = { DEFAULT_PROFILE, JOB_RISK, supportedJob, commandFor, resolveRepoPath, runCommand, executeJob, redact, codexChildEnvironment };

@@ -3,7 +3,7 @@ const { loadJson, saveJson } = require('./configStore');
 const { ingestLog, listLogs, setLogStatus, autoResolveLogs } = require('./src/logsHubStore');
 
 const EVENT_LIMIT = 500;
-const NON_REPORTABLE = new Set(['INVALID_URL', 'ENV_MISCONFIG', 'MISSING_DSN']);
+const NON_REPORTABLE = new Set(['INVALID_URL', 'ENV_MISCONFIG', 'MISSING_DSN', 'CONFIG_DB_DSN_MISSING', 'CONFIG_DB_DSN_INVALID', 'CONFIG_DB_HOST_INVALID']);
 const LEVEL_WEIGHT = { info: 1, warn: 2, error: 3, critical: 4 };
 
 const memory = {
@@ -59,7 +59,7 @@ async function persistOpsState() {
   ]);
 }
 
-async function appendEvent({ level = 'info', source = 'pm', category = 'GENERAL', messageShort = '', messageFull = '', projectId = null, meta = null }) {
+async function appendEvent({ level = 'info', source = 'pm', category = 'GENERAL', messageShort = '', messageFull = '', projectId = null, meta = null, fingerprint = null }) {
   let safeMeta = null;
   if (meta != null) {
     try {
@@ -76,6 +76,7 @@ async function appendEvent({ level = 'info', source = 'pm', category = 'GENERAL'
     message_full: String(messageFull || messageShort || '').slice(0, 4000),
     meta_json: { ...(safeMeta || {}), source },
     projectId: projectId || safeMeta?.projectId || safeMeta?.project_id || null,
+    ...(fingerprint ? { fingerprint } : {}),
   });
   memory.eventLog = (await listLogs({})).slice(0, EVENT_LIMIT);
   return upserted.event;
@@ -96,6 +97,7 @@ async function setDbHealthSnapshot(next) {
   if (['DOWN', 'DEGRADED', 'MISCONFIG'].includes(memory.dbHealth.status) && prev === 'HEALTHY') {
     memory.dbHealth.lastOutageId += 1;
   }
+  if (next.lastErrorCategory && !memory.dbHealth.lastOutageId) memory.dbHealth.lastOutageId = 1;
   await saveJson('ops_db_health_snapshot', memory.dbHealth);
 }
 
@@ -110,6 +112,7 @@ async function getUserAlertPrefs(userId) {
 
 function shouldRouteEvent(prefs, event) {
   if (!prefs?.enable_alerts) return false;
+  if (event.meta_json?.source === 'config-db' && Number(event.occurrence_count) > 1) return false;
   if (NON_REPORTABLE.has(event.category)) return false;
   if (prefs.mute_categories?.includes(event.category)) return false;
   const min = LEVEL_WEIGHT[prefs.severity_threshold] || LEVEL_WEIGHT.warn;
@@ -128,6 +131,15 @@ function shouldRouteEvent(prefs, event) {
   bucket.lastSentAt = now;
   rateBuckets.set(bucketKey, bucket);
   return true;
+}
+
+async function resolveConfigDbIncidents(envVar) {
+  const rows = await listLogs({});
+  for (const row of rows) {
+    if (row.meta_json?.source === 'config-db' && row.meta_json?.envVar === envVar && (row.category.startsWith('CONFIG_DB_') || row.category === 'UNKNOWN_DB_ERROR') && row.status !== 'resolved') {
+      await setLogStatus({ id: row.id, status: 'resolved' });
+    }
+  }
 }
 
 function computeDestinations(prefs, eventLevel) {
@@ -159,6 +171,7 @@ module.exports = {
   shouldRouteEvent,
   computeDestinations,
   shouldNotifyRecovery,
+  resolveConfigDbIncidents,
   listOpsEvents: listLogs,
   setOpsEventStatus: setLogStatus,
   autoResolveOpsEvents: autoResolveLogs,

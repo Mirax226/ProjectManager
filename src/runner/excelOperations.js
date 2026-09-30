@@ -24,27 +24,60 @@ function sourcePath(asset) { return safePath(asset?.manualPath || asset?.sourceP
 function destinationPath(asset, profile, payload = {}) { return safePath(payload.destinationPath || asset?.backupPath || profile.backupLocation || profile.backupPath); }
 function safeMetadata(input) { const source = input && typeof input === 'object' ? input : {}; return Object.fromEntries(SAFE_META_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(source, key)).map((key) => [key, typeof source[key] === 'string' ? String(source[key]).slice(0, 500) : source[key]])); }
 
-const EXCEL_DESKTOP_PROBE = "$ErrorActionPreference='Stop'; $path=$env:PJ_EXCEL_PROBE_PATH; $before=@(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); $excel=$null; $book=$null; $owned=@(); $stage='COM_CREATE'; $stages=@('COM_CREATE'); $started=[Diagnostics.Stopwatch]::StartNew(); function Set-Stage([string]$next) { $script:stage=$next; $script:stages += $next }; function Safe([object]$e) { $h=$null; try { $h=('0x{0:X8}' -f ([uint32]$e.HResult)) } catch {}; [pscustomobject]@{ exceptionClass=([string]$e.GetType().FullName).Split('.')[-1]; message=(([string]$e.Message) -replace '[\r\n]+',' ' -replace '(?i)([A-Za-z]:\\|\\\\)[^ ]+','[PATH]'); hresult=$h } }; try { $excel=New-Object -ComObject Excel.Application; $afterCreate=@(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); $owned=@($afterCreate | Where-Object { $before -notcontains $_ }); Set-Stage 'EXCEL_CONFIGURE'; $excel.Visible=$false; $excel.DisplayAlerts=$false; $excel.AskToUpdateLinks=$false; $excel.EnableEvents=$false; $excel.AutomationSecurity=3; Set-Stage 'WORKBOOK_OPEN_START'; $book=$excel.Workbooks.Open($path, 0, $true); Set-Stage 'WORKBOOK_OPEN_SUCCESS'; Set-Stage 'WORKBOOK_READ_PROBE'; $version=[string]$excel.Version; Set-Stage 'WORKBOOK_CLOSE'; $book.Close($false); $book=$null; Set-Stage 'EXCEL_QUIT'; $excel.Quit(); $excel=$null; $started.Stop(); [pscustomobject]@{ ok=$true; version=$version; ownedProcessIds=@($owned); stage='EXCEL_QUIT'; stages=@($stages); durationMs=$started.ElapsedMilliseconds } | ConvertTo-Json -Compress } catch { $started.Stop(); [pscustomobject]@{ ok=$false; diagnosticCode=($(if($stage -eq 'COM_CREATE'){'COM_CREATE_FAILED'}elseif($stage -eq 'EXCEL_CONFIGURE'){'EXCEL_CONFIGURATION_FAILED'}elseif($stage -eq 'WORKBOOK_OPEN_START'){'WORKBOOK_OPEN_FAILED'}elseif($stage -eq 'WORKBOOK_READ_PROBE'){'WORKBOOK_READ_FAILED'}elseif($stage -eq 'WORKBOOK_CLOSE'){'WORKBOOK_CLOSE_FAILED'}elseif($stage -eq 'EXCEL_QUIT'){'EXCEL_QUIT_FAILED'}else{'EXCEL_OPEN_FAILED'})); failedStage=$stage; stages=@($stages); safeError=(Safe $_.Exception); durationMs=$started.ElapsedMilliseconds } | ConvertTo-Json -Compress } finally { if ($book) { try { $book.Close($false) } catch {} }; if ($excel) { try { $excel.Quit() } catch {}; try { [Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null } catch {} } }";
+const EXCEL_DESKTOP_SCRIPT = path.resolve(__dirname, '../../tools/excel-desktop-probe.ps1');
 
-function probeExcelDesktop(filePath, timeoutMs = 60_000) {
-  if (process.platform !== 'win32') return Promise.resolve({ ok: false, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', openability: 'NOT_VERIFIED' });
-  return new Promise((resolve) => {
-    let stdout = ''; let stderr = ''; let timedOut = false;
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', EXCEL_DESKTOP_PROBE], { shell: false, windowsHide: true, env: { ...process.env, PJ_EXCEL_PROBE_PATH: filePath } });
-    const timer = setTimeout(() => { timedOut = true; child.kill(); }, Math.min(120_000, Math.max(1_000, Number(timeoutMs) || 60_000)));
-    child.stdout?.on('data', (chunk) => { stdout += chunk; }); child.stderr?.on('data', (chunk) => { stderr += chunk; });
-    const finish = (result) => { clearTimeout(timer); resolve(result); };
-    child.on('error', () => finish({ ok: false, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', openability: 'NOT_VERIFIED' }));
-    child.on('close', (code) => {
-      if (timedOut) return finish({ ok: false, diagnosticCode: 'TIMEOUT', failedStage: 'TIMEOUT', openability: 'OPEN_FAILED' });
-      if (code !== 0) return finish({ ok: false, diagnosticCode: 'EXCEL_OPEN_FAILED', failedStage: 'COM_CREATE', openability: 'OPEN_FAILED' });
+async function probeExcelDesktop(filePath, timeoutMs = 60_000, options = {}) {
+  if (process.platform !== 'win32') return { ok: false, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', openability: 'NOT_VERIFIED' };
+  const spawnProcess = options.spawn || spawn;
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-excel-state-'));
+  const statePath = path.join(stateRoot, 'state.json');
+  const env = { ...process.env, PJ_EXCEL_PROBE_PATH: filePath, PJ_EXCEL_PROBE_STATE: statePath, PJ_EXCEL_SUPPRESS_REFRESH: options.suppressExternalRefresh === false ? 'false' : 'true' };
+  let timedOut = false;
+  let gracefulQuitTimedOut = false;
+  let savedState = null;
+  const invoke = (cleanup) => new Promise((resolve) => {
+    let stdout = ''; let settled = false;
+    const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', EXCEL_DESKTOP_SCRIPT, ...(cleanup ? ['-CleanupOnly'] : [])];
+    const child = spawnProcess('powershell.exe', args, { shell: false, windowsHide: true, env });
+    const timer = setTimeout(() => {
+      if (!cleanup) timedOut = true;
+      child.kill();
+    }, cleanup ? 15_000 : Math.min(120_000, Math.max(1000, Number(timeoutMs) || 60_000)));
+    let quitStartedAt = null;
+    const quitWatch = cleanup ? null : setInterval(() => {
       try {
-        const parsed = JSON.parse(stdout.trim());
-        if (!parsed.ok) return finish({ ...parsed, openability: 'OPEN_FAILED' });
-        return finish({ ...parsed, ok: true, openability: 'OPENABLE', excelVersion: String(parsed.version || '').slice(0, 80), ownedExcelProcessIds: Array.isArray(parsed.ownedProcessIds) ? parsed.ownedProcessIds.slice(0, 8).map((id) => Number(id)).filter(Number.isInteger) : [] });
-      } catch (_) { return finish({ ok: false, diagnosticCode: stderr ? 'EXCEL_OPEN_FAILED' : 'EXCEL_DESKTOP_UNAVAILABLE', failedStage: 'COM_CREATE', openability: 'NOT_VERIFIED' }); }
+        const state = JSON.parse(fs.readFileSync(statePath, 'utf8').replace(/^\uFEFF/, ''));
+        if (state.stage === 'EXCEL_QUIT') {
+          quitStartedAt ||= Date.now();
+          if (Date.now() - quitStartedAt >= 5000) { timedOut = true; gracefulQuitTimedOut = true; child.kill(); }
+        }
+      } catch (_) {}
+    }, 250);
+    const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); clearInterval(quitWatch); resolve(value); };
+    child.stdout?.on('data', (chunk) => { stdout = (stdout + chunk).slice(0, 16000); });
+    child.stderr?.on('data', () => {});
+    child.on('error', () => finish(null));
+    child.on('close', () => {
+      try { finish(JSON.parse(stdout.trim().replace(/^\uFEFF/, ''))); } catch (_) { finish(null); }
     });
   });
+  try {
+    const parsed = await invoke(false);
+    try { savedState = JSON.parse(fs.readFileSync(statePath, 'utf8').replace(/^\uFEFF/, '')); } catch (_) {}
+    // Always run cleanup in a separate process: a killed COM worker cannot run
+    // its finally block. Ownership comes from the HWND and creation timestamp.
+    const cleanup = await invoke(true);
+    const result = timedOut
+      ? { ok: false, diagnosticCode: 'TIMEOUT', failedStage: savedState?.stage || 'COM_CREATE', stages: savedState?.stages || [], ownedProcessIds: (savedState?.owned || []).map((entry) => entry.id) }
+      : parsed || { ok: false, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', failedStage: savedState?.stage || 'COM_CREATE' };
+    const cleanupVerified = cleanup?.cleanupVerified === true && (savedState?.owned?.length > 0 || cleanup.noNewExcelProcessesObserved === true);
+    const quitRecovered = timedOut && savedState?.stage === 'EXCEL_QUIT' && ['WORKBOOK_OPEN_SUCCESS', 'WORKBOOK_READ_PROBE', 'WORKBOOK_CLOSE', 'EXCEL_QUIT'].every((stage) => savedState?.stages?.includes(stage)) && savedState?.owned?.length > 0 && cleanupVerified;
+    if (quitRecovered) { gracefulQuitTimedOut = true; result.ok = true; result.diagnosticCode = null; result.lifecycleWarningCode = 'EXCEL_QUIT_TIMEOUT_RECOVERED'; result.safeError = { exceptionClass: 'TimeoutError', hresult: null, message: 'Excel.Quit timed out; verified owned process cleaned up' }; }
+    if (result.ok && !cleanupVerified) { result.ok = false; result.diagnosticCode = 'EXCEL_PROCESS_CLEANUP_FAILED'; result.failedStage = 'EXCEL_QUIT'; }
+    return { ...result, openability: result.ok ? 'OPENABLE' : 'OPEN_FAILED', excelVersion: result.version || savedState?.excelVersion || null, externalRefreshSuppressed: result.externalRefreshSuppressed ?? savedState?.externalRefreshSuppressed ?? null, refreshFlagsCleared: result.refreshFlagsCleared ?? savedState?.refreshFlagsCleared ?? null, queryTablesDisabled: result.queryTablesDisabled ?? savedState?.queryTablesDisabled ?? null, calculationDisabled: result.calculationDisabled ?? savedState?.calculationDisabled ?? null, vbaProjectUnchanged: result.vbaProjectUnchanged ?? savedState?.vbaProjectUnchanged ?? null, gracefulQuitTimedOut, ownedExcelProcessIds: result.ownedProcessIds || [], cleanupVerified, ownershipVerified: Boolean(savedState?.owned?.length), remainingOwnedProcessIds: cleanup?.remainingOwnedProcessIds || [], unverifiedNewExcelProcessIds: cleanup?.unverifiedNewExcelProcessIds || [] };
+  } finally {
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  }
 }
 
 async function healthcheck(job, profile, options = {}) {
@@ -74,7 +107,7 @@ async function healthcheck(job, profile, options = {}) {
       result.disposableCopy = 'CREATED'; result.disposableCopyUsed = true;
       const probed = typeof options.probeOpenability === 'function' ? await options.probeOpenability(probePath) : await probeExcelDesktop(probePath, options.probeTimeoutMs);
       if (typeof probed === 'string') result.openability = probed;
-      else if (probed && typeof probed === 'object') { result.openability = probed.openability || (probed.ok ? 'OPENABLE' : 'OPEN_FAILED'); result.excelVersion = probed.excelVersion || null; result.ownedExcelProcessIds = Array.isArray(probed.ownedExcelProcessIds) ? probed.ownedExcelProcessIds : []; result.failedStage = probed.failedStage || null; result.safeErrorClass = probed.safeError?.exceptionClass || null; result.safeError = probed.safeError ? { exceptionClass: String(probed.safeError.exceptionClass || '').slice(0, 80), hresult: String(probed.safeError.hresult || '').slice(0, 20), message: String(probed.safeError.message || '').slice(0, 240) } : null; result.probeDurationMs = Number.isFinite(probed.durationMs) ? probed.durationMs : null; }
+      else if (probed && typeof probed === 'object') { result.openability = probed.openability || (probed.ok ? 'OPENABLE' : 'OPEN_FAILED'); result.excelVersion = probed.excelVersion || null; result.ownedExcelProcessIds = Array.isArray(probed.ownedExcelProcessIds) ? probed.ownedExcelProcessIds : []; result.failedStage = probed.failedStage || null; result.safeErrorClass = probed.safeError?.exceptionClass || null; result.safeError = probed.safeError ? { exceptionClass: String(probed.safeError.exceptionClass || '').slice(0, 80), hresult: String(probed.safeError.hresult || '').slice(0, 20), message: String(probed.safeError.message || '').slice(0, 240) } : null; result.probeDurationMs = Number.isFinite(probed.durationMs) ? probed.durationMs : null; result.excelProcessCleanupVerified = probed.cleanupVerified ?? null; result.excelProcessOwnershipVerified = probed.ownershipVerified ?? null; result.unverifiedNewExcelProcessIds = probed.unverifiedNewExcelProcessIds || []; result.externalRefreshSuppressed = probed.externalRefreshSuppressed ?? null; result.queryTablesDisabled = probed.queryTablesDisabled ?? null; result.calculationDisabled = probed.calculationDisabled ?? null; result.refreshFlagsCleared = probed.refreshFlagsCleared ?? null; result.vbaProjectUnchanged = probed.vbaProjectUnchanged ?? null; result.lifecycleWarningCode = probed.lifecycleWarningCode ?? null; result.gracefulQuitTimedOut = probed.gracefulQuitTimedOut ?? false; }
       if (Array.isArray(probed?.stages)) probed.stages.forEach((stage) => { if (typeof stage === 'string' && !result.stages.some((entry) => entry.stage === stage)) mark(stage); });
       if (result.failedStage && !result.stages.some((entry) => entry.stage === result.failedStage)) mark(result.failedStage);
       if (probed && typeof probed === 'object' && probed.diagnosticCode === 'EXCEL_DESKTOP_UNAVAILABLE') { await sourceAfter(); return { ok: false, result: { ...result, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE' }, diagnosticCode: 'EXCEL_DESKTOP_UNAVAILABLE', eventCategory: 'EXCEL_DESKTOP_UNAVAILABLE' }; }

@@ -4,12 +4,12 @@ const assert = require('node:assert/strict');
 const { maskDsn, tryFixPostgresDsn } = require('../configDb');
 const { shouldRouteEvent, computeDestinations, shouldNotifyRecovery } = require('../opsReliability');
 
-test('maskDsn masks password and preserves host/db', () => {
+test('maskDsn hides complete credentials including password suffix and query secrets', () => {
   const input = 'postgres://user:SuperSecret1234@db.example.com:5432/appdb?sslmode=require';
   const masked = maskDsn(input);
   assert.equal(masked.includes('SuperSecret1234'), false);
-  assert.equal(masked.includes('***1234'), true);
-  assert.equal(masked.includes('db.example.com:5432/appdb'), true);
+  assert.equal(masked.includes('1234'), false);
+  assert.equal(masked, 'postgresql://[REDACTED]');
 });
 
 test('tryFixPostgresDsn encodes credentials once', () => {

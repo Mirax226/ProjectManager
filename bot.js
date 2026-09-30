@@ -17,7 +17,8 @@ const {
   setNextRetryInMs: setConfigDbNextRetry,
   snapshot: getConfigDbSnapshot,
 } = require('./configDbState');
-const { classifyDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
+const { classifyDbError, classifyConfigDbError, configDbIncidentFingerprint, isConfigDbRetryable, sanitizeDbErrorMessage } = require('./configDbErrors');
+const { getConfigDbSourceMetadata } = require('./configDb');
 function truncateRuntimeError(value, max = 2500) {
   const text = String(value == null ? '' : value);
   if (text.length <= max) return text;
@@ -33,6 +34,7 @@ const {
   shouldRouteEvent,
   computeDestinations,
   shouldNotifyRecovery,
+  resolveConfigDbIncidents,
 } = require('./opsReliability');
 
 process.on('unhandledRejection', (reason) => {
@@ -313,7 +315,8 @@ const WEB_DASHBOARD_SESSION_TTL_MINUTES = 20;
 const WEB_DASHBOARD_LOGIN_WINDOW_MS = 60_000;
 const WEB_DASHBOARD_LOGIN_MAX_ATTEMPTS = 5;
 const WEB_DASHBOARD_LOGIN_BLOCK_MS = 5 * 60_000;
-const CONFIG_DB_MAX_RETRIES_PER_BOOT = Number(process.env.CONFIG_DB_MAX_RETRIES_PER_BOOT || 20);
+const configuredDbRetryCap = Number(process.env.CONFIG_DB_MAX_RETRIES_PER_BOOT || 20);
+const CONFIG_DB_MAX_RETRIES_PER_BOOT = Number.isFinite(configuredDbRetryCap) && configuredDbRetryCap > 0 ? Math.max(1, Math.min(100, Math.floor(configuredDbRetryCap))) : 20;
 const WEB_DASHBOARD_ASSETS_DIR = path.join(__dirname, 'src', 'web');
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
 const LOG_API_ADMIN_CHAT_ID =
@@ -2383,7 +2386,7 @@ function buildConfigDbStatusLine() {
   const snapshot = getConfigDbSnapshot();
   if (snapshot.ready) return '';
   if (!process.env.DATABASE_URL_PM && !process.env.PATH_APPLIER_CONFIG_DSN) return '🟡 Config DB: Misconfigured';
-  if (snapshot.lastErrorCategory === 'INVALID_URL') return '🟡 Config DB: Misconfigured';
+  if (['INVALID_URL', 'CONFIG_DB_DSN_INVALID', 'CONFIG_DB_HOST_INVALID', 'CONFIG_DB_DSN_MISSING'].includes(snapshot.lastErrorCategory)) return '🟡 Config DB: Misconfigured';
   if (snapshot.nextRetryInMs > 0) return '🟠 Config DB: Degraded';
   return '🔴 Config DB: Down';
 }
@@ -2426,7 +2429,7 @@ function buildConfigDbStatusView(notice) {
   const snapshot = getConfigDbSnapshot();
   const configured = Boolean(process.env.DATABASE_URL_PM || process.env.PATH_APPLIER_CONFIG_DSN);
   const configuredDsn = getConfiguredConfigDbDsn();
-  const invalidUrlNotice = snapshot.lastErrorCategory === 'INVALID_URL'
+  const invalidUrlNotice = ['INVALID_URL', 'CONFIG_DB_DSN_INVALID', 'CONFIG_DB_HOST_INVALID'].includes(snapshot.lastErrorCategory)
     ? [
         '',
         '⚠️ Invalid URL detected for Config DB DSN.',
@@ -2573,7 +2576,7 @@ function decodeRoutinePayload(id) {
 }
 
 function buildRoutineFixButton(text, category, refId, extra = {}) {
-  const blockedCategories = new Set(['INVALID_URL', 'ENV_MISCONFIG', 'MISSING_DSN']);
+  const blockedCategories = new Set(['INVALID_URL', 'CONFIG_DB_DSN_INVALID', 'CONFIG_DB_HOST_INVALID', 'CONFIG_DB_DSN_MISSING', 'ENV_MISCONFIG', 'MISSING_DSN']);
   if (blockedCategories.has(String(category || '').toUpperCase())) return null;
   const payload = encodeRoutinePayload({
     text: String(text || '').slice(0, 1200),
@@ -2718,7 +2721,7 @@ async function testConfigDbConnection() {
     return status;
   }
   console.error('Config DB connection failed', status.message);
-  if (status.category !== 'INVALID_URL') {
+  if (!['CONFIG_DB_DSN_INVALID', 'CONFIG_DB_HOST_INVALID', 'CONFIG_DB_DSN_MISSING'].includes(status.category)) {
     await forwardSelfLog('error', 'Config DB connection failed', {
       context: { error: status.message, category: status.category },
     });
@@ -2779,21 +2782,22 @@ async function runConfigDbWarmup(reason = 'scheduled') {
     const status = await withDbTimeout(probeConfigDbConnection(), `config_db_warmup:${reason}`);
     if (!status.configured) {
       const message = sanitizeDbErrorMessage(status.message) || 'not configured';
-      recordDbError('UNKNOWN_DB_ERROR', message);
+      recordDbError('CONFIG_DB_DSN_MISSING', message);
       configDbFailureStreak += 1;
       runtimeStatus.configDbOk = false;
       runtimeStatus.configDbError = message;
-      if (shouldLogConfigDbFailure('UNKNOWN_DB_ERROR')) {
+      if (shouldLogConfigDbFailure('CONFIG_DB_DSN_MISSING')) {
         console.warn('[db] Config DB not configured; warmup halted.');
-        configDbLastLogCategory = 'UNKNOWN_DB_ERROR';
+        configDbLastLogCategory = 'CONFIG_DB_DSN_MISSING';
         configDbLastLogAttempt = configDbFailureStreak;
       }
       await setDbHealthSnapshot({
         status: 'MISCONFIG',
-        lastErrorCategory: 'MISSING_DSN',
+        lastErrorCategory: 'CONFIG_DB_DSN_MISSING',
         lastErrorMessageMasked: message,
       });
-      await emitOpsEvent('warn', 'ENV_MISCONFIG', 'Config DB DSN missing; running in memory mode.', { reason });
+      await emitOpsEvent('warn', 'CONFIG_DB_DSN_MISSING', 'Config DB DSN missing; running in memory mode.', { reason });
+      configDbWarmupHaltedForBoot = true;
       setConfigDbNextRetry(0);
       return;
     }
@@ -2805,17 +2809,14 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       }
       setDbReady(true);
       setDegradedMode(false);
-      await setDbHealthSnapshot({
-        status: 'HEALTHY',
-        lastErrorCategory: null,
-        lastErrorMessageMasked: null,
-      });
       const configOk = await loadConfig();
       if (!configOk) {
         throw new Error('Config load failed');
       }
       runtimeStatus.configDbOk = true;
       runtimeStatus.configDbError = null;
+      await resolveConfigDbIncidents(getConfigDbSourceMetadata().envVar);
+      await setDbHealthSnapshot({ status: 'HEALTHY', lastErrorCategory: null, lastErrorMessageMasked: null });
       configDbFailureStreak = 0;
       configDbDsnIssueAttempts = 0;
       setConfigDbNextRetry(0);
@@ -2839,20 +2840,18 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       configDbLastLogAttempt = configDbFailureStreak;
     }
     await setDbHealthSnapshot({
-      status: category === 'INVALID_URL' ? 'MISCONFIG' : 'DOWN',
+      status: ['CONFIG_DB_DSN_INVALID', 'CONFIG_DB_HOST_INVALID', 'CONFIG_DB_DSN_MISSING'].includes(category) ? 'MISCONFIG' : 'DOWN',
       lastErrorCategory: category,
       lastErrorMessageMasked: message,
     });
     await emitOpsEvent('warn', category, `Config DB warmup failed: ${message || 'unknown error'}`, { attempt: attemptCount, reason });
-    const isDsnIssue = category === 'INVALID_URL' || isDsnAutoFixApplied();
+    const isDsnIssue = !isConfigDbRetryable(category);
     if (isDsnIssue) {
       configDbDsnIssueAttempts += 1;
-      if (configDbDsnIssueAttempts >= 2) {
-        configDbWarmupHaltedForBoot = true;
-        setConfigDbNextRetry(0);
-        console.warn('[db] Config DB unavailable after DSN auto-fix attempt; running in-memory config mode for this boot.');
-        return;
-      }
+      configDbWarmupHaltedForBoot = true;
+      setConfigDbNextRetry(0);
+      console.warn('[db] Config DB non-transient failure; warmup halted for this boot. Review configuration before restarting.');
+      return;
     }
     if (shouldHaltConfigDbRetries()) {
       configDbWarmupHaltedForBoot = true;
@@ -2866,7 +2865,7 @@ async function runConfigDbWarmup(reason = 'scheduled') {
     const delayMs = computeConfigDbBackoff(configDbFailureStreak);
     scheduleConfigDbWarmup(delayMs, 'retry');
   } catch (error) {
-    const category = classifyDbError(error);
+    const category = classifyConfigDbError(error);
     const message = sanitizeDbErrorMessage(error?.message);
     recordDbError(category, message);
     configDbFailureStreak += 1;
@@ -2883,20 +2882,18 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       configDbLastLogAttempt = configDbFailureStreak;
     }
     await setDbHealthSnapshot({
-      status: category === 'INVALID_URL' ? 'MISCONFIG' : 'DOWN',
+      status: ['CONFIG_DB_DSN_INVALID', 'CONFIG_DB_HOST_INVALID', 'CONFIG_DB_DSN_MISSING'].includes(category) ? 'MISCONFIG' : 'DOWN',
       lastErrorCategory: category,
       lastErrorMessageMasked: message,
     });
     await emitOpsEvent('error', category, `Config DB warmup exception: ${message || 'unknown error'}`, { attempt: attemptCount, reason });
-    const isDsnIssue = category === 'INVALID_URL' || isDsnAutoFixApplied();
+    const isDsnIssue = !isConfigDbRetryable(category);
     if (isDsnIssue) {
       configDbDsnIssueAttempts += 1;
-      if (configDbDsnIssueAttempts >= 2) {
-        configDbWarmupHaltedForBoot = true;
-        setConfigDbNextRetry(0);
-        console.warn('[db] Config DB unavailable after DSN auto-fix attempt; running in-memory config mode for this boot.');
-        return;
-      }
+      configDbWarmupHaltedForBoot = true;
+      setConfigDbNextRetry(0);
+      console.warn('[db] Config DB non-transient failure; warmup halted for this boot. Review configuration before restarting.');
+      return;
     }
     if (shouldHaltConfigDbRetries()) {
       configDbWarmupHaltedForBoot = true;
@@ -3064,7 +3061,11 @@ async function emitInternalBotUiError(payload) {
 }
 
 async function emitOpsEvent(level, category, message, meta) {
-  const event = await appendEvent({ level, category, messageShort: message, source: 'config-db', meta });
+  const configFailure = category.startsWith('CONFIG_DB_') || category === 'UNKNOWN_DB_ERROR';
+  const source = configFailure ? getConfigDbSourceMetadata() : null;
+  const safeMeta = source ? { ...meta, envVar: source.envVar, hostname: source.hostname } : meta;
+  const fingerprint = source ? configDbIncidentFingerprint({ projectId: meta?.projectId, source: source.envVar, category, hostname: source.hostname, message }) : null;
+  const event = await appendEvent({ level, category, messageShort: message, source: 'config-db', meta: safeMeta, fingerprint });
   opsTimeline.append({
     scope: meta?.projectId ? 'project' : 'global', projectId: meta?.projectId || null,
     type: category, severity: level, title: message, detailsMasked: maskDiagnosticText(JSON.stringify(meta || {})), refId: meta?.refId || null,
@@ -26534,6 +26535,7 @@ module.exports = {
     getPmDiagnosticsForTests: () => pmLogger.diagnostics(),
     isPmTestAllowedForTests: (token) => pmLogger.isTestRequestAllowed(token),
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
+    computeConfigDbBackoff,
     buildRoutineFixButton,
     buildScopedHeader,
     buildProjectHubView,

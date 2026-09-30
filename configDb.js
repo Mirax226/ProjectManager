@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
-const { classifyDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
+const { isIP } = require('node:net');
+const { classifyDbError, classifyConfigDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
 
 let pool = null;
 let sslWarningEmitted = false;
@@ -21,24 +22,46 @@ function getConfigDbEnvSource() {
   return { envVar: null, dsn: null };
 }
 
+function inspectConfigDbDsn(dsn) {
+  const value = String(dsn || '');
+  const base = { configured: Boolean(value), valid: false, scheme: null, hostname: null, port: null, databaseNamePresent: false, usernamePresent: false, hostValid: false };
+  if (!value) return { ...base, category: 'CONFIG_DB_DSN_MISSING' };
+  let parsed;
+  try { parsed = new URL(value); } catch (_error) { return { ...base, category: 'CONFIG_DB_DSN_INVALID' }; }
+  const scheme = String(parsed.protocol || '').toLowerCase();
+  const hostname = String(parsed.hostname || '');
+  const ipHost = hostname.replace(/^\[|\]$/g, '');
+  const hostValid = Boolean(isIP(ipHost)) || (hostname.length <= 253 && hostname.split('.').every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)));
+  const validScheme = scheme === 'postgres:' || scheme === 'postgresql:';
+  const databaseNamePresent = String(parsed.pathname || '').replace(/^\/+/, '').length > 0;
+  const result = { ...base, valid: validScheme && hostValid && databaseNamePresent, scheme: scheme || null, hostname: hostname || null, port: parsed.port ? Number(parsed.port) : 5432, databaseNamePresent, usernamePresent: Boolean(parsed.username), hostValid };
+  if (!validScheme) return { ...result, category: 'CONFIG_DB_DSN_INVALID' };
+  // pg-connection-string query parameters can override URI authority fields.
+  // Reject ambiguous destinations rather than validating one host and dialing another.
+  if (['host', 'port'].some((key) => parsed.searchParams.has(key)) || (parsed.port && (Number(parsed.port) < 1 || Number(parsed.port) > 65535))) return { ...result, category: 'CONFIG_DB_DSN_INVALID' };
+  try { decodeURIComponent(parsed.username); decodeURIComponent(parsed.password); decodeURI(parsed.pathname); } catch (_) { return { ...result, category: 'CONFIG_DB_DSN_INVALID' }; }
+  if (!hostValid) return { ...result, category: 'CONFIG_DB_HOST_INVALID' };
+  if (!databaseNamePresent) return { ...result, category: 'CONFIG_DB_DSN_INVALID' };
+  return { ...result, category: null };
+}
+
+function getConfigDbSourceMetadata() {
+  const source = getConfigDbEnvSource();
+  const inspected = inspectConfigDbDsn(tryFixPostgresDsn(source.dsn).dsn);
+  return { envVar: source.envVar, configured: inspected.configured, category: inspected.category, scheme: inspected.scheme, hostname: inspected.hostname, port: inspected.port, databaseNamePresent: inspected.databaseNamePresent, usernamePresent: inspected.usernamePresent };
+}
+
+function createConfigDbError(category, message, details = {}) {
+  const error = new Error(message || category);
+  error.code = category;
+  error.configDbCategory = category;
+  error.configDbDetails = details;
+  return error;
+}
+
 function maskDsn(dsn) {
   if (!dsn) return null;
-  const text = String(dsn);
-  try {
-    const parsed = new URL(text);
-    const username = parsed.username || '';
-    const password = parsed.password || '';
-    const maskedPassword = password ? `***${password.slice(-4)}` : '';
-    const userInfo = username
-      ? `${username}${password ? `:${maskedPassword}` : ''}@`
-      : '';
-    return `${parsed.protocol}//${userInfo}${parsed.host}${parsed.pathname}${parsed.search}`;
-  } catch (_error) {
-    return text.replace(/(postgres(?:ql)?:\/\/[^:\s@]+:)([^@\s]+)(@)/i, (_m, p1, p2, p3) => {
-      const suffix = String(p2).slice(-4);
-      return `${p1}***${suffix}${p3}`;
-    });
-  }
+  return 'postgresql://[REDACTED]';
 }
 
 function tryFixPostgresDsn(dsn) {
@@ -108,27 +131,30 @@ async function getConfigDbPool() {
   }
 
   let dsn = rawDsn;
-  if (!dsnAutoFixApplied) {
+  {
     const fixResult = tryFixPostgresDsn(rawDsn);
     if (fixResult.fixed) {
       dsn = fixResult.dsn;
+      const shouldWarn = !dsnAutoFixApplied;
       dsnAutoFixApplied = true;
       const warningMessage = `[configDb] Auto-fixed malformed Postgres DSN from ${envVar} (detected unescaped special characters in username/password). Please update ENV with encoded credentials.`;
       const context = {
         envVar,
         detected: 'Invalid URL caused by unescaped special characters in username/password',
-        originalMaskedDsn: maskDsn(rawDsn),
-        correctedMaskedDsn: maskDsn(dsn),
         fixHint: 'Set encoded DSN in ENV (encode username/password only).',
       };
-      console.warn(warningMessage, context);
-      await forwardConfigDbWarning(warningMessage, context);
+      if (shouldWarn) { console.warn(warningMessage, context); await forwardConfigDbWarning(warningMessage, context); }
     }
+  }
+
+  const dsnInspection = inspectConfigDbDsn(dsn);
+  if (dsnInspection.category) {
+    throw createConfigDbError(dsnInspection.category, `Config DB DSN preflight failed: ${dsnInspection.category}`, { envVar, ...dsnInspection });
   }
 
   if (!pool) {
     if (!sslWarningEmitted) {
-      const sslMode = `${dsn} ${process.env.DATABASE_URL || ''}`.toLowerCase();
+      const sslMode = new URL(dsn).search.toLowerCase();
       if (sslMode.includes('sslmode=require') && !sslMode.includes('uselibpqcompat=true')) {
         console.warn(
           '[configDb] SSL warning: add uselibpqcompat=true or use direct 5432 Supabase host to avoid SSL chain errors.',
@@ -136,7 +162,7 @@ async function getConfigDbPool() {
         sslWarningEmitted = true;
       }
     }
-    const sslMode = `${dsn} ${process.env.DATABASE_URL || ''}`.toLowerCase();
+    const sslMode = new URL(dsn).search.toLowerCase();
     const sslRequired = sslMode.includes('sslmode=require') || sslMode.includes('ssl=true');
     const ssl = sslRequired
       ? { rejectUnauthorized: !ALLOW_INSECURE_TLS_FOR_TESTS }
@@ -178,17 +204,18 @@ async function withDbTimeout(promise, context) {
 }
 
 async function testConfigDbConnection() {
-  const db = await getConfigDbPool();
-  if (!db) {
-    return { ok: false, category: 'UNKNOWN_DB_ERROR', message: 'not configured', configured: false };
-  }
   try {
+    const source = getConfigDbEnvSource();
+    if (!source.dsn) return { ok: false, category: 'CONFIG_DB_DSN_MISSING', message: 'Config DB DSN is not configured', configured: false, source: source.envVar };
+    const db = await getConfigDbPool();
+    if (!db) return { ok: false, category: 'CONFIG_DB_DSN_MISSING', message: 'Config DB DSN is not configured', configured: false, source: source.envVar };
     await withDbTimeout(db.query('SELECT 1'), 'config_db_test');
-    return { ok: true, configured: true };
+    return { ok: true, configured: true, source: source.envVar };
   } catch (error) {
-    const category = classifyDbError(error);
+    let category = error.configDbCategory || classifyConfigDbError(error);
+    if (category === 'UNKNOWN_DB_ERROR' && /^[0-9A-Z]{5}$/.test(String(error.code || ''))) category = 'CONFIG_DB_QUERY_FAILED';
     const message = sanitizeDbErrorMessage(error?.message) || 'connection failed';
-    return { ok: false, category, message, configured: true };
+    return { ok: false, category, legacyCategory: classifyDbError(error), message, configured: true };
   }
 }
 
@@ -197,5 +224,9 @@ module.exports = {
   testConfigDbConnection,
   maskDsn,
   tryFixPostgresDsn,
+  getConfigDbEnvSource,
+  inspectConfigDbDsn,
+  getConfigDbSourceMetadata,
+  classifyConfigDbError,
   isDsnAutoFixApplied,
 };

@@ -1,0 +1,102 @@
+{
+  "date": "2026-09-30",
+  "runtime": "local in-memory Control Plane / Windows Runner / real Excel COM",
+  "preexistingExcelProcessIds": [
+    2868
+  ],
+  "workbooks": [
+    {
+      "asset": "Mirax.xlsm",
+      "ok": false,
+      "jobStatus": "FAILED",
+      "eventCategory": "EXCEL_OPEN_FAILED",
+      "openability": "OPEN_FAILED",
+      "failedStage": "COM_CREATE",
+      "diagnosticCode": "TIMEOUT",
+      "safeError": null,
+      "durationMs": 96503,
+      "probeDurationMs": null,
+      "excelVersion": null,
+      "disposableCopyUsed": true,
+      "sourceHashBefore": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "sourceHashAfter": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "sourceUnchanged": true,
+      "ownedExcelProcessIds": [],
+      "excelProcessOwnershipVerified": false,
+      "excelProcessCleanupVerified": false,
+      "externalRefreshSuppressed": true,
+      "refreshFlagsCleared": 2,
+      "vbaProjectUnchanged": true,
+      "lifecycleWarningCode": null,
+      "gracefulQuitTimedOut": false,
+      "stages": [
+        "ASSET_RESOLVE",
+        "SOURCE_EXISTS",
+        "SOURCE_HASH_BEFORE",
+        "COPY_CREATE",
+        "COPY_CONFIGURE",
+        "COM_CREATE",
+        "SOURCE_HASH_AFTER",
+        "COPY_DELETE"
+      ]
+    },
+    {
+      "asset": "Gozareshkar.xlsm",
+      "ok": true,
+      "jobStatus": "SUCCEEDED",
+      "eventCategory": "EXCEL_HEALTH_RECOVERED",
+      "openability": "OPENABLE",
+      "failedStage": "EXCEL_QUIT",
+      "diagnosticCode": null,
+      "safeError": {
+        "exceptionClass": "TimeoutError",
+        "hresult": "",
+        "message": "Excel.Quit timed out; verified owned process cleaned up"
+      },
+      "durationMs": 44870,
+      "probeDurationMs": null,
+      "excelVersion": "16.0",
+      "disposableCopyUsed": true,
+      "sourceHashBefore": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "sourceHashAfter": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "sourceUnchanged": true,
+      "ownedExcelProcessIds": [
+        49004
+      ],
+      "excelProcessOwnershipVerified": true,
+      "excelProcessCleanupVerified": true,
+      "externalRefreshSuppressed": true,
+      "refreshFlagsCleared": 0,
+      "vbaProjectUnchanged": true,
+      "lifecycleWarningCode": "EXCEL_QUIT_TIMEOUT_RECOVERED",
+      "gracefulQuitTimedOut": true,
+      "stages": [
+        "ASSET_RESOLVE",
+        "SOURCE_EXISTS",
+        "SOURCE_HASH_BEFORE",
+        "COPY_CREATE",
+        "COPY_CONFIGURE",
+        "COM_CREATE",
+        "EXCEL_CONFIGURE",
+        "WORKBOOK_OPEN_START",
+        "WORKBOOK_OPEN_SUCCESS",
+        "WORKBOOK_READ_PROBE",
+        "WORKBOOK_CLOSE",
+        "EXCEL_QUIT",
+        "COPY_DELETE",
+        "SOURCE_HASH_AFTER"
+      ]
+    }
+  ],
+  "finalExcelProcessIds": [
+    2868,
+    31620
+  ],
+  "preexistingProcessesPreserved": true,
+  "probeOwnedProcessesExited": true,
+  "allProcessCleanupVerified": false,
+  "unverifiedNewExcelProcessIds": [
+    31620
+  ],
+  "ownershipException": "COM_CREATE timed out before HWND identity returned; newly observed automation process left untouched because ownership is unverified."
+}

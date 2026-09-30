@@ -10,3 +10,9 @@ test('config DB warmup retry logic halts after configured cap', () => {
   assert.equal(__test.shouldHaltConfigDbRetries(), cap > 0);
   __test.setConfigDbFailureStreakForTests(0);
 });
+
+test('Config DB transient retries use exponential backoff bounded to one minute plus jitter', () => {
+  assert.ok(__test.computeConfigDbBackoff(1) >= 500 && __test.computeConfigDbBackoff(1) <= 750);
+  assert.ok(__test.computeConfigDbBackoff(4) >= 4000 && __test.computeConfigDbBackoff(4) <= 4250);
+  assert.ok(__test.computeConfigDbBackoff(100) >= 60000 && __test.computeConfigDbBackoff(100) <= 60250);
+});
