@@ -8,11 +8,17 @@
     "pm": "./pm"
   },
   "scripts": {
-    "start": "node src/bot.js",
+    "start": "wrangler dev",
     "test": "node --require ./test/setup-env.js --test",
     "runner": "node src/runner/index.js",
     "dev:control": "node src/controlPlane/server.js",
-    "check": "node --check src/controlPlane/handler.js && node --check src/controlPlane/operationalState.js && node --check src/controlPlane/d1Store.js && node --check src/runner/jobExecutor.js && node --check src/runner/excelOperations.js && node --check src/dailySystemAdapter.js && node --check src/telegramOpsCenter.js"
+    "check": "node --check src/controlPlane/handler.js && node --check src/controlPlane/operationalState.js && node --check src/controlPlane/d1Store.js && node --check src/runner/jobExecutor.js && node --check src/runner/excelOperations.js && node --check src/dailySystemAdapter.js && node --check src/telegramOpsCenter.js && node --check src/controlPlane/worker.js && node --check src/controlPlane/telegramWebhook.js && node --check src/telegramApplication.js && node --check tools/telegram-webhook.js",
+    "start:legacy": "node src/bot.js",
+    "worker:dev": "wrangler dev",
+    "worker:deploy": "wrangler deploy",
+    "worker:build": "wrangler deploy --dry-run",
+    "test:worker": "node --require ./test/setup-env.js --test test/cloudflareRuntime.test.js",
+    "telegram:webhook": "node tools/telegram-webhook.js"
   },
   "dependencies": {
     "@octokit/rest": "^20.1.1",
@@ -21,5 +27,15 @@
     "node-fetch": "^2.7.0",
     "pg": "^8.12.0",
     "simple-git": "^3.24.0"
+  },
+  "devDependencies": {
+    "miniflare": "^4.20260730.0",
+    "wrangler": "^4.145.0"
+  },
+  "overrides": {
+    "miniflare@^4.20260730.0": {
+      "undici": "^7.29.1",
+      "sharp": "^0.35.4"
+    }
   }
 }

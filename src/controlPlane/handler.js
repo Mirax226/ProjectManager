@@ -1,3 +1,4 @@
+const { boundedJson } = require('./requestBody');
 const { createAuthenticator } = require('./auth');
 
 function json(data, status = 200, headers = {}) {
@@ -37,12 +38,17 @@ function createControlPlaneHandler({ store, authenticator, tokens, logger = cons
     if (request.method === 'GET' && url.pathname === '/api/v1/projects') return json({ ok: true, projects: (identity.role === 'admin' ? await store.listProjects() : (await store.listProjects()).filter((p) => p.id === (identity.project || p.id))) }, 200, headers);
     if (request.method === 'GET' && url.pathname === '/api/v1/jobs') return json({ ok: true, jobs: await store.listJobs(identity.role === 'admin' ? url.searchParams.get('projectId') : identity.project) }, 200, headers);
     if (request.method === 'GET' && /^\/api\/v1\/jobs\/[^/]+$/.test(url.pathname)) {
-      const job = await store.getJob(url.pathname.split('/').pop(), identity.role === 'project' ? identity.project : null);
+      const job = await store.getJob(url.pathname.split('/').pop(), identity.role === 'admin' ? null : identity.project);
       return job ? json({ ok: true, job }, 200, headers) : json({ ok: false, error: 'not_found' }, 404, headers);
     }
     let payload = {};
     if (request.method === 'POST') {
-      try { payload = await request.json(); } catch (_) { return json({ ok: false, error: 'invalid_json' }, 400, headers); }
+      try { payload = await boundedJson(request); } catch (error) { return json({ ok: false, error: error.message === 'body_limit' ? 'body_limit' : 'invalid_json' }, error.message === 'body_limit' ? 413 : 400, headers); }
+    }
+    if (url.pathname === '/api/v1/config') {
+      if (identity.role !== 'admin') return json({ ok:false,error:'admin_required' },403,headers);
+      if (request.method === 'GET') return json({ ok:true,config:store.operationalConfig },200,headers);
+      if (request.method === 'POST') { const saved=await store.saveOperationalConfig(payload.config,'control-plane-admin',payload.operationKey); return json(saved,saved.ok?200:400,headers); }
     }
     if (request.method === 'POST' && url.pathname === '/api/v1/ops/events') {
       if (identity.role === 'project' && String(payload.project || payload.projectId).toLowerCase() !== identity.project) return json({ ok: false, error: 'project_scope_denied' }, 403, headers);
@@ -69,9 +75,11 @@ function createControlPlaneHandler({ store, authenticator, tokens, logger = cons
         const job = await store.getJob(id);
         if (!job || job.projectId !== identity.project) return json({ ok: false, error: 'project_scope_denied' }, 403, headers);
       }
+      if (identity.role === 'runner' && !Number.isInteger(payload.attemptCount)) return json({ ok: false, error: 'attempt_count_required' }, 400, headers);
       const result = await store.resultJob(id, identity.runnerId, payload); return json(result, result.status || 200, headers);
     }
     if (request.method === 'POST' && url.pathname === '/api/v1/alerts/ack') {
+      if (identity.role !== 'admin') return json({ ok: false, error: 'admin_required' }, 403, headers);
       const alert = await store.acknowledgeAlert(payload.id); return alert ? json({ ok: true, alert }, 200, headers) : json({ ok: false, error: 'not_found' }, 404, headers);
     }
     logger.debug?.('[control-plane] route not found', { method: request.method, path: url.pathname });

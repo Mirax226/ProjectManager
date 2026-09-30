@@ -40,9 +40,9 @@ test('job creation, project scope, lease ownership, and duplicate results', asyn
   assert.equal((await body(duplicate)).duplicate, true);
   const claim = await call(handler, '/api/v1/jobs/claim', { method: 'POST', headers: { authorization: 'Bearer runner-secret' }, body: JSON.stringify({ projectId: 'daily-system' }) });
   const claimed = (await body(claim)).job; assert.equal(claimed.leaseOwner, 'r1');
-  const wrong = await call(handler, `/api/v1/jobs/${claimed.id}/result`, { method: 'POST', headers: { authorization: 'Bearer runner-secret' }, body: JSON.stringify({ ok: true, result: { status: 'clean' } }) });
+  const wrong = await call(handler, `/api/v1/jobs/${claimed.id}/result`, { method: 'POST', headers: { authorization: 'Bearer runner-secret' }, body: JSON.stringify({ ok: true, attemptCount: claimed.attemptCount, result: { status: 'clean' } }) });
   assert.equal(wrong.status, 200);
-  const duplicateResult = await call(handler, `/api/v1/jobs/${claimed.id}/result`, { method: 'POST', headers: { authorization: 'Bearer runner-secret' }, body: JSON.stringify({ ok: true }) });
+  const duplicateResult = await call(handler, `/api/v1/jobs/${claimed.id}/result`, { method: 'POST', headers: { authorization: 'Bearer runner-secret' }, body: JSON.stringify({ ok: true, attemptCount: claimed.attemptCount }) });
   assert.equal((await body(duplicateResult)).duplicate, true);
 });
 

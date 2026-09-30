@@ -1,3 +1,7 @@
+## Production runtime: Cloudflare (PJ-012)
+
+ProjectManager's designated production path is Telegram webhook -> unified Cloudflare Worker/D1 -> typed local Windows Runner. Account identity is confirmed and D1/schema are provisioned; activation is pending administrator IDs and secrets; see [activation runbook](docs/handoffs/PJ-012/CLOUDFLARE-RUNBOOK.md). `npm start` runs local Wrangler development; `npm run worker:deploy` deploys the Worker. `npm run start:legacy` requires explicit LEGACY_NODE_POLLING_ENABLED=true; legacy DB warmup additionally requires LEGACY_CONFIG_DB_ENABLED=true. Render and the old Postgres Config DB are deprecated/unused/non-authoritative; no old data migration is required. Historical instructions below are retained for compatibility, not production authority.
+
 # Patch Runner Bot
 
 Telegram bot that applies git patches to GitHub repositories and opens pull requests automatically.

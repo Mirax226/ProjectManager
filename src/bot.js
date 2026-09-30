@@ -1,3 +1,4 @@
+if (String(process.env.LEGACY_NODE_POLLING_ENABLED).toLowerCase() !== 'true') { console.error('Legacy Node polling is disabled; production uses Cloudflare.'); process.exit(1); }
 console.error('[boot] starting app');
 
 const { createPmLogger } = require('./pmLogger');

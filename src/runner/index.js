@@ -4,8 +4,8 @@ const { executeJob, DEFAULT_PROFILE } = require('./jobExecutor');
 async function runOnce(client, options = {}) {
   const claim = await client.claim(); if (!claim.job) return null;
   const job = claim.job;
-  try { const result = await executeJob(job, options); await client.result(job.id, result); return result; }
-  catch (error) { const result = { ok: false, error: String(error.message || error).slice(0, 1000) }; await client.result(job.id, result); return result; }
+  try { const result = await executeJob(job, options); await client.result(job.id, { ...result, attemptCount: job.attemptCount, leaseExpiresAt: job.leaseExpiresAt }); return result; }
+  catch (error) { const result = { ok: false, error: String(error.message || error).slice(0, 1000) }; await client.result(job.id, { ...result, attemptCount: job.attemptCount, leaseExpiresAt: job.leaseExpiresAt }); return result; }
 }
 
 async function startRunner(options = {}) {

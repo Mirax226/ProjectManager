@@ -2912,6 +2912,7 @@ async function runConfigDbWarmup(reason = 'scheduled') {
 }
 
 function startConfigDbWarmup() {
+  if (String(process.env.LEGACY_CONFIG_DB_ENABLED).toLowerCase() !== 'true') return;
   scheduleConfigDbWarmup(0, 'startup');
 }
 
@@ -26449,6 +26450,7 @@ async function startBotPolling() {
 }
 
 async function startBot() {
+  if (String(process.env.LEGACY_NODE_POLLING_ENABLED).toLowerCase() !== 'true') throw new Error('Legacy Node polling is disabled; use the Cloudflare webhook runtime');
   console.error('[boot] starting bot init');
   await startHttpServer();
   await loadOpsState();

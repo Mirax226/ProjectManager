@@ -1,18 +1,13 @@
 # ProjectManager Current Plan
 
-- Canonical repository: `C:\Users\Amir\Documents\GitHub\cloned\ProjectManager`.
-- Milestone: PJ-011B desktop resume, 2026-09-30. Repository hardening and safe diagnosis complete; live incident closure remains unverified.
-- Starting Git baseline: `6d4169e82e889f90f5390c9eb29bff307d01e902`, synchronized with origin/main; five interrupted modified files retained and repaired.
-- Architecture: separate legacy Node Telegram/PostgreSQL service, Cloudflare-compatible Worker/D1 Control Plane, and project-bound Windows Runner.
-- Runtime provenance: README and commit `ff15588` identify Render as the intended Node deployment. Actual active service remains `ACTIVE_NODE_HOST_UNKNOWN`. The configured Worker name is `projectmanager-control-plane`; its deployed existence/bindings are unverified. Worker source does not run Telegram or Config DB warmup.
-- Config DB: DATABASE_URL_PM takes precedence over PATH_APPLIER_CONFIG_DSN. Structural preflight, typed errors, repeat-safe credential encoding repair, bounded transient backoff, and active-incident warning deduplication are implemented. The reported tenant/user lookup error is a provider routing/authentication failure, distinct from DNS. The actual selected deployed variable/hostname and incorrect field cannot be confirmed without runtime metadata.
-- Excel: source hashes and VBA are preserved. Sandbox COM_CREATE fails with 0x80070520. Host Mirax repeatedly times out at WORKBOOK_OPEN_START; one refresh-suppressed copy reached open/read/close then stalled at quit, but later repeats still failed. Last Mirax run timed out at COM_CREATE. Refresh is a candidate, not a confirmed sole root cause. Gozareshkar has successful runs and recovered quit stalls; final verification timed out at WORKBOOK_READ_PROBE after successful open.
-- Diagnostics: disposable copies disable automatic query refresh; the separate Excel instance uses manual calculation, macros/events/link updates disabled. No business values or VBA are stored or changed. Five-second quit grace and independent PID/creation-time-checked cleanup preserve failures at earlier stages.
-- Cleanup exception: new automation PID 31620 appeared during a COM-creation timeout without a returned HWND. Its ownership cannot be securely proven; it remains untouched. Pre-existing PID 2868 remains untouched. Overall cleanup must not be claimed fully verified.
-- Runner: real local in-memory Control Plane -> authenticated claim/lease -> Windows Excel -> typed result/status exercised; Gozareshkar has SUCCEEDED and FAILED observations, Mirax FAILED. Cloud deployment E2E is not verified. EXCEL_SYNC remains disabled.
-- Security: CODEX_TASK has project binding, explicit sandbox/mode, environment allowlist, bounded capture, and redacted output. Edit remains disabled by default. CLI task execution and symlink containment are not newly certified.
-- Verification: final exact test/check/Finalizer evidence is recorded in docs/handoffs/PJ-011B/REVIEW.md.
-- Finalizer: repository sources only; Codex runs DryRun. Owner publishes append-only Review/Plans manually.
-- Next: PJ-012 runtime provenance and read-only deployed configuration verification, plus interactive-host COM/Excel investigation of unresolved Mirax and PID ownership. Any production configuration change/deployment requires a separate owner decision.
-
-Final verification: Gozareshkar also timed out at WORKBOOK_READ_PROBE after successful open; its owned process was cleaned up and source unchanged. Host instability remains unresolved. Release suite: 180/180 passed; syntax/check and diff checks passed.
+- Canonical repository: C:\Users\Amir\Documents\GitHub\cloned\ProjectManager.
+- PJ-011B finalized at 7a2a6f010d3f4756aaf76816c0a1faa303839e99; normal push succeeded, working tree clean, HEAD == origin/main verified.
+- PJ-012 owner decision: Cloudflare = designated production runtime; D1 = active PJ operational persistence; Windows Runner = local execution plane. Render and old Postgres = DEPRECATED / UNUSED / NON-AUTHORITATIVE; NO MIGRATION REQUIRED. External resources are not deleted.
+- Runtime target: Telegram webhook -> unified projectmanager-control-plane Worker -> shared application/Ops Center -> D1/jobs -> project-bound authenticated Windows Runner. Production Worker imports no Node bot bootstrap/Config DB/Excel/shell execution.
+- Implementation: bounded secret-verified webhook, private-chat admin authorization, durable replay leases, shared admin/status/incident/runner UI, safe typed diagnostic jobs; existing Control Plane routes preserved/aliased. Legacy Node polling and Config DB warmup explicitly opt-in.
+- Persistence: D1-only migrations under migrations/d1; cross-isolate atomic claims, result compare-and-swap and attempt/terminal-owner verification. Managed config and audit reuse existing D1 store.
+- Deployment status: CLOUDFLARE_DEPLOYMENT_PENDING_SECRETS: account confirmed by owner; D1 created and all three remote migrations applied. Worker deployment, webhook activation and live smoke checks await administrator IDs and interactive secret provisioning.
+- Excel: PJ-011B intermittent COM/open/read/quit evidence retained, underlying cause unresolved. PJ-012 keeps diagnostics and adds stage/provenance metadata; no authoritative XLSM/VBA changes, no new host probes, no sync.
+- Validation and exact test totals: docs/handoffs/PJ-012/REVIEW.md. Activation commands/safety and parity limits: CLOUDFLARE-RUNBOOK.md.
+- Finalizer: Codex DryRun only; owner publishes append-only external Review/Plans manually.
+- Next milestone: authenticated Cloudflare activation and safe Telegram->D1->Windows Runner production health smoke; Excel host investigation separately observable. No additional architecture/paid-service decision needed.

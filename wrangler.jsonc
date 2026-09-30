@@ -1,15 +1,24 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "projectmanager-control-plane",
-  "main": "src/controlPlane/worker.js",
-  "compatibility_date": "2026-09-24",
-  "compatibility_flags": ["nodejs_compat"],
+  "main": "src/controlPlane/entry.mjs",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
   "vars": {
-    "PG_CONTROL_PLANE_ADMIN_TOKEN": "set-locally-or-in-dashboard",
-    "PG_RUNNER_TOKENS_JSON": "{}",
-    "PG_PROJECT_TOKENS_JSON": "{}"
+    "PJ_RUNTIME": "cloudflare",
+    "LEGACY_CONFIG_DB_ENABLED": "false",
+    "TELEGRAM_ADMIN_USER_IDS": ""
   },
   "d1_databases": [
-    { "binding": "CONTROL_PLANE_DB", "database_name": "projectmanager-control-plane", "database_id": "REPLACE_MANUALLY" }
-  ]
+    {
+      "binding": "CONTROL_PLANE_DB",
+      "database_name": "projectmanager-control-plane",
+      "database_id": "1871da4e-4078-48d7-ac02-62ecb0662004",
+      "migrations_dir": "migrations/d1"
+    }
+  ],
+  "account_id": "9f12f5d584ab6b4bd94c66d4bf7f53dc"
 }

@@ -18,8 +18,9 @@ function Cleanup-Owned($state) {
   $newIds = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Where-Object { @($state.before) -notcontains $_.Id } | Select-Object -ExpandProperty Id)
   $noNewObserved = @($state.owned).Count -eq 0 -and $newIds.Count -eq 0
   $unverified = @()
-  if (@($state.owned).Count -eq 0) { $unverified=@($newIds) }
-  [pscustomobject]@{ cleanupVerified=($remaining.Count -eq 0 -and (@($state.owned).Count -gt 0 -or $noNewObserved)); noNewExcelProcessesObserved=$noNewObserved; remainingOwnedProcessIds=@($remaining); unverifiedNewExcelProcessIds=@($unverified) }
+  $ownedIds=@($state.owned | ForEach-Object { $_.id })
+  $unverified=@($newIds | Where-Object { $ownedIds -notcontains $_ })
+  [pscustomobject]@{ cleanupVerified=($remaining.Count -eq 0 -and $unverified.Count -eq 0 -and (@($state.owned).Count -gt 0 -or $noNewObserved)); noNewExcelProcessesObserved=$noNewObserved; remainingOwnedProcessIds=@($remaining); unverifiedNewExcelProcessIds=@($unverified) }
 }
 
 if ($CleanupOnly) {
@@ -35,9 +36,12 @@ $before = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Objec
 $excel = $null; $book = $null; $sheets = $null; $seedBook = $null
 $sharedInstance = $false
 $quitRequested = $false
-$state = @{ stage='COM_CREATE'; stages=@(); before=$before; owned=@(); ownerProcessId=$PID }
+$state = @{ stage='COM_CREATE'; stages=@(); before=$before; owned=@(); ownerProcessId=$PID; hostSessionId=(Get-Process -Id $PID).SessionId; interactive=[Environment]::UserInteractive; stageTimings=@() }
 $started = [Diagnostics.Stopwatch]::StartNew()
 function Set-Stage([string]$stage) {
+  $now=$started.ElapsedMilliseconds
+  if ($state.stageTimings.Count) { $state.stageTimings[-1].durationMs=$now-$state.stageTimings[-1].atMs; $state.stageTimings[-1].completed=$true }
+  $state.stageTimings += @{stage=$stage;atMs=$now;durationMs=$null;completed=$false}
   $state.stage = $stage; $state.stages += $stage
   $state | ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath "$statePath.tmp" -Encoding UTF8
   Move-Item -LiteralPath "$statePath.tmp" -Destination $statePath -Force
@@ -89,7 +93,7 @@ try {
   $process = Get-Process -Id $excelPid
   if ($before -contains $process.Id) { $sharedInstance=$true; throw 'COM activation reused a pre-existing Excel process' }
   if ($before -notcontains $process.Id) {
-    $state.owned = @(@{ id=$process.Id; startTicks=$process.StartTime.ToUniversalTime().Ticks.ToString() })
+    $state.owned = @(@{ id=$process.Id; startTicks=$process.StartTime.ToUniversalTime().Ticks.ToString(); sessionId=$process.SessionId; hwnd=[string]$excel.Hwnd; proof='HWND_PID_START_TIME' })
   }
   Set-Stage 'EXCEL_CONFIGURE'
   $excel.Visible=$false; $excel.DisplayAlerts=$false; $excel.AskToUpdateLinks=$false
@@ -132,6 +136,8 @@ try {
   [GC]::Collect(); [GC]::WaitForPendingFinalizers()
   $started.Stop()
 }
+$state.stageTimings[-1].durationMs=$started.ElapsedMilliseconds-$state.stageTimings[-1].atMs; $state.stageTimings[-1].completed=($result.ok -eq $true)
+$result.stageTimings=@($state.stageTimings); $result.processOwnership=@($state.owned); $result.hostSessionId=$state.hostSessionId; $result.interactive=$state.interactive
 $result.stages=@($state.stages); $result.stage=$state.stage
 $result.ownedProcessIds=@($state.owned | ForEach-Object { $_.id })
 $result.durationMs=$started.ElapsedMilliseconds

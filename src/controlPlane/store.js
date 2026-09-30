@@ -67,6 +67,7 @@ class ControlPlaneStore {
   }
   resultJob(id, runnerId, result = {}) {
     const job = this.jobs.get(String(id)); if (!job) return { ok: false, status: 404, error: 'job not found' };
+    if (result.attemptCount != null && Number(result.attemptCount) !== job.attemptCount) return { ok:false,status:409,error:'stale attempt' };
     if (['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(job.status)) return { ok: true, duplicate: true, job: { ...job } };
     if (job.leaseOwner !== String(runnerId) || (job.leaseExpiresAt && Date.parse(job.leaseExpiresAt) < this.now())) return { ok: false, status: 409, error: 'lease is not owned by runner' };
     const retryable = result.retryable === true && (result.ok === false || result.error);
