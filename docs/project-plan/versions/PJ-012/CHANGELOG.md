@@ -9,3 +9,5 @@
 - Corrected cross-isolate D1 claim/result/idempotency handling and updated Runner attempt metadata; project scope and local execution boundaries retained.
 - Added actual workerd/Miniflare/D1 integration and local Runner health E2E tests. CLOUDFLARE_DEPLOYMENT_PENDING_SECRETS: account confirmed by owner; D1 created and all three remote migrations applied. Worker deployment, webhook activation and live smoke checks await administrator IDs and interactive secret provisioning.
 - Finalizer remains DryRun only; owner publishes external Plans/Review.
+
+Owner follow-up: Telegram bootstrap administrator 843686302 configured in wrangler.jsonc. Remaining activation gate is interactive secret provisioning and live CLI verification/deployment.

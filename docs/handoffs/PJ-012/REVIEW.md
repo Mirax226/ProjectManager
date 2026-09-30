@@ -45,3 +45,5 @@ No second backend, paid hosting, queue or old-data migration. One Worker entrypo
 Changed areas: Worker entry/routing, bounded body and Telegram adapter/application, existing D1/Control Plane store/handler, Runner result attempt metadata, disabled legacy bot defaults, safe webhook tool, pinned Wrangler/package dependencies, D1 migrations, integration tests, preserved Excel diagnostics, README/plan/memory and this handoff. Historical D1 migration content retained. No .env, credentials, workbook, database dump, log, temporary build or review ZIP belongs in the commit.
 
 Wrangler dry-run build passed (approximately 118.57 KiB uncompressed, 24.98 KiB gzip). Dependency audit: zero vulnerabilities after scoped stable Miniflare dependency overrides. Wrangler 4.145.0 is project-pinned. CLI is primary; no browser inspection was used after owner preference update.
+
+Owner follow-up: Telegram bootstrap administrator 843686302 configured in wrangler.jsonc. Remaining activation gate is interactive secret provisioning and live CLI verification/deployment.
