@@ -1,5 +1,22 @@
 # PJ-012 Cloudflare activation runbook
 
+## Final owner activation procedure (2026-10-01)
+
+Worker health/account/required secret names reverified from clean a60a53f. No secret values are available to Codex. If the owner still has the SAME matching webhook secret, use the masked-input activation procedure below. Otherwise: WEBHOOK_SECRET_ROTATION_REQUIRED. The owner-only OWNER-FINAL-ACTIVATION.ps1 generates 256-bit randomness, uploads through Wrangler standard input, and immediately reuses the same value with the existing webhook tool. No automatic rotation was run.
+
+From the canonical repository, run intentionally in an owner-controlled PowerShell shell:
+
+```powershell
+# Only if the matching existing webhook secret has been lost:
+./docs/handoffs/PJ-012/OWNER-FINAL-ACTIVATION.ps1 -Webhook
+# Owner explicitly performs the required single-runner scope/token rotation:
+./docs/handoffs/PJ-012/OWNER-FINAL-ACTIVATION.ps1 -Runner
+```
+
+Do not enable a transcript, print environment/generated variables, or share credentials in chat. The Runner action replaces the stated single-runner map; if additional runners exist, preserve them in an owner-reviewed map first. It sets the same token locally for windows-runner/daily-system and does not start polling. Keep that shell open and report only success and non-secret IDs. Codex cannot inherit another shell's environment. Set DAILYSYSTEM_REPO_PATH to the verified DailySystem repository before a later one-job smoke; do not substitute ProjectManager. Clear PG_RUNNER_TOKEN after use or retain through an owner-controlled secure mechanism outside Git.
+
+Webhook partial failure after Cloudflare upload requires retrying the existing --set command in the SAME shell with the SAME generated secret; do not rerun rotation. The script reports safe getWebhookInfo fields including allowed-update names. Expect matching URL, message/callback_query, draining pending updates, and fresh /start and /status responses for 843686302. Historical last_error_date alone does not prove an active failure. Neither WEBHOOK_ACTIVE nor TELEGRAM_SMOKE_PASS nor Runner E2E is claimed before actual evidence.
+
 Cloudflare is the designated production runtime. Activation is pending bootstrap administrator IDs and secret provisioning. Wrangler OAuth succeeded; the owner explicitly confirmed Amirhoseinsalmani19472@gmail.com's Account (9f12f5d584ab6b4bd94c66d4bf7f53dc). That account is pinned in wrangler.jsonc. D1 projectmanager-control-plane (1871da4e-4078-48d7-ac02-62ecb0662004), binding CONTROL_PLANE_DB, was created and all three migrations applied remotely on 2026-10-01. No existing unrelated database was changed. Render and old Postgres are DEPRECATED / UNUSED / NON-AUTHORITATIVE by owner decision; NO MIGRATION REQUIRED. No old data/resource was read, reconciled, recovered or deleted for this migration. Stop legacy polling separately when activating the webhook; an old deployment must not call deleteWebhook again.
 
 ## Architecture and routes

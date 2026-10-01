@@ -61,3 +61,13 @@ RUNNER_SECRET_SCOPE_MISMATCH: canonical client defaults src/runner/client.js are
 Telegram token and webhook secret names are deployed; corresponding process environment names absent. WEBHOOK_ACTIVE is NOT claimed: no setWebhook/getWebhookInfo or real chat smoke performed. Owner-side steps below use the SAME existing Cloudflare webhook secret; no extraction/rotation. PJ-012 COMPLETE: NO; Worker deployment portion complete, webhook/live Telegram and optional Runner smoke outstanding.
 
 Activation finalization: Finalizer DryRun passed with no external writes. Six documentation files changed, no runtime code or secret files. Normal commit/push and exact final HEAD are recorded in the final response; inspect git log for the immutable checkpoint hash.
+
+## Final activation checkpoint — 2026-10-01
+
+Started clean at a60a53f7b831b17d7f305dbf29523fd814f5e567 == origin/main. Wrangler confirmed account 9f12f5d584ab6b4bd94c66d4bf7f53dc and all four required secret names. Production /health returned HTTP 200, runtime cloudflare, D1 available. No deployment or rotation performed.
+
+This process has no Telegram or Runner credential environment names. WEBHOOK_SECRET_ROTATION_REQUIRED if the owner has lost the matching secret; existing masked-input activation remains preferred if retained. OWNER-FINAL-ACTIVATION.ps1 supplies owner-only alternatives without printing/persisting generated values. Runner before/after unchanged: existing owner-stated windows-01/daily-system remains wrong; required windows-runner/daily-system. No authentication before rotation confirmation.
+
+Webhook activation/getWebhookInfo and Telegram /start /status remain unverified; no live update/job D1 evidence. No Runner E2E. PJ-012 COMPLETE: NO. Pending owner-controlled activation/rotation and one safe-job smoke. Another owner shell's environment is not inherited by Codex; keep it open for execution. No workbook/VBA, Render or old DB activity.
+
+Validation: 196 tests passed, 0 failed/skipped, 31.2321189 seconds; npm run check, owner-script parser check, diff check and Finalizer DryRun passed. No external Plans/Review writes. Updated runbook, owner procedure, handoff, current plan and two memory files only. Commit/push checkpoint hash recorded in final response; no secret/env/raw log staged.
