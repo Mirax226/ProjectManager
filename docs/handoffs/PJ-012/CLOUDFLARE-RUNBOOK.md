@@ -1,5 +1,9 @@
 # PJ-012 Cloudflare activation runbook
 
+## Activation complete — 2026-10-01
+
+PJ-012 is closed. Owner confirmed live /start without the duplicate footer, /status, emoji buttons and active webhook. Production D1 verified HEALTHCHECK job 1bfad0eb-12c1-4c10-a996-7067ce693707 SUCCEEDED on attempt 1 with result owner windows-runner/daily-system, diagnostic available and cleared lease; runner heartbeat ONLINE. No further activation/rotation is required. Previous procedures below are recovery history, not instructions to rotate healthy credentials. Complete evidence is in REVIEW.md. Next roadmap work is separate unnumbered Excel host closure; it was not started.
+
 ## Current closure steps — webhook already active
 
 Do NOT rerun -Webhook or setWebhook. Owner-confirmed webhook is active and prior /start passed. Emoji UI deployed as c7d32662-455e-41eb-9e7c-64d190d5911d; send /start and /status as administrator 843686302 and confirm emoji labels after this deployment. If the bot token is still securely in the owner shell, use only `npm run telegram:webhook -- --info`; this reports allowedUpdates and safe status already, so no separate node/eval check is required. The owner helper's duplicated node -e quoting path was removed.

@@ -1,5 +1,10 @@
 # PJ-012 Cloudflare migration
 
+## Final closure — 2026-10-01
+
+PJ-012 COMPLETE: production Worker/D1/webhook/UI verified; command footer removed, emoji callbacks retained. Owner rotated Runner scope/token through existing helper; one Telegram-created HEALTHCHECK completed SUCCEEDED on attempt 1 by windows-runner/daily-system. Full suite 213/213, syntax/diff/Finalizer DryRun passed. No authoritative Excel/VBA writes or webhook/token rotation by Codex. Closure evidence and next unnumbered Excel host milestone are in REVIEW.md.
+
+
 - Started from clean 7a2a6f010d3f4756aaf76816c0a1faa303839e99 == origin/main; PJ-011B normal push/clean finalization recorded.
 - Owner replaced runtime discovery with Cloudflare-first/D1 architecture; Render and old Config DB unused, no old-data migration or deletion.
 - Retained two interrupted Excel diagnostic edits: stage timing and session/HWND/PID/start-time evidence; no new host matrix or source workbook writes.

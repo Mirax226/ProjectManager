@@ -1,5 +1,22 @@
 # ProjectManager Current Plan
 
+## PJ-012 COMPLETE — 2026-10-01
+
+This final closure supersedes the pending checkpoints preserved below. CLOUDFLARE_RUNTIME_ACTIVE; TELEGRAM_WEBHOOK_ACTIVE; TELEGRAM_UI_SMOKE_PASS; EMOJI_MENU_ACTIVE; START_COMMAND_FOOTER_REMOVED; RUNNER_SCOPE_CORRECT; RUNNER_E2E_PASS; RENDER_LEGACY_UNUSED; OLD_POSTGRES_LEGACY_UNUSED.
+
+Worker projectmanager-control-plane remains healthy: HTTP 200, runtime cloudflare, D1 available. Footer-removal code version 1930d9b0-e4f5-4f6e-bbd1-f7e15c99cfd9; active version after owner Runner-secret update 2f5db2c8-3624-495c-800e-489c8a1aa099 (deployment 37271715-2e68-4915-82d5-574fc52d43bf, 100%). Same existing Worker/account/D1; no second backend. No webhook secret or bot-token rotation.
+
+Owner confirmed post-deployment /start PASS, /status PASS, removed duplicated footer and visible 📊 Status / 🖥️ Runners / 🚨 Incidents / 📋 Jobs. Webhook remains ACTIVE. Command/callback identifiers and authorization unchanged; menu uses BotFather commands instead of duplicated message help. Helper quoting defect was fixed in the prior checkpoint.
+
+Owner performed exactly one intentional Runner rotation via existing helper and retained the matching token in the owner shell. RUNNER_TOKEN_PRESENT established by successful authenticated heartbeat/result, not value inspection. Scope windows-runner / daily-system; verified local repository C:\Users\Amir\Documents\GitHub\DailySystem. D1 confirmed fresh ONLINE heartbeat. No credential was sent to or printed by Codex.
+
+Production E2E evidence: job 1bfad0eb-12c1-4c10-a996-7067ce693707 requested_by=telegram-admin, project=daily-system, type=HEALTHCHECK, terminal=SUCCEEDED, attempt_count=1, result_runner_id=windows-runner, diagnostic_status=available, lease_owner=null and lease_expires_at=null after result acceptance. The authenticated D1 result compare-and-swap validates the claimed owner, unexpired lease and current attempt before terminal acceptance; terminal lease clearing is expected. Total jobs=1 confirms a single smoke job. This proves Telegram -> Worker/D1 -> local Runner -> typed result. No Excel, shell, deploy, SQL, deletion or authoritative sync job ran. All CLI D1 inspections were read-only metadata selections.
+
+Validation: six focused closure tests pass; full suite 213 passed, 0 failed/skipped (31.3718172 seconds); npm run check and diff checks passed. Finalizer DryRun only; no external Plans/Review writes. Normal footer checkpoint 0a8b6a71b97652a7bfade93bddc7571262ab750b pushed cleanly; final closure documentation commit/hash and final clean synchronization are recorded in final response (a commit cannot embed its own hash). No credential/env/log/database/workbook artifacts staged.
+
+NEXT_PJ_MILESTONE: separate Excel host closure, currently unnumbered. NEXT_PJ_OBJECTIVE: narrow existing intermittent COM/open/read/quit failures and establish process ownership/cleanup plus preserved-source evidence; authoritative Excel sync remains disabled. WHY_THIS_IS_NEXT: the latest roadmap/current plan explicitly scheduled activation and safe health E2E first, then separate Excel host closure. No PJ-013 definition exists; older duplicate PJ-010 policy/review headings are preserved without renumbering. CURRENT_BLOCKERS for PJ-012: none. Existing Excel host uncertainty belongs to the next work item. That milestone was not started.
+
+
 ## Footer cleanup and final smoke checkpoint — 2026-10-01
 
 Starting clean HEAD ef2a378a8cb75900e67405b74490d6acddd2b49f matched origin/main. Removed only the four-line /start/admin command-help footer; main Ops Center summary and compact emoji buttons retained. Commands and callback_data unchanged, including diagnostic commands registered in BotFather. Six focused tests pass; full suite 213 passed, 0 failed/skipped in 31.3718172 seconds. Syntax/diff checks passed.
