@@ -122,3 +122,13 @@ try {
 Expect webhookMatchesExpected=true. Existing historical lastErrorPresent may remain after a resolved error; confirm pending updates drain and a fresh /start or /status response arrives for administrator 843686302. These are read-only commands. Do not queue health jobs until Runner scope/token/profile is resolved. Never let legacy polling call deleteWebhook after activation.
 
 Runner next procedure (owner only): choose the intended ID explicitly, keep project daily-system, generate and retain a fresh cryptographically random token securely if old token is lost; enter scoped JSON via `npx wrangler secret put PG_RUNNER_TOKENS_JSON` interactively, then configure that same token locally with masked input and explicit PG_RUNNER_ID/PG_PROJECT_ID/PG_CONTROL_PLANE_URL. Do not print the token or JSON. Verify local project repository profile, heartbeat, then one HEALTHCHECK/PROJECT_STATUS job. Do not rotate automatically or alter other runner entries.
+
+## Current webhook debug retry (2026-10-01)
+
+Do NOT run the rotation procedure again. Keep the owner shell open and use:
+
+```powershell
+npm run telegram:webhook -- --set
+```
+
+This reuses PJ_WORKER_URL, TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET already in that shell. Updated tool emits safe input presence/nonempty flags, secret-format boolean, exact failure stage, HTTP status, Telegram error code and fixed classification. No description/raw response/value is printed. INPUT_PRECHECK_FAILED names only the offending variable; SETWEBHOOK_TELEGRAM_REJECTED differs from SETWEBHOOK_HTTP_FAILED. POST_SET_VERIFY_MISMATCH or POST_SET_VERIFY_FAILED explicitly means Telegram already accepted setWebhook. Do not rotate on any generic failure. Return only safe JSON, then resolve the evidenced stage. Owner-reported Runner rotation succeeded; no further Runner credential change authorized in this debug task. Live root cause is pending owner-shell diagnostic.

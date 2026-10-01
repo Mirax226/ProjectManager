@@ -71,3 +71,17 @@ This process has no Telegram or Runner credential environment names. WEBHOOK_SEC
 Webhook activation/getWebhookInfo and Telegram /start /status remain unverified; no live update/job D1 evidence. No Runner E2E. PJ-012 COMPLETE: NO. Pending owner-controlled activation/rotation and one safe-job smoke. Another owner shell's environment is not inherited by Codex; keep it open for execution. No workbook/VBA, Render or old DB activity.
 
 Validation: 196 tests passed, 0 failed/skipped, 31.2321189 seconds; npm run check, owner-script parser check, diff check and Finalizer DryRun passed. No external Plans/Review writes. Updated runbook, owner procedure, handoff, current plan and two memory files only. Commit/push checkpoint hash recorded in final response; no secret/env/raw log staged.
+
+## Webhook debug checkpoint — 2026-10-01
+
+Starting clean HEAD db26fadd898558eea059a1a57d1bb745f5037c74 matched origin/main. Owner reports Runner scope rotation succeeded to windows-runner/daily-system; no Runner credential changes or authentication attempted in this task. Worker deployment remains unchanged.
+
+Environment contract: PJ_WORKER_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET. OWNER-FINAL-ACTIVATION.ps1 sets these exact names and retains them on setup failure; no naming mismatch found. Expected endpoint is https://projectmanager-control-plane.amirhoseinsalmani194728095.workers.dev/telegram/webhook. Secret validation remains 1..256 allowed A-Z/a-z/0-9/_/-; no live value or format conclusion inferred from source. Owner-generated format is structurally compatible.
+
+Confirmed tooling defect: generic telegram_delivery_failed plus a generic CLI catch erased input-validation/API/verification stage evidence. Owner evidence proves getWebhookInfo reached Telegram, returned a nonmatching URL and pending count 2; it does NOT prove whether setWebhook was rejected or accepted before verification failed. Exact live failure stage/root cause remain UNCONFIRMED_PENDING_OWNER_SAFE_DIAGNOSTIC. No claim of bad token, secret, network or environment mismatch.
+
+Fix: owner setup tool now prechecks names/presence/nonempty and secret-format boolean; emits INPUT_PRECHECK_FAILED, SETWEBHOOK_HTTP_FAILED, SETWEBHOOK_TELEGRAM_REJECTED, SETWEBHOOK_ACCEPTED, POST_SET_VERIFY_FAILED, POST_SET_VERIFY_MISMATCH or SUCCESS as appropriate. HTTP status, Telegram ok/error code and acceptance evidence are safe allowlisted metadata. Descriptions map only to fixed classification labels; raw API/exception/request URLs and credentials are never returned. Transport failures leave delivery unknown rather than implying no request reached Telegram. Existing deployed Worker helper is unchanged; no deployment needed.
+
+Owner retry: npm run telegram:webhook -- --set in the SAME existing PowerShell session, reusing its CURRENT secret. Do NOT rerun OWNER-FINAL-ACTIVATION.ps1 -Webhook. Do NOT rotate secrets. Return only safe JSON diagnostic output. The next remedy must follow actual stage/classification evidence. PJ-012 COMPLETE: NO; live activation/smoke/one safe Runner E2E remain unverified.
+
+Tests: 11 focused webhook-tool tests pass; full suite 207 passed, 0 failed/skipped (34.9978228 seconds). Covers missing inputs, malformed origin, exact URL, secret format, accepted set, API rejection, accepted-then-mismatch/verification failure and credential-bearing exceptions safely omitted. Syntax/diff checks passed. Code/test/runbook/handoff only; no environment/token files or raw responses.
