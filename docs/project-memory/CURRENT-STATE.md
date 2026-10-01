@@ -1,5 +1,18 @@
 # Current State
 
+## Footer cleanup and final smoke checkpoint — 2026-10-01
+
+Starting clean HEAD ef2a378a8cb75900e67405b74490d6acddd2b49f matched origin/main. Removed only the four-line /start/admin command-help footer; main Ops Center summary and compact emoji buttons retained. Commands and callback_data unchanged, including diagnostic commands registered in BotFather. Six focused tests pass; full suite 213 passed, 0 failed/skipped in 31.3718172 seconds. Syntax/diff checks passed.
+
+Confirmed account and required secret NAMES, deployed footer cleanup to existing Worker. Menu code version 1930d9b0-e4f5-4f6e-bbd1-f7e15c99cfd9; post-deploy /health HTTP 200 runtime cloudflare, D1 available. Owner already confirmed active webhook, working /start and live emoji menu before this cleanup. Fresh /start/footer and /status observations are pending after cleanup. No webhook secret/bot-token change by Codex.
+
+Owner reported RUNNER_TOKEN_ROTATION_REQUIRED, verified DailySystem path C:\Users\Amir\Documents\GitHub\DailySystem (directory existence also checked locally). Required identity windows-runner/daily-system. Owner-only existing -Runner procedure provided; same generated token must stay in owner shell, then npm run runner with DAILYSYSTEM_REPO_PATH set to the verified path. Exactly one Telegram /health daily-system requested. No authentication from Codex and no credential values requested. D1 initially had no jobs; heartbeat/job/lease/result proof awaits owner execution.
+
+PJ-012 COMPLETE: NO while safe Runner E2E and fresh UI observations remain pending. CURRENT_BLOCKERS: retained owner-shell credentials/one live safe job and post-deployment /start /status observations.
+
+NEXT_PJ_MILESTONE (after PJ-012 closure): separate Excel host closure, unnumbered in latest roadmap/current plan. NEXT_PJ_OBJECTIVE: narrow intermittent COM creation/open/read/quit behavior, verify process ownership/cleanup and source preservation while keeping authoritative sync disabled. WHY_THIS_IS_NEXT: latest roadmap explicitly orders authenticated activation and safe health E2E before separate Excel host closure. No PJ-013 identifier/scope is defined. Older duplicate PJ-010 entries retain independent review/persistence-policy work and should not be silently renumbered. Do not begin next work in this task.
+
+
 ## Latest closure checkpoint — 2026-10-01
 
 Owner-confirmed WEBHOOK_ACTIVE: setWebhook SUCCESS/setAccepted true/HTTP 200/matching URL; getWebhookInfo matched, pending count 0, lastErrorPresent false, allowedUpdates message/callback_query. Owner confirms prior /start response. These are supplied production evidence, not credential inspection by Codex. No webhook/token rotation in this task.

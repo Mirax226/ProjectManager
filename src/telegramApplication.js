@@ -17,7 +17,6 @@ async function dispatchTelegramUpdate(update, { store, env }) {
   let keyboard;
   if (['start', 'admin'].includes(command)) {
     text = buildProjectManagerAdminModel({ config: store.operationalConfig, jobs: await store.listJobs(), archives: [...store.archives.values()] }).text;
-    text += '\n\n🏠 Start: /start\n❤️ Health: /health PROJECT\n📁 Project Status: /project_status PROJECT\n📗 Excel Health: /excel_healthcheck PROJECT ASSET';
     keyboard = { inline_keyboard: [[{ text: '📊 Status', callback_data: 'status' }, { text: '🖥️ Runners', callback_data: 'runners' }], [{ text: '🚨 Incidents', callback_data: 'incidents' }, { text: '📋 Jobs', callback_data: 'jobs' }]] };
   } else if (command === 'status') {
     const state = await store.status();

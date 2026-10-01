@@ -6,14 +6,23 @@ const { dispatchTelegramUpdate } = require('../src/telegramApplication');
 const { ControlPlaneStore } = require('../src/controlPlane/store');
 const env = { TELEGRAM_ADMIN_USER_IDS: '843686302' };
 const message = (text, id = 843686302) => ({ update_id: 1, message: { text, from: { id }, chat: { id, type: 'private' } } });
-test('start/admin show compact emoji labels and preserve callback identifiers', async () => {
+test('start/admin omit command footer while preserving status and emoji callbacks', async () => {
   for (const text of ['/start', '/admin']) {
     const output = await dispatchTelegramUpdate(message(text), { store: new ControlPlaneStore(), env });
     assert.equal(output.authorized, true);
-    assert.match(output.text, /🏠 Start/); assert.match(output.text, /❤️ Health/); assert.match(output.text, /📁 Project Status/); assert.match(output.text, /📗 Excel Health/);
+    assert.match(output.text, /ProjectManager Admin/); assert.match(output.text, /Archive destination/);
+    for (const footer of ['Start: /start', 'Health: /health', 'Project Status: /project_status', 'Excel Health: /excel_healthcheck']) assert.equal(output.text.includes(footer), false);
     const buttons = output.replyMarkup.inline_keyboard.flat();
     assert.deepEqual(buttons.map((button) => button.callback_data), ['status', 'runners', 'incidents', 'jobs']);
     assert.deepEqual(buttons.map((button) => button.text), ['📊 Status', '🖥️ Runners', '🚨 Incidents', '📋 Jobs']);
+  }
+});
+test('BotFather diagnostic commands remain routed after footer removal', async () => {
+  for (const [command, type] of [['/health daily-system', 'HEALTHCHECK'], ['/project_status daily-system', 'PROJECT_STATUS'], ['/excel_healthcheck daily-system mirax', 'EXCEL_HEALTHCHECK']]) {
+    const store = new ControlPlaneStore();
+    const result = await dispatchTelegramUpdate(message(command), { store, env });
+    assert.equal(result.authorized, true); assert.match(result.text, new RegExp(`Queued ${type}`));
+    assert.equal(store.listJobs()[0].type, type);
   }
 });
 test('status message and unchanged status callback return the same authorized view', async () => {
