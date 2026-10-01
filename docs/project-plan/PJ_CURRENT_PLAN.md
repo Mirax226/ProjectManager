@@ -1,5 +1,15 @@
 # ProjectManager Current Plan
 
+## Excel Host Closure OPEN — 2026-10-01
+
+EXCEL_HOST_CLOSURE = OPEN; PJ-012 remains COMPLETE. Starting clean 3ca7657c0bdc92b9eda84ca58929181830906635 matched origin/main. Two serial G/M/G/M disposable-copy matrices recorded: before, Gozareshkar quit timeout recovered after proven cleanup and Mirax close timeout; after, Mirax open timeout while three runs passed. MULTIPLE_HOST_FAILURE_MODES / WORKBOOK_OPEN_INSTABILITY / QUIT_CLEANUP_INSTABILITY; underlying cause UNKNOWN. Refresh/query causation is unconfirmed.
+
+Corrected diagnostic semantics: successful open stays OPENABLE after a later lifecycle failure, while healthcheck still fails; persisted read/close/quit substages and safe timeout/probe/cleanup durations added. No feature, lifecycle budget or process ownership change. Eight owned instances cleaned, no probe orphans, pre-existing Excel PID 9396 preserved. Both authoritative hashes unchanged in all eight runs and final independent check; no source/VBA/global Office change.
+
+Validation: 16 focused tests, full 215 passed with zero failures/skips, npm run check and diff checks PASS. Safe matrices and full evidence: docs/handoffs/PJ-EXCEL-HOST-CLOSURE/REVIEW.md. Finalizer DryRun only. No Cloudflare/Telegram/legacy DB/Render/secret mutation.
+
+NEXT_PJ_MILESTONE: Excel Host Closure (still OPEN). Smallest next experiment: bounded copy-only Mirax open with read-only observation of the proven owned HWND's dialog state, plus one Gozareshkar control, before any Open argument or add-in change. Remaining blocker is intermittent open/close/quit hangs, not ownership/source integrity. Latest roadmap defines no formal successor after this milestone; do not invent PJ-013. Authoritative Excel sync remains disabled.
+
 ## PJ-012 COMPLETE — 2026-10-01
 
 This final closure supersedes the pending checkpoints preserved below. CLOUDFLARE_RUNTIME_ACTIVE; TELEGRAM_WEBHOOK_ACTIVE; TELEGRAM_UI_SMOKE_PASS; EMOJI_MENU_ACTIVE; START_COMMAND_FOOTER_REMOVED; RUNNER_SCOPE_CORRECT; RUNNER_E2E_PASS; RENDER_LEGACY_UNUSED; OLD_POSTGRES_LEGACY_UNUSED.

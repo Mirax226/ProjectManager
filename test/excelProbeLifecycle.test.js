@@ -5,7 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
-const { probeExcelDesktop } = require('../src/runner/excelOperations');
+const { probeExcelDesktop, healthcheck } = require('../src/runner/excelOperations');
 
 function adapter({ timeout = false, cleanup = true, comFailure = false, stage = 'WORKBOOK_OPEN_START' }) {
   const calls = [];
@@ -18,7 +18,8 @@ function adapter({ timeout = false, cleanup = true, comFailure = false, stage = 
         child.stdout.emit('data', JSON.stringify({ cleanupVerified: cleanup, noNewExcelProcessesObserved: comFailure, remainingOwnedProcessIds: cleanup ? [] : [100] }));
         child.emit('close', 0);
       } else {
-        fs.writeFileSync(options.env.PJ_EXCEL_PROBE_STATE, JSON.stringify({ stage: comFailure ? 'COM_CREATE' : stage, stages: comFailure ? ['COM_CREATE'] : ['COM_CREATE', 'EXCEL_CONFIGURE', 'WORKBOOK_OPEN_START', ...(stage === 'EXCEL_QUIT' ? ['WORKBOOK_OPEN_SUCCESS', 'WORKBOOK_READ_PROBE', 'WORKBOOK_CLOSE', 'EXCEL_QUIT'] : [])], before: [99], owned: comFailure ? [] : [{ id: 100, startTicks: '1' }] }));
+        const laterStages = ['WORKBOOK_READ_PROBE', 'WORKBOOK_CLOSE', 'EXCEL_QUIT'].includes(stage) ? ['WORKBOOK_OPEN_SUCCESS', 'WORKBOOK_READ_PROBE', ...(['WORKBOOK_CLOSE', 'EXCEL_QUIT'].includes(stage) ? ['WORKBOOK_CLOSE'] : []), ...(stage === 'EXCEL_QUIT' ? ['EXCEL_QUIT'] : [])] : [];
+        fs.writeFileSync(options.env.PJ_EXCEL_PROBE_STATE, JSON.stringify({ stage: comFailure ? 'COM_CREATE' : stage, substage: stage === 'WORKBOOK_CLOSE' ? 'SEED_WORKBOOK_CLOSE' : null, stages: comFailure ? ['COM_CREATE'] : ['COM_CREATE', 'EXCEL_CONFIGURE', 'WORKBOOK_OPEN_START', ...laterStages], before: [99], owned: comFailure ? [] : [{ id: 100, startTicks: '1' }] }));
         if (!timeout) {
           child.stdout.emit('data', JSON.stringify(comFailure ? { ok: false, failedStage: 'COM_CREATE', diagnosticCode: 'COM_CREATE_FAILED', safeError: { exceptionClass: 'COMException', hresult: '0x80070520' } } : { ok: true, version: '16.0', ownedProcessIds: [100] }));
           child.emit('close', 0);
@@ -54,6 +55,25 @@ test('Excel quit timeout recovers only after verified owned-process cleanup; ope
   const readTimeout = await probeExcelDesktop('C:\\disposable\\Mirax.xlsm', 1000, adapter({ timeout: true, stage: 'WORKBOOK_READ_PROBE' }));
   assert.equal(readTimeout.ok, false);
   assert.equal(readTimeout.failedStage, 'WORKBOOK_READ_PROBE');
+  assert.equal(readTimeout.openability, 'OPENABLE');
+});
+
+test('close timeout preserves successful open, exact substage, safe TimeoutError and separate cleanup duration', { skip: process.platform !== 'win32' }, async () => {
+  const result = await probeExcelDesktop('C:\\disposable\\Mirax.xlsm', 1000, adapter({ timeout: true, stage: 'WORKBOOK_CLOSE' }));
+  assert.equal(result.ok, false); assert.equal(result.openability, 'OPENABLE'); assert.equal(result.workbookOpened, true);
+  assert.equal(result.failedStage, 'WORKBOOK_CLOSE'); assert.equal(result.failedSubstage, 'SEED_WORKBOOK_CLOSE');
+  assert.equal(result.safeError.exceptionClass, 'TimeoutError'); assert.equal(result.safeError.hresult, null);
+  assert.ok(result.durationMs >= 1000); assert.ok(result.cleanupDurationMs >= 0); assert.equal(result.cleanupVerified, true);
+});
+
+test('healthcheck cannot convert a post-open lifecycle failure into success and preserves copy/source safety', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-post-open-')); const source = path.join(root, 'fixture.xlsm'); fs.writeFileSync(source, 'safe fixture');
+  let copy;
+  try {
+    const result = await healthcheck({ projectId: 'daily-system', payload: { assetId: 'fixture' } }, { excelAssets: { fixture: { projectId: 'daily-system', manualPath: source } } }, { probeOpenability: async (file) => { copy = file; return { ok: false, openability: 'OPENABLE', workbookOpened: true, diagnosticCode: 'TIMEOUT', failedStage: 'WORKBOOK_CLOSE', failedSubstage: 'TARGET_WORKBOOK_CLOSE', durationMs: 1000, cleanupDurationMs: 20, safeError: { exceptionClass: 'TimeoutError', hresult: null } }; } });
+    assert.equal(result.ok, false); assert.equal(result.result.openability, 'OPENABLE'); assert.equal(result.result.failedStage, 'WORKBOOK_CLOSE'); assert.equal(result.result.failedSubstage, 'TARGET_WORKBOOK_CLOSE'); assert.equal(result.result.workbookOpened, true);
+    assert.equal(result.result.sourceHashBefore, result.result.sourceHashAfter); assert.equal(result.result.sourceUnchanged, true); assert.equal(fs.existsSync(copy), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('Excel cleanup failure cannot be reported as successful openability', { skip: process.platform !== 'win32' }, async () => {

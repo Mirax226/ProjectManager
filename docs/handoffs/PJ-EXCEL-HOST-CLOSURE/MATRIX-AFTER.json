@@ -1,0 +1,654 @@
+{
+  "date": "2026-10-01",
+  "policy": "existing cached-read; copy refresh suppression/manual calculation; macros/events/links disabled",
+  "runs": [
+    {
+      "run": 1,
+      "asset": "Gozareshkar.xlsm",
+      "ok": true,
+      "durationMs": 27226,
+      "sourceHashBefore": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "sourceHashAfter": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "copyCreated": true,
+      "copyIdentity": "pj-excel-probe-eO3Jen/Gozareshkar.xlsm",
+      "copyDeleted": true,
+      "diagnosticCode": null,
+      "failedStage": null,
+      "probe": {
+        "refreshFlagsCleared": 0,
+        "vbaProjectUnchanged": true,
+        "externalRefreshSuppressed": true,
+        "queryTablesDisabled": 0,
+        "calculationDisabled": true,
+        "stageTimings": [
+          {
+            "completed": true,
+            "atMs": 43,
+            "durationMs": 1789,
+            "stage": "COPY_CONFIGURE"
+          },
+          {
+            "completed": true,
+            "atMs": 1832,
+            "durationMs": 7561,
+            "stage": "COM_CREATE"
+          },
+          {
+            "completed": true,
+            "atMs": 9393,
+            "durationMs": 1366,
+            "stage": "EXCEL_CONFIGURE"
+          },
+          {
+            "completed": true,
+            "atMs": 10759,
+            "durationMs": 2728,
+            "stage": "WORKBOOK_OPEN_START"
+          },
+          {
+            "completed": true,
+            "atMs": 13487,
+            "durationMs": 18,
+            "stage": "WORKBOOK_OPEN_SUCCESS"
+          },
+          {
+            "completed": true,
+            "atMs": 13505,
+            "durationMs": 1064,
+            "stage": "WORKBOOK_READ_PROBE"
+          },
+          {
+            "completed": true,
+            "atMs": 14569,
+            "durationMs": 386,
+            "stage": "WORKBOOK_CLOSE"
+          },
+          {
+            "completed": true,
+            "atMs": 14955,
+            "durationMs": 4625,
+            "stage": "EXCEL_QUIT"
+          }
+        ],
+        "processOwnership": [
+          {
+            "proof": "HWND_PID_START_TIME",
+            "hwnd": "4655436",
+            "startTicks": "639264515163762672",
+            "id": 23012,
+            "sessionId": 1
+          }
+        ],
+        "durationMs": 19580,
+        "ownedProcessIds": [
+          23012
+        ],
+        "version": "16.0",
+        "interactive": true,
+        "stage": "EXCEL_QUIT",
+        "stages": [
+          "COPY_CONFIGURE",
+          "COM_CREATE",
+          "EXCEL_CONFIGURE",
+          "WORKBOOK_OPEN_START",
+          "WORKBOOK_OPEN_SUCCESS",
+          "WORKBOOK_READ_PROBE",
+          "WORKBOOK_CLOSE",
+          "EXCEL_QUIT"
+        ],
+        "ok": true,
+        "hostSessionId": 1,
+        "cleanupDurationMs": 2501,
+        "workbookOpened": true,
+        "openability": "OPENABLE",
+        "excelVersion": "16.0",
+        "gracefulQuitTimedOut": false,
+        "ownedExcelProcessIds": [
+          23012
+        ],
+        "cleanupVerified": true,
+        "ownershipVerified": true,
+        "remainingOwnedProcessIds": [],
+        "unverifiedNewExcelProcessIds": []
+      },
+      "stages": [
+        {
+          "stage": "ASSET_RESOLVE",
+          "atMs": 0
+        },
+        {
+          "stage": "SOURCE_EXISTS",
+          "atMs": 1
+        },
+        {
+          "stage": "SOURCE_HASH_BEFORE",
+          "atMs": 4
+        },
+        {
+          "stage": "COPY_CREATE",
+          "atMs": 17
+        },
+        {
+          "stage": "COPY_CONFIGURE",
+          "atMs": 27213
+        },
+        {
+          "stage": "COM_CREATE",
+          "atMs": 27213
+        },
+        {
+          "stage": "EXCEL_CONFIGURE",
+          "atMs": 27213
+        },
+        {
+          "stage": "WORKBOOK_OPEN_START",
+          "atMs": 27213
+        },
+        {
+          "stage": "WORKBOOK_OPEN_SUCCESS",
+          "atMs": 27213
+        },
+        {
+          "stage": "WORKBOOK_READ_PROBE",
+          "atMs": 27213
+        },
+        {
+          "stage": "WORKBOOK_CLOSE",
+          "atMs": 27213
+        },
+        {
+          "stage": "EXCEL_QUIT",
+          "atMs": 27213
+        },
+        {
+          "stage": "COPY_DELETE",
+          "atMs": 27213
+        },
+        {
+          "stage": "SOURCE_HASH_AFTER",
+          "atMs": 27215
+        }
+      ]
+    },
+    {
+      "run": 2,
+      "asset": "Mirax.xlsm",
+      "ok": false,
+      "durationMs": 63643,
+      "sourceHashBefore": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "sourceHashAfter": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "copyCreated": true,
+      "copyIdentity": "pj-excel-probe-obibK4/Mirax.xlsm",
+      "copyDeleted": true,
+      "diagnosticCode": "TIMEOUT",
+      "failedStage": "WORKBOOK_OPEN_START",
+      "probe": {
+        "ok": false,
+        "diagnosticCode": "TIMEOUT",
+        "failedStage": "WORKBOOK_OPEN_START",
+        "failedSubstage": null,
+        "safeError": {
+          "exceptionClass": "TimeoutError",
+          "hresult": null,
+          "message": "Excel diagnostic timed out at WORKBOOK_OPEN_START"
+        },
+        "stages": [
+          "COPY_CONFIGURE",
+          "COM_CREATE",
+          "EXCEL_CONFIGURE",
+          "WORKBOOK_OPEN_START"
+        ],
+        "ownedProcessIds": [
+          32720
+        ],
+        "durationMs": 60094,
+        "cleanupDurationMs": 2656,
+        "workbookOpened": false,
+        "stageTimings": [
+          {
+            "completed": true,
+            "atMs": 30,
+            "durationMs": 11131,
+            "stage": "COPY_CONFIGURE"
+          },
+          {
+            "completed": true,
+            "atMs": 11161,
+            "durationMs": 6678,
+            "stage": "COM_CREATE"
+          },
+          {
+            "completed": true,
+            "atMs": 17839,
+            "durationMs": 1891,
+            "stage": "EXCEL_CONFIGURE"
+          },
+          {
+            "completed": false,
+            "atMs": 19730,
+            "durationMs": null,
+            "stage": "WORKBOOK_OPEN_START"
+          }
+        ],
+        "processOwnership": [
+          {
+            "proof": "HWND_PID_START_TIME",
+            "hwnd": "266302",
+            "startTicks": "639264515520585521",
+            "id": 32720,
+            "sessionId": 1
+          }
+        ],
+        "hostSessionId": 1,
+        "interactive": true,
+        "openability": "OPEN_FAILED",
+        "excelVersion": null,
+        "externalRefreshSuppressed": true,
+        "refreshFlagsCleared": 2,
+        "queryTablesDisabled": 2,
+        "calculationDisabled": true,
+        "vbaProjectUnchanged": true,
+        "gracefulQuitTimedOut": false,
+        "ownedExcelProcessIds": [
+          32720
+        ],
+        "cleanupVerified": true,
+        "ownershipVerified": true,
+        "remainingOwnedProcessIds": [],
+        "unverifiedNewExcelProcessIds": []
+      },
+      "stages": [
+        {
+          "stage": "ASSET_RESOLVE",
+          "atMs": 0
+        },
+        {
+          "stage": "SOURCE_EXISTS",
+          "atMs": 2
+        },
+        {
+          "stage": "SOURCE_HASH_BEFORE",
+          "atMs": 3
+        },
+        {
+          "stage": "COPY_CREATE",
+          "atMs": 427
+        },
+        {
+          "stage": "COPY_CONFIGURE",
+          "atMs": 63232
+        },
+        {
+          "stage": "COM_CREATE",
+          "atMs": 63232
+        },
+        {
+          "stage": "EXCEL_CONFIGURE",
+          "atMs": 63232
+        },
+        {
+          "stage": "WORKBOOK_OPEN_START",
+          "atMs": 63232
+        },
+        {
+          "stage": "SOURCE_HASH_AFTER",
+          "atMs": 63233
+        },
+        {
+          "stage": "COPY_DELETE",
+          "atMs": 63627
+        }
+      ]
+    },
+    {
+      "run": 3,
+      "asset": "Gozareshkar.xlsm",
+      "ok": true,
+      "durationMs": 21682,
+      "sourceHashBefore": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "sourceHashAfter": "2fd360e08b92c37c42a25c185b340e72cfe2dc43d6724d47144d83a6853cbe1d",
+      "copyCreated": true,
+      "copyIdentity": "pj-excel-probe-hs5ifc/Gozareshkar.xlsm",
+      "copyDeleted": true,
+      "diagnosticCode": null,
+      "failedStage": null,
+      "probe": {
+        "refreshFlagsCleared": 0,
+        "vbaProjectUnchanged": true,
+        "externalRefreshSuppressed": true,
+        "queryTablesDisabled": 0,
+        "calculationDisabled": true,
+        "stageTimings": [
+          {
+            "completed": true,
+            "atMs": 17,
+            "durationMs": 1611,
+            "stage": "COPY_CONFIGURE"
+          },
+          {
+            "completed": true,
+            "atMs": 1628,
+            "durationMs": 5924,
+            "stage": "COM_CREATE"
+          },
+          {
+            "completed": true,
+            "atMs": 7552,
+            "durationMs": 2048,
+            "stage": "EXCEL_CONFIGURE"
+          },
+          {
+            "completed": true,
+            "atMs": 9600,
+            "durationMs": 2965,
+            "stage": "WORKBOOK_OPEN_START"
+          },
+          {
+            "completed": true,
+            "atMs": 12565,
+            "durationMs": 16,
+            "stage": "WORKBOOK_OPEN_SUCCESS"
+          },
+          {
+            "completed": true,
+            "atMs": 12581,
+            "durationMs": 770,
+            "stage": "WORKBOOK_READ_PROBE"
+          },
+          {
+            "completed": true,
+            "atMs": 13351,
+            "durationMs": 275,
+            "stage": "WORKBOOK_CLOSE"
+          },
+          {
+            "completed": true,
+            "atMs": 13626,
+            "durationMs": 4589,
+            "stage": "EXCEL_QUIT"
+          }
+        ],
+        "processOwnership": [
+          {
+            "proof": "HWND_PID_START_TIME",
+            "hwnd": "39063200",
+            "startTicks": "639264516055576053",
+            "id": 12024,
+            "sessionId": 1
+          }
+        ],
+        "durationMs": 18215,
+        "ownedProcessIds": [
+          12024
+        ],
+        "version": "16.0",
+        "interactive": true,
+        "stage": "EXCEL_QUIT",
+        "stages": [
+          "COPY_CONFIGURE",
+          "COM_CREATE",
+          "EXCEL_CONFIGURE",
+          "WORKBOOK_OPEN_START",
+          "WORKBOOK_OPEN_SUCCESS",
+          "WORKBOOK_READ_PROBE",
+          "WORKBOOK_CLOSE",
+          "EXCEL_QUIT"
+        ],
+        "ok": true,
+        "hostSessionId": 1,
+        "cleanupDurationMs": 857,
+        "workbookOpened": true,
+        "openability": "OPENABLE",
+        "excelVersion": "16.0",
+        "gracefulQuitTimedOut": false,
+        "ownedExcelProcessIds": [
+          12024
+        ],
+        "cleanupVerified": true,
+        "ownershipVerified": true,
+        "remainingOwnedProcessIds": [],
+        "unverifiedNewExcelProcessIds": []
+      },
+      "stages": [
+        {
+          "stage": "ASSET_RESOLVE",
+          "atMs": 0
+        },
+        {
+          "stage": "SOURCE_EXISTS",
+          "atMs": 1
+        },
+        {
+          "stage": "SOURCE_HASH_BEFORE",
+          "atMs": 1
+        },
+        {
+          "stage": "COPY_CREATE",
+          "atMs": 8
+        },
+        {
+          "stage": "COPY_CONFIGURE",
+          "atMs": 21677
+        },
+        {
+          "stage": "COM_CREATE",
+          "atMs": 21677
+        },
+        {
+          "stage": "EXCEL_CONFIGURE",
+          "atMs": 21677
+        },
+        {
+          "stage": "WORKBOOK_OPEN_START",
+          "atMs": 21677
+        },
+        {
+          "stage": "WORKBOOK_OPEN_SUCCESS",
+          "atMs": 21677
+        },
+        {
+          "stage": "WORKBOOK_READ_PROBE",
+          "atMs": 21677
+        },
+        {
+          "stage": "WORKBOOK_CLOSE",
+          "atMs": 21677
+        },
+        {
+          "stage": "EXCEL_QUIT",
+          "atMs": 21677
+        },
+        {
+          "stage": "COPY_DELETE",
+          "atMs": 21677
+        },
+        {
+          "stage": "SOURCE_HASH_AFTER",
+          "atMs": 21678
+        }
+      ]
+    },
+    {
+      "run": 4,
+      "asset": "Mirax.xlsm",
+      "ok": true,
+      "durationMs": 39919,
+      "sourceHashBefore": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "sourceHashAfter": "72302572d4965a5d0ba2571d1fdcadfe6b197873cbc9adeeb0985237398b4d77",
+      "copyCreated": true,
+      "copyIdentity": "pj-excel-probe-QXUhwy/Mirax.xlsm",
+      "copyDeleted": true,
+      "diagnosticCode": null,
+      "failedStage": null,
+      "probe": {
+        "refreshFlagsCleared": 2,
+        "vbaProjectUnchanged": true,
+        "externalRefreshSuppressed": true,
+        "queryTablesDisabled": 2,
+        "calculationDisabled": true,
+        "stageTimings": [
+          {
+            "completed": true,
+            "atMs": 16,
+            "durationMs": 5029,
+            "stage": "COPY_CONFIGURE"
+          },
+          {
+            "completed": true,
+            "atMs": 5045,
+            "durationMs": 2376,
+            "stage": "COM_CREATE"
+          },
+          {
+            "completed": true,
+            "atMs": 7421,
+            "durationMs": 468,
+            "stage": "EXCEL_CONFIGURE"
+          },
+          {
+            "completed": true,
+            "atMs": 7889,
+            "durationMs": 23779,
+            "stage": "WORKBOOK_OPEN_START"
+          },
+          {
+            "completed": true,
+            "atMs": 31668,
+            "durationMs": 9,
+            "stage": "WORKBOOK_OPEN_SUCCESS"
+          },
+          {
+            "completed": true,
+            "atMs": 31677,
+            "durationMs": 433,
+            "stage": "WORKBOOK_READ_PROBE"
+          },
+          {
+            "completed": true,
+            "atMs": 32110,
+            "durationMs": 1336,
+            "stage": "WORKBOOK_CLOSE"
+          },
+          {
+            "completed": true,
+            "atMs": 33446,
+            "durationMs": 4101,
+            "stage": "EXCEL_QUIT"
+          }
+        ],
+        "processOwnership": [
+          {
+            "proof": "HWND_PID_START_TIME",
+            "hwnd": "33951658",
+            "startTicks": "639264516296996600",
+            "id": 9212,
+            "sessionId": 1
+          }
+        ],
+        "durationMs": 37547,
+        "ownedProcessIds": [
+          9212
+        ],
+        "version": "16.0",
+        "interactive": true,
+        "stage": "EXCEL_QUIT",
+        "stages": [
+          "COPY_CONFIGURE",
+          "COM_CREATE",
+          "EXCEL_CONFIGURE",
+          "WORKBOOK_OPEN_START",
+          "WORKBOOK_OPEN_SUCCESS",
+          "WORKBOOK_READ_PROBE",
+          "WORKBOOK_CLOSE",
+          "EXCEL_QUIT"
+        ],
+        "ok": true,
+        "hostSessionId": 1,
+        "cleanupDurationMs": 786,
+        "workbookOpened": true,
+        "openability": "OPENABLE",
+        "excelVersion": "16.0",
+        "gracefulQuitTimedOut": false,
+        "ownedExcelProcessIds": [
+          9212
+        ],
+        "cleanupVerified": true,
+        "ownershipVerified": true,
+        "remainingOwnedProcessIds": [],
+        "unverifiedNewExcelProcessIds": []
+      },
+      "stages": [
+        {
+          "stage": "ASSET_RESOLVE",
+          "atMs": 0
+        },
+        {
+          "stage": "SOURCE_EXISTS",
+          "atMs": 0
+        },
+        {
+          "stage": "SOURCE_HASH_BEFORE",
+          "atMs": 1
+        },
+        {
+          "stage": "COPY_CREATE",
+          "atMs": 170
+        },
+        {
+          "stage": "COPY_CONFIGURE",
+          "atMs": 39767
+        },
+        {
+          "stage": "COM_CREATE",
+          "atMs": 39767
+        },
+        {
+          "stage": "EXCEL_CONFIGURE",
+          "atMs": 39767
+        },
+        {
+          "stage": "WORKBOOK_OPEN_START",
+          "atMs": 39767
+        },
+        {
+          "stage": "WORKBOOK_OPEN_SUCCESS",
+          "atMs": 39767
+        },
+        {
+          "stage": "WORKBOOK_READ_PROBE",
+          "atMs": 39767
+        },
+        {
+          "stage": "WORKBOOK_CLOSE",
+          "atMs": 39767
+        },
+        {
+          "stage": "EXCEL_QUIT",
+          "atMs": 39767
+        },
+        {
+          "stage": "COPY_DELETE",
+          "atMs": 39767
+        },
+        {
+          "stage": "SOURCE_HASH_AFTER",
+          "atMs": 39775
+        }
+      ]
+    }
+  ],
+  "hostFinal": {
+    "interactive": true,
+    "sessionId": 1,
+    "excelProcesses": [
+      {
+        "id": 9396,
+        "startUtc": "2026-10-01T11:24:43.8635012Z",
+        "hwnd": "985748"
+      }
+    ],
+    "preexistingPreserved": true,
+    "probeOrphans": [],
+    "sourceHashesVerified": true
+  }
+}

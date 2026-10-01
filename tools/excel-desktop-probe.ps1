@@ -42,7 +42,13 @@ function Set-Stage([string]$stage) {
   $now=$started.ElapsedMilliseconds
   if ($state.stageTimings.Count) { $state.stageTimings[-1].durationMs=$now-$state.stageTimings[-1].atMs; $state.stageTimings[-1].completed=$true }
   $state.stageTimings += @{stage=$stage;atMs=$now;durationMs=$null;completed=$false}
-  $state.stage = $stage; $state.stages += $stage
+  $state.stage = $stage; $state.stages += $stage; $state.substage=$null
+  $state | ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath "$statePath.tmp" -Encoding UTF8
+  Move-Item -LiteralPath "$statePath.tmp" -Destination $statePath -Force
+}
+function Set-Substage([string]$substage) {
+  # Persist before each potentially blocking metadata/close call; no workbook contents.
+  $state.substage=$substage
   $state | ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath "$statePath.tmp" -Encoding UTF8
   Move-Item -LiteralPath "$statePath.tmp" -Destination $statePath -Force
 }
@@ -111,23 +117,32 @@ try {
   finally { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($books) | Out-Null }
   Set-Stage 'WORKBOOK_OPEN_SUCCESS'
   Set-Stage 'WORKBOOK_READ_PROBE'
+  Set-Substage 'WORKSHEETS_GET'
   $sheets = $book.Worksheets
+  Set-Substage 'WORKSHEETS_COUNT'
   if ($sheets.Count -lt 1) { throw 'No worksheet available' }
+  Set-Substage 'WORKSHEETS_RELEASE'
   [Runtime.InteropServices.Marshal]::FinalReleaseComObject($sheets) | Out-Null; $sheets=$null
+  Set-Substage 'EXCEL_VERSION'
   $version = [string]$excel.Version
   $state.excelVersion=$version
   Set-Stage 'WORKBOOK_CLOSE'
+  Set-Substage 'TARGET_WORKBOOK_CLOSE'
   $book.Close($false)
+  Set-Substage 'TARGET_WORKBOOK_RELEASE'
   [Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) | Out-Null; $book=$null
+  Set-Substage 'SEED_WORKBOOK_CLOSE'
   $seedBook.Close($false)
+  Set-Substage 'SEED_WORKBOOK_RELEASE'
   [Runtime.InteropServices.Marshal]::FinalReleaseComObject($seedBook) | Out-Null; $seedBook=$null
   Set-Stage 'EXCEL_QUIT'
+  Set-Substage 'APPLICATION_QUIT'
   $quitRequested=$true
   $excel.Quit()
   $result = @{ ok=$true; version=$version }
 } catch {
   $codes = @{ COPY_CONFIGURE='COPY_CONFIGURE_FAILED'; COM_CREATE='COM_CREATE_FAILED'; EXCEL_CONFIGURE='EXCEL_CONFIGURATION_FAILED'; WORKBOOK_OPEN_START='WORKBOOK_OPEN_FAILED'; WORKBOOK_READ_PROBE='WORKBOOK_READ_FAILED'; WORKBOOK_CLOSE='WORKBOOK_CLOSE_FAILED'; EXCEL_QUIT='EXCEL_QUIT_FAILED' }
-  $result = @{ ok=$false; diagnosticCode=$codes[$state.stage]; failedStage=$state.stage; safeError=@{ exceptionClass=$_.Exception.GetType().Name; hresult=('0x' + $_.Exception.HResult.ToString('X8')); message=('Excel diagnostic failed at ' + $state.stage); scriptLine=$_.InvocationInfo.ScriptLineNumber } }
+  $result = @{ ok=$false; diagnosticCode=$codes[$state.stage]; failedStage=$state.stage; failedSubstage=$state.substage; safeError=@{ exceptionClass=$_.Exception.GetType().Name; hresult=('0x' + $_.Exception.HResult.ToString('X8')); message=('Excel diagnostic failed at ' + $state.stage); scriptLine=$_.InvocationInfo.ScriptLineNumber } }
 } finally {
   if ($sheets) { try { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($sheets) | Out-Null } catch {} }
   if ($book) { try { $book.Close($false) } catch {}; try { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) | Out-Null } catch {} }
