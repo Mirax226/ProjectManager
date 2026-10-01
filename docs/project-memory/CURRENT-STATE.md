@@ -1,5 +1,21 @@
 # Current State
 
+## Excel Host Closure CLOSED — 2026-10-01
+
+EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.
+
+Closure evidence supplied by the owner in task PJ-EXCEL-HOST-CLOSURE-AND-NEXT-SCOPE: later bounded QA did not reproduce the intermittent failure; continuous window observation found no correlated dialog; independent AntiGravity production-path Excel runner soak passed 6/6, with 0 timeouts and 0 forced cleanup. Mirax and Gozareshkar source hashes were unchanged, process ownership was safe, every owned Excel process exited naturally, every disposable copy was deleted, and the soak made no repository changes. CODEX_FIX_REQUIRED = NO; EXCEL_HOST_CLOSURE_RECOMMENDED = YES. These are supplied independent results, not probes rerun by this documentation task.
+
+Historical Open/Close/Quit failures, earlier COM/read failures, matrix evidence and diagnostic fixes remain preserved. Root cause remains unconfirmed; refresh/query, dialog, add-in and host-context causation are not established. Residual risk: the historical intermittent issue may recur; closure does not prove a root-cause fix or permanent host stability.
+
+ACTIVE_EXCEL_HOST_BLOCKER = NONE. Authoritative Excel sync remains disabled. Final closure evidence and successor assessment: `docs/handoffs/PJ-EXCEL-HOST-CLOSURE/CLOSURE.md`.
+
+NEXT_PJ_MILESTONE: PJ_NEXT_SCOPE_UNDEFINED. PJ_NEXT_SCOPE_DEFINED = NO. The pre-closure current plan and roadmap explicitly state: "Latest roadmap defines no formal successor after this milestone; do not invent PJ-013." The only latest ordered work was PJ-012 activation/health E2E, then separate Excel host closure; both are now closed. Older duplicate PJ-010 policy/review entries are historical and are not automatically promoted to a successor. Owner definition of the next scope is needed before implementation; no milestone number, objective, dependencies, acceptance criteria or implementation files are assigned here.
+
+This task changes repository documentation only. DailySystem coordination required for this closure: NO; successor coordination: undefined until scope is defined. Production-impacting actions: NO. No Cloudflare, secrets, Telegram webhook, D1 production state, owner workbook or sync change. Existing gates remain: explicit owner review for integration/production enablement and ownership/restore verification before migration or archival mutation. External Plans/Review publication remains owner-only through the Finalizer.
+
+## Historical checkpoints (superseded for current status)
+
 ## Excel Host Closure OPEN — 2026-10-01
 
 EXCEL_HOST_CLOSURE = OPEN; PJ-012 remains COMPLETE. Starting clean 3ca7657c0bdc92b9eda84ca58929181830906635 matched origin/main. Two serial G/M/G/M disposable-copy matrices recorded: before, Gozareshkar quit timeout recovered after proven cleanup and Mirax close timeout; after, Mirax open timeout while three runs passed. MULTIPLE_HOST_FAILURE_MODES / WORKBOOK_OPEN_INSTABILITY / QUIT_CLEANUP_INSTABILITY; underlying cause UNKNOWN. Refresh/query causation is unconfirmed.
