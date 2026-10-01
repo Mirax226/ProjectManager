@@ -1,5 +1,22 @@
 # PJ-012 review and activation checkpoint
 
+## Latest closure checkpoint — 2026-10-01
+
+Owner-confirmed WEBHOOK_ACTIVE: setWebhook SUCCESS/setAccepted true/HTTP 200/matching URL; getWebhookInfo matched, pending count 0, lastErrorPresent false, allowedUpdates message/callback_query. Owner confirms prior /start response. These are supplied production evidence, not credential inspection by Codex. No webhook/token rotation in this task.
+
+Helper false-failure root cause: duplicated inline JavaScript passed via PowerShell/native node -e quoting, after successful activation. Removed only the redundant node/eval block; retained the tested npm run telegram:webhook -- --info path, safe failure exit and environment cleanup. Two actual PowerShell control-flow tests mock all external operations and prove success plus nonzero verification failure.
+
+English active Worker menu now has 📊 Status, 🖥️ Runners, 🚨 Incidents, 📋 Jobs buttons plus 🏠 Start, ❤️ Health, 📁 Project Status and 📗 Excel Health command hints. Status/jobs headings consistent. Existing Ops Center already supplies admin/incident/runner emoji titles. Command identifiers and callback_data status/runners/incidents/jobs unchanged; allowlist/private-chat auth unchanged. Added three application tests for menus, message/callback equivalence and authorization.
+
+Starting clean HEAD 2090fe1af80c804e9cf6d7db5198f1433fe54c12 == origin/main. Confirmed account 9f12f5d584ab6b4bd94c66d4bf7f53dc and four required secret names before deployment. New Worker version c7d32662-455e-41eb-9e7c-64d190d5911d deployed to same public origin; post-deploy /health HTTP 200 runtime cloudflare, D1 available. Read-only D1 metadata: five DONE Telegram updates and zero jobs at probe time; no raw update payload/data dump. Emoji code DEPLOYED; EMOJI_MENU_ACTIVE / fresh TELEGRAM_STATUS_PASS and post-deploy /start visibility await owner observation.
+
+RUNNER_SCOPE_CORRECT per owner's confirmed prior rotation: windows-runner / daily-system. Codex process has no matching token and cannot inherit owner-shell environment. RUNNER_TOKEN_ROTATION_REQUIRED only if owner shell lost the matching value; do not rotate if retained. No automatic Runner rotation or auth attempt. RUNNER_E2E_PASS remains unverified; D1 job/result evidence not yet present. Owner should use retained shell to run one safe health job, then report its ID for independent D1 confirmation.
+
+Verification: five new closure tests; 16 focused closure/webhook tests passed. Full suite 212 passed, 0 failed/skipped in 31.1011811 seconds; npm run check and git diff --check passed. Finalizer DryRun only, no external Plans/Review writes. Eight files changed: dispatcher, owner helper, closure tests, runbook, handoff, current plan and two memory files. No credentials/.env/log/database/workbook files staged.
+
+PJ-012 COMPLETE: NO until post-deploy /start and /status, visible emoji menu and one safe local Runner E2E pass. No Excel/VBA write, Render/legacy DB investigation or shell/deploy/SQL job. Remaining owner actions documented in runbook; final commit/push hash and clean synchronized state reported in final response.
+
+
 Cloudflare Worker + D1 is the owner-selected production architecture. Repository implementation and local verification are complete; production activation is pending owner-entered secrets and Telegram administrator IDs. No deployed runtime success is claimed.
 
 ## Requested report

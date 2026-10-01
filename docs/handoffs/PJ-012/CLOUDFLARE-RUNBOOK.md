@@ -1,5 +1,28 @@
 # PJ-012 Cloudflare activation runbook
 
+## Current closure steps — webhook already active
+
+Do NOT rerun -Webhook or setWebhook. Owner-confirmed webhook is active and prior /start passed. Emoji UI deployed as c7d32662-455e-41eb-9e7c-64d190d5911d; send /start and /status as administrator 843686302 and confirm emoji labels after this deployment. If the bot token is still securely in the owner shell, use only `npm run telegram:webhook -- --info`; this reports allowedUpdates and safe status already, so no separate node/eval check is required. The owner helper's duplicated node -e quoting path was removed.
+
+Runner scope is already corrected per owner: windows-runner / daily-system. If the matching local token was lost, RUNNER_TOKEN_ROTATION_REQUIRED: intentionally use `./docs/handoffs/PJ-012/OWNER-FINAL-ACTIVATION.ps1 -Runner` once. If retained, do not rotate. The owner shell must keep the same uploaded token available; do not send it to Codex/chat.
+
+For exactly one safe live job, run in that retained owner shell from the canonical repository:
+
+```powershell
+$env:PG_RUNNER_ID = 'windows-runner'
+$env:PG_PROJECT_ID = 'daily-system'
+$env:PG_CONTROL_PLANE_URL = 'https://projectmanager-control-plane.amirhoseinsalmani194728095.workers.dev'
+$env:DAILYSYSTEM_REPO_PATH = Read-Host 'Verified absolute local DailySystem repository path'
+if (-not [IO.Path]::IsPathRooted($env:DAILYSYSTEM_REPO_PATH) -or -not (Test-Path -LiteralPath $env:DAILYSYSTEM_REPO_PATH -PathType Container)) { throw 'Valid DailySystem repository path required' }
+if (-not (Test-Path Env:PG_RUNNER_TOKEN) -or [string]::IsNullOrWhiteSpace($env:PG_RUNNER_TOKEN)) { throw 'Matching local Runner token required; never paste it into chat' }
+npm run runner
+```
+
+The latest read-only D1 check showed zero jobs; recheck that no unrelated pending/expired claimed job has appeared before starting polling. Do not enqueue other work during smoke. After Runner starts, send exactly one `/health daily-system` in the admin bot chat, note its job ID, and use `/job ID` to confirm SUCCEEDED. Stop Runner with Ctrl+C immediately afterward and clear PG_RUNNER_TOKEN if no longer needed. Report only job ID, runner/project IDs, result status and menu observations; Codex can independently verify safe D1 lease/attempt/result metadata. No Excel write, shell, deploy or SQL job. If heartbeat/auth fails, stop and report the safe error rather than re-rotating or guessing.
+
+Historical setup sections below remain for recovery context; they are not instructions to rotate the healthy webhook again. PJ-012 stays open until this smoke and visible post-deployment menu are confirmed.
+
+
 ## Final owner activation procedure (2026-10-01)
 
 Worker health/account/required secret names reverified from clean a60a53f. No secret values are available to Codex. If the owner still has the SAME matching webhook secret, use the masked-input activation procedure below. Otherwise: WEBHOOK_SECRET_ROTATION_REQUIRED. The owner-only OWNER-FINAL-ACTIVATION.ps1 generates 256-bit randomness, uploads through Wrangler standard input, and immediately reuses the same value with the existing webhook tool. No automatic rotation was run.

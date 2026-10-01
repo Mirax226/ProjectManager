@@ -17,16 +17,17 @@ async function dispatchTelegramUpdate(update, { store, env }) {
   let keyboard;
   if (['start', 'admin'].includes(command)) {
     text = buildProjectManagerAdminModel({ config: store.operationalConfig, jobs: await store.listJobs(), archives: [...store.archives.values()] }).text;
-    keyboard = { inline_keyboard: [[{ text: 'Status', callback_data: 'status' }, { text: 'Runners', callback_data: 'runners' }], [{ text: 'Incidents', callback_data: 'incidents' }, { text: 'Jobs', callback_data: 'jobs' }]] };
+    text += '\n\n🏠 Start: /start\n❤️ Health: /health PROJECT\n📁 Project Status: /project_status PROJECT\n📗 Excel Health: /excel_healthcheck PROJECT ASSET';
+    keyboard = { inline_keyboard: [[{ text: '📊 Status', callback_data: 'status' }, { text: '🖥️ Runners', callback_data: 'runners' }], [{ text: '🚨 Incidents', callback_data: 'incidents' }, { text: '📋 Jobs', callback_data: 'jobs' }]] };
   } else if (command === 'status') {
     const state = await store.status();
-    text = `ProjectManager · Cloudflare/D1\nProjects: ${state.projects.length}\nRunners: ${state.runners.length}\nIncidents: ${state.openAlerts.length}`;
+    text = `📊 ProjectManager · Cloudflare/D1\n📁 Projects: ${state.projects.length}\n🖥️ Runners: ${state.runners.length}\n🚨 Incidents: ${state.openAlerts.length}`;
   } else if (command === 'runners') {
     text = buildRunnerDashboardModel((await store.status()).runners, await store.listJobs()).text;
   } else if (command === 'incidents') {
     text = buildIncidentCenterModel((await store.status()).openAlerts).text;
   } else if (command === 'jobs') {
-    text = (await store.listJobs()).slice(0, 10).map((job) => `${job.id} · ${job.projectId} · ${job.type} · ${job.status}`).join('\n') || 'No jobs.';
+    text = '📋 Jobs\n' + ((await store.listJobs()).slice(0, 10).map((job) => `${job.id} · ${job.projectId} · ${job.type} · ${job.status}`).join('\n') || 'No jobs.');
   } else if (command === 'job' && projectId) {
     const job = await store.getJob(projectId);
     text = job ? `${job.id} · ${job.projectId} · ${job.type} · ${job.status}` : 'Job not found.';
@@ -36,7 +37,7 @@ async function dispatchTelegramUpdate(update, { store, env }) {
     const created = inputJob.ok ? await store.createJob(inputJob.job, 'telegram-admin') : inputJob;
     text = created.ok ? `Queued ${created.job.type}\nJob: ${created.job.id}\nUse /job ${created.job.id} for the Runner result.` : 'Invalid project or diagnostic action.';
   } else {
-    text = 'Commands: /admin /status /runners /incidents /jobs /job ID /health PROJECT /project_status PROJECT /excel_healthcheck PROJECT ASSET. Other legacy actions are disabled.';
+    text = '🏠 /start · ⚙️ /admin\n📊 /status · 🖥️ /runners\n🚨 /incidents · 📋 /jobs · /job ID\n❤️ /health PROJECT\n📁 /project_status PROJECT\n📗 /excel_healthcheck PROJECT ASSET\nOther legacy actions are disabled.';
   }
   return { authorized: true, chatId: message.chat.id, text: text.slice(0, 4000), replyMarkup: keyboard, callbackId: callback?.id };
 }

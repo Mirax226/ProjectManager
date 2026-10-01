@@ -43,8 +43,6 @@ if ($Runner) {
   if ($LASTEXITCODE -ne 0) { throw 'Keep shell open; retry --set with SAME generated secret, not this rotation script' }
   npm run telegram:webhook -- --info
   if ($LASTEXITCODE -ne 0) { throw 'Keep shell open; retry --info before clearing values' }
-  node -e 'const {telegramCall}=require("./src/controlPlane/telegramWebhook");telegramCall(process.env.TELEGRAM_BOT_TOKEN,"getWebhookInfo",{}).then(x=>console.log(JSON.stringify({allowedUpdates:(x.allowed_updates||[]).filter(v=>["message","callback_query"].includes(v)),pendingUpdateCount:x.pending_update_count||0,lastErrorDate:x.last_error_date||null}))).catch(()=>{console.error("Safe verification failed");process.exitCode=1})'
-  if ($LASTEXITCODE -ne 0) { throw 'Safe getWebhookInfo failed' }
   Remove-Item Env:TELEGRAM_BOT_TOKEN, Env:TELEGRAM_WEBHOOK_SECRET -ErrorAction SilentlyContinue
   Write-Output 'Now verify /start and /status in administrator private chat. No chat smoke result is claimed here.'
 }
