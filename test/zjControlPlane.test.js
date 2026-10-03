@@ -192,15 +192,31 @@ test('active ProjectManager paths no longer use the former checkout', () => {
 test('Telegram admin can navigate projects and queue only typed ZJ actions', async () => {
   const store = new ControlPlaneStore(); const env = { TELEGRAM_ADMIN_USER_IDS: '123' };
   const update = (text, id = 123) => ({ update_id: Math.floor(Math.random() * 1e6), message: { text, from: { id }, chat: { id, type: 'private' } } });
+  const callback = (data) => ({ update_id: Math.floor(Math.random() * 1e6), callback_query: { id: 'callback', data, from: { id: 123 }, message: { chat: { id: 123, type: 'private' } } } });
   const unauthorized = await dispatchTelegramUpdate(update('/projects', 999), { store, env });
   assert.equal(unauthorized.authorized, false);
   const projects = await dispatchTelegramUpdate(update('/projects'), { store, env });
-  assert.match(projects.text, /DailySystem/); assert.match(projects.text, /ZJ/);
-  const zj = await dispatchTelegramUpdate(update('/project zj'), { store, env });
-  assert.deepEqual(zj.replyMarkup.inline_keyboard.flat().map((button) => button.callback_data), ['zj_status', 'zj_repo', 'zj_release', 'zj_readiness', 'zj_validate', 'zj_staging', 'zj_jobs']);
-  const queued = await dispatchTelegramUpdate(update('/zj_repo'), { store, env });
-  assert.match(queued.text, /Queued ZJ_REPO_STATUS/);
-  assert.equal(store.listJobs('zj').length, 1);
+  assert.match(projects.text, /📁 Projects/);
+  assert.deepEqual(projects.replyMarkup.inline_keyboard.flat().map((button) => [button.text, button.callback_data]), [['📘 DailySystem', 'project daily-system'], ['🎓 ZJ', 'project zj'], ['🏠 Home', 'start']]);
+  const zj = await dispatchTelegramUpdate(callback('project zj'), { store, env });
+  assert.deepEqual(zj.replyMarkup.inline_keyboard.flat().map((button) => button.text), ['📊 Status', '🗂 Repository', '🧾 Release Evidence', '✅ Release Readiness', '🧪 Local Validation', '🩺 Staging Health', '🕘 Last Jobs', '⬅️ Back', '🏠 Home']);
+  assert.deepEqual(zj.replyMarkup.inline_keyboard.flat().map((button) => button.callback_data), ['zj_status', 'zj_repo', 'zj_release', 'zj_readiness', 'zj_validate', 'zj_staging', 'zj_jobs', 'projects', 'start']);
+  const daily = await dispatchTelegramUpdate(callback('project daily-system'), { store, env });
+  assert.deepEqual(daily.replyMarkup.inline_keyboard.flat().map((button) => [button.text, button.callback_data]), [['📊 Status', 'project_status daily-system'], ['🩺 Health', 'health daily-system'], ['🧾 Jobs', 'jobs'], ['⬅️ Back', 'projects'], ['🏠 Home', 'start']]);
+  assert.match((await dispatchTelegramUpdate(callback('zj_status'), { store, env })).text, /🎓 ZJ/);
+  assert.match((await dispatchTelegramUpdate(callback('zj_jobs'), { store, env })).text, /🕘 ZJ Last Jobs/);
+  for (const [data, type] of [['zj_repo', 'ZJ_REPO_STATUS'], ['zj_release', 'ZJ_RELEASE_EVIDENCE'], ['zj_readiness', 'ZJ_RELEASE_READINESS'], ['zj_validate', 'ZJ_LOCAL_VALIDATION'], ['zj_staging', 'ZJ_STAGING_HEALTHCHECK']]) {
+    const queued = await dispatchTelegramUpdate(callback(data), { store, env });
+    assert.match(queued.text, new RegExp(`(?:Queued|Ready) ${type}`));
+  }
+  assert.equal(store.listJobs('zj').length, 5);
+  assert.match((await dispatchTelegramUpdate(callback('projects'), { store, env })).text, /📁 Projects/);
+  assert.match((await dispatchTelegramUpdate(callback('start'), { store, env })).text, /ProjectManager/);
+  assert.match((await dispatchTelegramUpdate(callback('unknown_callback'), { store, env })).text, /legacy actions are disabled/);
+  const disabled = new ControlPlaneStore({ zjEnabled: false });
+  const disabledProjects = await dispatchTelegramUpdate(update('/projects'), { store: disabled, env });
+  assert.match(disabledProjects.text, /🎓 ZJ: DISABLED/);
+  assert.equal(disabledProjects.replyMarkup.inline_keyboard.flat().some((button) => button.callback_data === 'project zj'), false);
 });
 
 test('runner bounds output and terminates a timed-out child', async () => {
