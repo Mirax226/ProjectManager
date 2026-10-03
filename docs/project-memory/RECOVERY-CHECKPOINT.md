@@ -2,7 +2,7 @@
 
 ## PJ-ZJ-002 recovery checkpoint — 2026-10-03
 
-PJ main includes activation commit 6c6ba2c and Runner/evidence fix d49c219; verify final HEAD/origin after the documentation commit. Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63 runs PJ_ZJ_ENABLED=true. Runner credentials were rotated for windows-runner/daily-system and zj-runner/zj with PROCESS_ONLY local storage. Live scope, DailySystem canaries, ZJ repo status, release evidence and local validation pass. ZJ HEAD/upstream f7d8bd43, clean. PJ 234/234 tests pass. Telegram admin live acceptance and durable Runner restart are unresolved. Recover details from ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md; do not use older single-runner rotation instructions.
+PJ main includes activation commit 6c6ba2c and Runner/evidence fix d49c219; verify final HEAD/origin after the documentation commit. Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63 runs PJ_ZJ_ENABLED=true. Runner credentials were rotated for windows-runner/daily-system and zj-runner/zj with PROCESS_ONLY local storage. Live scope, DailySystem canaries, ZJ repo status, release evidence and local validation passed during validation. Both Runners were intentionally stopped at 2026-10-03 12:40 UTC; no local token copy survives and coordinated re-rotation is required before restart. ZJ HEAD/upstream f7d8bd43, clean. PJ 234/234 tests pass. Telegram admin live acceptance and durable Runner restart are unresolved. Recover details from ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md; do not use older single-runner rotation instructions.
 
 ## Latest PJ recovery result — 2026-10-03
 

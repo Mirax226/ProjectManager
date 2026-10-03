@@ -2,7 +2,7 @@
 
 ## PJ-ZJ-002 latest state — 2026-10-03
 
-PJ_ZJ_ENABLED=true is live; Worker 45f537fb-f9dc-4d47-bb59-0b2fd7296d63 returns HTTP 200 with D1 available. Distinct scoped windows-runner/daily-system and zj-runner/zj credentials were rotated without recording values. DailySystem and ZJ live Runner jobs pass; cross-project requests fail with 403. ZJ disposable-clone validation passed 61 files/1,160 tests and all eight command domains. PJ full suite 234/234, check/build/diff pass. ZJ is clean at accepted f7d8bd43. Current Plans evidence is ZJ-RC-006 and still lacks staging Telegram application acceptance. PJ live Telegram admin acceptance and durable local Runner storage remain pending. See the PJ-ZJ-002 handoff; older state below is superseded.
+PJ_ZJ_ENABLED=true is live; Worker 45f537fb-f9dc-4d47-bb59-0b2fd7296d63 returns HTTP 200 with D1 available. Distinct scoped windows-runner/daily-system and zj-runner/zj credentials were rotated without recording values. DailySystem and ZJ live Runner jobs passed during validation; cross-project requests failed with 403. ZJ disposable-clone validation passed 61 files/1,160 tests and all eight command domains. PJ full suite 234/234, check/build/diff pass. ZJ is clean at accepted f7d8bd43. Both process-only Runners were stopped at 2026-10-03 12:40 UTC and their local tokens were not retained, so Runner service requires coordinated re-rotation before restart. Current Plans evidence is ZJ-RC-006 and still lacks staging Telegram application acceptance. PJ live Telegram admin acceptance and durable local Runner storage remain pending. See the PJ-ZJ-002 handoff; older state below is superseded.
 
 ## Latest PJ-ZJ-001 result — 2026-10-03
 

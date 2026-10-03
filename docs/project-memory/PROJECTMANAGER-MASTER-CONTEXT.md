@@ -2,7 +2,7 @@
 
 ## PJ-ZJ-002 current context — 2026-10-03
 
-ProjectManager now has live DailySystem and ZJ project records and distinct scoped Runner identities. PJ_ZJ_ENABLED=true was deployed in Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. Remote DailySystem canaries, bidirectional project isolation, ZJ repository status and ZJ local validation passed. ZJ validation reports 61 files/1,160 tests and all eight command domains PASS without changing canonical ZJ. Current release Plans checkpoint is ZJ-RC-006 with staging Telegram acceptance blocked. The local Runner credentials are process-only, so restart persistence is open. PJ Telegram admin live acceptance is pending. Read the PJ-ZJ-002 handoff and continuity backup first; older disabled/dirty narratives below are historical.
+ProjectManager now has live DailySystem and ZJ project records and distinct scoped Runner identities. PJ_ZJ_ENABLED=true was deployed in Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. Remote DailySystem canaries, bidirectional project isolation, ZJ repository status and ZJ local validation passed. ZJ validation reports 61 files/1,160 tests and all eight command domains PASS without changing canonical ZJ. Current release Plans checkpoint is ZJ-RC-006 with staging Telegram acceptance blocked. The local Runner credentials were process-only; both Runners were intentionally stopped at 2026-10-03 12:40 UTC, with no retained local token copy. PJ Telegram admin live acceptance and coordinated Runner restart remain pending. Read the PJ-ZJ-002 handoff and continuity backup first; older disabled/dirty narratives below are historical.
 
 ## Latest PJ-ZJ-001 outcome — 2026-10-03
 

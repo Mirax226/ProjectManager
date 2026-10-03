@@ -2,7 +2,7 @@
 
 ## Current PJ-ZJ-002 gate — 2026-10-03
 
-Credential rotation, PJ ZJ activation, DailySystem live canaries, bidirectional Runner isolation, ZJ repository/release/validation jobs, and PJ local regression are complete. PJ_ZJ_ENABLED=true is deployed as Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. Remaining acceptance: direct ProjectManager Telegram admin Projects→ZJ observation and a Telegram-triggered ZJ job; then establish approved durable local Runner secret storage/restart or explicitly accept process-only operation. ZJ production remains untouched. See ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md for evidence and precise job IDs.
+Credential rotation, PJ ZJ activation, DailySystem live canaries, bidirectional Runner isolation, ZJ repository/release/validation jobs, and PJ local regression are complete. PJ_ZJ_ENABLED=true is deployed as Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. The two task-owned process-only Runners were intentionally stopped at 2026-10-03 12:40 UTC; their tokens were not retained locally, so restart needs coordinated re-rotation. Remaining acceptance: direct ProjectManager Telegram admin Projects→ZJ observation and a Telegram-triggered ZJ job; then establish approved durable local Runner secret storage/restart or explicitly accept process-only operation. ZJ production remains untouched. See ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md for evidence and precise job IDs.
 
 # Current owner-defined plan — PJ-ZJ-001 (2026-10-03)
 
