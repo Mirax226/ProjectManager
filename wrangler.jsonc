@@ -11,7 +11,7 @@
     "PJ_RUNTIME": "cloudflare",
     "LEGACY_CONFIG_DB_ENABLED": "false",
     "TELEGRAM_ADMIN_USER_IDS": "843686302",
-    "PJ_ZJ_ENABLED": "false"
+    "PJ_ZJ_ENABLED": "true"
   },
   "d1_databases": [
     {
