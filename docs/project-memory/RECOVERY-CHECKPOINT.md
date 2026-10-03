@@ -1,5 +1,9 @@
 # Recovery Checkpoint
 
+## PJ-ZJ-004 recovery checkpoint — 2026-10-03
+
+PJ emoji UX commit `21519a1` is deployed as Worker `4d8b95c9-67d1-4a89-b471-348f2a376098`; health/D1 pass. Both scoped Runners use local Windows DPAPI CurrentUser records and the documented `tools/runner-durable.ps1` launcher; each passed restart without token re-entry. Cross-project requests rejected with HTTP 403 and both post-deploy canaries passed. Preserve the owner-bound encrypted store; Git recovers code/runbook but not credentials. Human Telegram menu/job evidence is pending; do not mark final acceptance complete. Current evidence and callback table: [PJ-ZJ-004 handoff](../handoffs/PJ-ZJ-004-TELEGRAM-FINAL-ACCEPTANCE.md).
+
 ## PJ-ZJ-003 recovery checkpoint — 2026-10-03
 
 Use `tools/runner-durable.ps1` and `docs/WINDOWS-RUNNER.md` for scoped Runner startup. The two Windows DPAPI CurrentUser encrypted records are under `%LOCALAPPDATA%\ProjectManager\runner-secrets\`; no plaintext or encryption key is in Git. Per-user logon startup entries exist for DailySystem and ZJ. Manual `-Mode Start -Project daily-system` and `-Mode Start -Project zj` were proven after owned-process stops, without token re-entry. Both were online after restoration. Code/runbook recovery from origin/main is possible after push; Runner credential recovery requires this owner's Windows profile and encrypted local store. Live Telegram acceptance remains pending. See the [PJ-ZJ-003 handoff](../handoffs/PJ-ZJ-003-DURABLE-RUNNERS-TELEGRAM-ACCEPTANCE.md) for job IDs, security checks, and limits; prior process-only notes below are historical.

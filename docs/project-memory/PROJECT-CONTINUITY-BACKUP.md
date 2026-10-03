@@ -1,5 +1,9 @@
 # ProjectManager continuity backup
 
+## PJ-ZJ-004 emoji UX deployment — 2026-10-03
+
+PJ commit `21519a1` adds emoji labels and Back/Home navigation to Telegram Projects, ZJ, and DailySystem menus while preserving existing ZJ callback data. Worker version `4d8b95c9-67d1-4a89-b471-348f2a376098` is deployed with `PJ_ZJ_ENABLED=true`, health HTTP 200, D1 available. Both DPAPI-backed scoped Runners passed independent restart, bidirectional 403 isolation, and post-deploy DailySystem/ZJ safe canaries; both were ONLINE. PJ full suite 234/234, check, diff and token audit passed. Human ProjectManager Telegram chat observation and Telegram-origin ZJ job proof are pending. See [PJ-ZJ-004 Telegram acceptance](../handoffs/PJ-ZJ-004-TELEGRAM-FINAL-ACCEPTANCE.md). Historical PJ-ZJ-003 and earlier entries below remain for provenance.
+
 ## PJ-ZJ-003 durable Runner checkpoint — 2026-10-03
 
 PJ-ZJ-003 replaced process-only credentials with two owner-bound Windows DPAPI CurrentUser records outside Git and rotated the complete `PG_RUNNER_TOKENS_JSON` map. Separate per-user logon startup entries are registered; Task Scheduler failed on this host even for a harmless diagnostic action and its nonfunctional tasks were removed. Both scoped Runners were started and independently restarted from encrypted records without token re-entry. DailySystem HEALTHCHECK before/after restart, ZJ repository/release/validation after restart, and bidirectional 403 isolation passed. ZJ validation stored 61 files/1,160 tests, 0 failures. PJ Worker remains deployed with `PJ_ZJ_ENABLED=true`; PJ 234/234 tests and check pass. Both Runners are online while live ProjectManager Telegram acceptance is pending. Code and runbook are recoverable from Git; credentials require this owner's local encrypted store. The current handoff is [PJ-ZJ-003 durable Runners](../handoffs/PJ-ZJ-003-DURABLE-RUNNERS-TELEGRAM-ACCEPTANCE.md). Older entries below are historical.

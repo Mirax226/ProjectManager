@@ -1,5 +1,9 @@
 # ProjectManager Current Plan
 
+## PJ-ZJ-004 live acceptance gate — 2026-10-03
+
+Emoji Telegram UX is coded, tested, pushed and deployed. Both durable scoped Runners passed restart and post-deploy canaries; PJ health/D1 pass. Await the owner's private ProjectManager bot `/projects` → ZJ → Repository and Local Validation observations, then verify reported job IDs as `telegram-admin` origin in D1 and complete DailySystem Telegram sanity. Keep both Runners online. Record final evidence before AntiGravity QA; current gate remains pending. See `docs/handoffs/PJ-ZJ-004-TELEGRAM-FINAL-ACCEPTANCE.md`.
+
 ## PJ-ZJ-003 final acceptance gate — 2026-10-03
 
 Durable owner-bound Runner credentials, coordinated rotation, separate logon startup entries, live restart proofs, DailySystem health, ZJ repository/release/validation, and project isolation have passed. Both Runners are online for live ProjectManager Telegram acceptance. Next: owner observes `/projects` → ZJ → Repository and Local Validation in the private ProjectManager admin chat and reports job IDs/results; verify Telegram origin in D1, DailySystem visibility, and one-at-a-time outage behavior. Keep ZJ production untouched. See `docs/handoffs/PJ-ZJ-003-DURABLE-RUNNERS-TELEGRAM-ACCEPTANCE.md` for evidence and recovery procedure.

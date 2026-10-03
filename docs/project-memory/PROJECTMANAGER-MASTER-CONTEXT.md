@@ -1,5 +1,9 @@
 # ProjectManager Master Context
 
+## PJ-ZJ-004 Telegram UX context — 2026-10-03
+
+PJ Projects/ZJ/DailySystem Telegram labels now use consistent leading emojis, with unchanged existing ZJ callback identifiers and added Back/Home navigation. PJ Worker version `4d8b95c9-67d1-4a89-b471-348f2a376098` is live with `PJ_ZJ_ENABLED=true`; health/D1 pass. Both owner-bound DPAPI Runners were restarted from encrypted records, passed scope isolation and post-deploy safe jobs, and were ONLINE. PJ regression 234/234 passed. The owner has been asked for private ProjectManager bot observations and Telegram-origin ZJ job IDs; final acceptance remains pending. Read the PJ-ZJ-004 handoff before older entries.
+
 ## PJ-ZJ-003 durable Runner context — 2026-10-03
 
 The ProjectManager Worker still has `PJ_ZJ_ENABLED=true` and D1 health available. Separate `windows-runner`/`daily-system` and `zj-runner`/`zj` credentials were rotated together and stored as owner-bound Windows DPAPI CurrentUser records outside Git. Both Runners passed live restart proof from those records; DailySystem health, ZJ repository/release/validation, and bidirectional isolation passed. ZJ validation reports 61 files/1,160 tests/0 failures. Per-user logon startup entries are registered, while actual logoff/logon startup is not yet tested. ProjectManager Telegram admin acceptance is pending; both Runners remain online for that check. The current handoff is `docs/handoffs/PJ-ZJ-003-DURABLE-RUNNERS-TELEGRAM-ACCEPTANCE.md`; older process-only notes below are historical.

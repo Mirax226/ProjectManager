@@ -1,5 +1,9 @@
 # Current State
 
+## PJ-ZJ-004 current state — 2026-10-03
+
+Emoji Telegram menus are deployed on PJ Worker version `4d8b95c9-67d1-4a89-b471-348f2a376098`. Existing callback identifiers are preserved; Projects exposes 📘 DailySystem and 🎓 ZJ, with emoji ZJ/DailySystem actions and Back/Home navigation. PJ health is HTTP 200 with D1 available. Both DPAPI-backed scoped Runners restarted successfully and were ONLINE; post-deploy DailySystem HEALTHCHECK and ZJ_REPO_STATUS passed. PJ tests 234/234, check and diff pass. Live ProjectManager Telegram owner observation and Telegram-origin D1 proof remain pending. See the PJ-ZJ-004 handoff; older checkpoints below are historical.
+
 ## PJ-ZJ-003 current state — 2026-10-03
 
 Two separate DailySystem and ZJ Runner credentials are encrypted with Windows DPAPI CurrentUser outside the repository. Both Runner processes were started, stopped independently, and restarted without secret re-entry; both are online with scoped heartbeats. DailySystem health jobs and ZJ repository, release-evidence, and validation jobs passed after durable startup; ZJ validation returned 61 files/1,160 passes/0 failures. Cross-project requests were rejected with HTTP 403 in both directions. PJ health is HTTP 200, D1 available, `PJ_ZJ_ENABLED=true`; PJ 234/234 tests and check pass. Live ProjectManager Telegram navigation and Telegram-origin job proof are pending. See the PJ-ZJ-003 handoff; older process-only state below is superseded.
