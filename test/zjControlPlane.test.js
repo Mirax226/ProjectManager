@@ -116,6 +116,24 @@ test('missing repo and Plans return bounded unknown evidence', async () => {
   assert.equal(releaseEvidence({ plansPath: missing }).diagnosticCode, 'PLANS_NOT_FOUND');
 });
 
+test('release evidence reads the current ZJ-RC checkpoint format without inventing acceptance', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-zj-plans-'));
+  try {
+    fs.writeFileSync(path.join(root, 'LATEST.md'), '# ZJ — staging application acceptance blocked\nZJ-RC-005. Clean HEAD f7d8bd43. 61 files / 1,160 tests. Staging zj-staging version 7e873b26. zj-staging-db / f2c7b000-b4a2-4489-88b6-d2e1732d8c1e. Quality run 37109504074 SUCCESS. CREATE DEDICATED STAGING TELEGRAM BOT. Production untouched. Next milestone: provision staging bot.\n');
+    fs.writeFileSync(path.join(root, 'RECOVERY_CONTEXT.md'), 'branch feature/P0-011-weekly-report\n');
+    const evidence = releaseEvidence({ plansPath: root }).result;
+    assert.equal(evidence.checkpoint, 'ZJ-RC-005');
+    assert.equal(evidence.branch, 'feature/P0-011-weekly-report');
+    assert.equal(evidence.testBaseline, '61 files / 1,160 tests');
+    assert.equal(evidence.stagingWorker, 'VERIFIED');
+    assert.equal(evidence.stagingD1, 'VERIFIED');
+    assert.equal(evidence.stagingTelegram, 'MISSING');
+    assert.deepEqual(evidence.blockers, ['STAGING_APPLICATION_ACCEPTANCE_BLOCKED']);
+  } finally {
+    if (path.dirname(root) === path.resolve(os.tmpdir()) && path.basename(root).startsWith('pj-zj-plans-')) fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('repository status distinguishes dirty, detached and tracking mismatch', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-zj-status-')); fs.mkdirSync(path.join(root, '.git'));
   const fake = (overrides = {}) => async (_file, args) => {

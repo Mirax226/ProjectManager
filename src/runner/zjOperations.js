@@ -93,16 +93,16 @@ function releaseEvidence(profile) {
   let releaseChecklist = 'UNKNOWN';
   try { const checklist = readBounded(path.join(paths(profile).repo, 'docs', 'release-checklist.md')); releaseChecklist = /NOT VERIFIED/i.test(checklist) ? 'EXTERNAL_ACCEPTANCE_UNKNOWN' : 'UNKNOWN'; } catch (_) { /* Optional reference remains unknown. */ }
   return { ok: true, result: {
-    projectId: 'zj', checkpoint: marker(latest, /Task:\s*\*\*([^*]+)\*\*/i),
-    branch: marker(text, /branch\s+`([^`]+)`/i),
-    testBaseline: marker(text, /\*\*(\d+ test files\s*\/\s*[\d,]+ tests)\*\*/i),
-    stagingWorker: /staging Worker[^\n]*\*\*VERIFIED MISSING\*\*/i.test(text) ? 'MISSING' : 'UNKNOWN',
-    stagingD1: /staging D1[^\n]*\*\*VERIFIED MISSING\*\*|distinct staging D1[^\n]*\*\*VERIFIED MISSING\*\*/i.test(text) ? 'MISSING' : 'UNKNOWN',
-    ci: /zero registered workflows\/runs|zero.*workflow.*runs/i.test(text) ? 'MISSING' : 'UNKNOWN',
-    stagingTelegram: 'UNKNOWN', productionIsolation: 'UNKNOWN',
+    projectId: 'zj', checkpoint: marker(latest, /\b(ZJ-RC-\d{3})\b/i),
+    branch: marker(text, /\b(feature\/[A-Za-z0-9._/-]+)\b/i),
+    testBaseline: marker(text, /\b(\d+ (?:test )?files\s*\/\s*[\d,]+ tests)\b/i),
+    stagingWorker: /staging zj-staging version\s+[a-f0-9-]+/i.test(text) ? 'VERIFIED' : /staging Worker[^\n]*\*\*VERIFIED MISSING\*\*/i.test(text) ? 'MISSING' : 'UNKNOWN',
+    stagingD1: /zj-staging-db\s*\/\s*[a-f0-9-]{36}/i.test(text) ? 'VERIFIED' : /staging D1[^\n]*\*\*VERIFIED MISSING\*\*|distinct staging D1[^\n]*\*\*VERIFIED MISSING\*\*/i.test(text) ? 'MISSING' : 'UNKNOWN',
+    ci: /quality run\s+\d+\s+SUCCESS/i.test(text) ? 'SUCCESS' : /zero registered workflows\/runs|zero.*workflow.*runs/i.test(text) ? 'MISSING' : 'UNKNOWN',
+    stagingTelegram: /CREATE DEDICATED STAGING TELEGRAM BOT/i.test(text) ? 'MISSING' : 'UNKNOWN', productionIsolation: /Production untouched|No production deployment/i.test(text) ? 'REPORTED_UNTOUCHED' : 'UNKNOWN',
     releaseChecklist,
-    blockers: /RELEASE NOT READY|NOT READY for staging or production/i.test(text) ? ['RELEASE_NOT_READY'] : [],
-    recommendedNextStep: marker(latest, /Exact next task:\s*\*\*([^*]+)\*\*/i),
+    blockers: /STAGING APPLICATION ACCEPTANCE BLOCKED/i.test(text) ? ['STAGING_APPLICATION_ACCEPTANCE_BLOCKED'] : /RELEASE NOT READY|NOT READY for staging or production/i.test(text) ? ['RELEASE_NOT_READY'] : [],
+    recommendedNextStep: marker(latest, /Next milestone:\s*([^\n]+)/i),
     timestamp: new Date().toISOString(),
   } };
 }
