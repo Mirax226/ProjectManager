@@ -1,5 +1,9 @@
 # PJ-ZJ-001 multi-project control plane handoff
 
+## PJ-ZJ-002 successor — 2026-10-03
+
+PJ-ZJ-001's disabled/dirty gate was superseded by accepted clean ZJ checkpoint f7d8bd43 and PJ-ZJ-002 activation. PJ_ZJ_ENABLED=true is deployed, distinct Runner scopes and live job chains pass, and ZJ local validation passed 61 files/1,160 tests. Live PJ Telegram admin acceptance and durable Runner restart remain open. The current detailed handoff is [PJ-ZJ-002-RUNNER-ACTIVATION.md](PJ-ZJ-002-RUNNER-ACTIVATION.md). Historical notes below are retained for provenance.
+
 ## Latest outcome — 2026-10-03
 
 PJ full regression passed **233/233**; focused ZJ matrix **17/17**; Worker/D1 runtime matrix **17/17**. Syntax check, dry-run build and diff check passed. PJ D1 has no pending migrations. PJ Worker `projectmanager-control-plane` was deployed at version `04704a5f-5394-4488-9577-5f4f5ad84d8b`; live `/health` returned HTTP 200 and D1 available. ZJ remains `DIRTY_UNKNOWN_WORK`; `PJ_ZJ_ENABLED=false`. No new ZJ validation, live ZJ Runner connection, or Telegram acceptance was performed. A unique project-scoped ZJ runner credential still needs owner provisioning. The WIP safety branch is pushed at `00ffe28`; verify final `main` commit and push from Git. This latest outcome supersedes earlier pending-check/deploy statements below.

@@ -1,5 +1,9 @@
 # ProjectManager continuity backup
 
+## PJ-ZJ-002 live activation — 2026-10-03
+
+The active recovery entrypoint is [PJ-ZJ-002 Runner activation](../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md). PJ_ZJ_ENABLED=true is deployed as Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. Two distinct 32-byte Runner credentials were rotated in one map for windows-runner/daily-system and zj-runner/zj; values were neither recorded nor committed. Local Runner storage is PROCESS_ONLY. Live DailySystem canaries passed before and after activation, cross-project requests returned 403 both ways, and live ZJ repository, release, and local validation jobs passed. ZJ validation: 61 files/1,160 tests, all eight command domains PASS; canonical ZJ remains clean at f7d8bd43f9a1431a04d4e57bd3566dd18086a331. PJ final suite 234/234 PASS, check/build PASS. Live Telegram admin acceptance and a durable Runner restart mechanism remain open. Older PJ-ZJ-001 disabled/dirty checkpoints below are historical.
+
 ## Final PJ local and deployment result — 2026-10-03
 
 PJ full local regression: **233 passed, 0 failed, 0 skipped** after the credential boundary fix. Focused ZJ matrix: **17 passed, 0 failed**. Worker/D1 runtime tests: **17 passed, 0 failed** after the health version update. `npm run check`, Worker dry-run build and `git diff --check` pass. PJ D1 has no pending migration. The required PJ secret names are present; their values were not inspected. PJ Worker `projectmanager-control-plane` is deployed at version `04704a5f-5394-4488-9577-5f4f5ad84d8b`; live `/health` returns HTTP 200, D1 available, version `PJ-ZJ-001`. `PJ_ZJ_ENABLED=false`, so live ZJ visibility, Telegram acceptance and real ZJ Runner end to end remain pending. `MANUAL_ZJ_RUNNER_CREDENTIAL_REQUIRED=YES`. Final commit/push and origin/main recovery should be verified from Git after this documentation is committed. This result supersedes earlier pending-test and pending-deployment statements below.

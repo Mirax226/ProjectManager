@@ -1,5 +1,9 @@
 # ProjectManager Current Plan
 
+## Current PJ-ZJ-002 gate — 2026-10-03
+
+Credential rotation, PJ ZJ activation, DailySystem live canaries, bidirectional Runner isolation, ZJ repository/release/validation jobs, and PJ local regression are complete. PJ_ZJ_ENABLED=true is deployed as Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. Remaining acceptance: direct ProjectManager Telegram admin Projects→ZJ observation and a Telegram-triggered ZJ job; then establish approved durable local Runner secret storage/restart or explicitly accept process-only operation. ZJ production remains untouched. See ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md for evidence and precise job IDs.
+
 # Current owner-defined plan — PJ-ZJ-001 (2026-10-03)
 
 The active milestone is PJ-ZJ-001: make the existing PJ control plane safely manage DailySystem and ZJ. Use `docs/project-memory/PROJECT-CONTINUITY-BACKUP.md` and `docs/handoffs/PJ-ZJ-001-MULTI-PROJECT-CONTROL-PLANE.md` for current implementation and acceptance status. Historical "next scope undefined" text below is superseded by this owner request.

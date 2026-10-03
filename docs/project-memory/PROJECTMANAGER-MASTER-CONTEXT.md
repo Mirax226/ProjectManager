@@ -1,5 +1,9 @@
 # ProjectManager Master Context
 
+## PJ-ZJ-002 current context — 2026-10-03
+
+ProjectManager now has live DailySystem and ZJ project records and distinct scoped Runner identities. PJ_ZJ_ENABLED=true was deployed in Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. Remote DailySystem canaries, bidirectional project isolation, ZJ repository status and ZJ local validation passed. ZJ validation reports 61 files/1,160 tests and all eight command domains PASS without changing canonical ZJ. Current release Plans checkpoint is ZJ-RC-006 with staging Telegram acceptance blocked. The local Runner credentials are process-only, so restart persistence is open. PJ Telegram admin live acceptance is pending. Read the PJ-ZJ-002 handoff and continuity backup first; older disabled/dirty narratives below are historical.
+
 ## Latest PJ-ZJ-001 outcome — 2026-10-03
 
 PJ multi-project code passed 233/233 local tests and focused ZJ/Worker-D1 matrices each passed 17/17. PJ Worker version `04704a5f-5394-4488-9577-5f4f5ad84d8b` is live with D1 health passing. PJ ZJ activation remains disabled because ZJ has unowned dirty test work (`DIRTY_UNKNOWN_WORK`) and a distinct live runner credential is not evidenced. Real ZJ validation and Telegram end to end acceptance remain open. The source recovery branch is `backup/pj-zj-001-pre-validation-20261003` (`00ffe28`). See `PROJECT-CONTINUITY-BACKUP.md` for the authoritative recovery state.

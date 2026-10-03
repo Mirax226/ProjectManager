@@ -1,5 +1,9 @@
 # Current State
 
+## PJ-ZJ-002 latest state — 2026-10-03
+
+PJ_ZJ_ENABLED=true is live; Worker 45f537fb-f9dc-4d47-bb59-0b2fd7296d63 returns HTTP 200 with D1 available. Distinct scoped windows-runner/daily-system and zj-runner/zj credentials were rotated without recording values. DailySystem and ZJ live Runner jobs pass; cross-project requests fail with 403. ZJ disposable-clone validation passed 61 files/1,160 tests and all eight command domains. PJ full suite 234/234, check/build/diff pass. ZJ is clean at accepted f7d8bd43. Current Plans evidence is ZJ-RC-006 and still lacks staging Telegram application acceptance. PJ live Telegram admin acceptance and durable local Runner storage remain pending. See the PJ-ZJ-002 handoff; older state below is superseded.
+
 ## Latest PJ-ZJ-001 result — 2026-10-03
 
 PJ full suite passes 233/233; focused ZJ tests 17/17 and Worker/D1 runtime tests 17/17 pass. Syntax check, Worker dry-run build and diff check pass. PJ D1 requires no migration. PJ Worker deployment version `04704a5f-5394-4488-9577-5f4f5ad84d8b` is live; `/health` returns HTTP 200 and D1 available. ZJ remains disabled in PJ Worker configuration (`PJ_ZJ_ENABLED=false`) pending an accepted ZJ baseline and a distinct ZJ runner credential. ZJ worktree classification is `DIRTY_UNKNOWN_WORK`; real ZJ validation and live Telegram acceptance are incomplete. See `PROJECT-CONTINUITY-BACKUP.md` for recovery. This result supersedes the earlier pending-test/deployment resume note below.

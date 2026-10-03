@@ -1,5 +1,9 @@
 # Recovery Checkpoint
 
+## PJ-ZJ-002 recovery checkpoint — 2026-10-03
+
+PJ main includes activation commit 6c6ba2c and Runner/evidence fix d49c219; verify final HEAD/origin after the documentation commit. Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63 runs PJ_ZJ_ENABLED=true. Runner credentials were rotated for windows-runner/daily-system and zj-runner/zj with PROCESS_ONLY local storage. Live scope, DailySystem canaries, ZJ repo status, release evidence and local validation pass. ZJ HEAD/upstream f7d8bd43, clean. PJ 234/234 tests pass. Telegram admin live acceptance and durable Runner restart are unresolved. Recover details from ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md; do not use older single-runner rotation instructions.
+
 ## Latest PJ recovery result — 2026-10-03
 
 Remote safety backup is `backup/pj-zj-001-pre-validation-20261003` (`00ffe28`). PJ local suite passed 233/233, focused ZJ tests 17/17, Worker/D1 tests 17/17, check/build/diff pass. PJ Worker version `04704a5f-5394-4488-9577-5f4f5ad84d8b` is deployed and live health/D1 pass. ZJ is still `DIRTY_UNKNOWN_WORK`, with no ZJ product or production mutation. `PJ_ZJ_ENABLED=false`; real ZJ validation, ZJ runner credential and live Telegram acceptance are pending. Verify the final PJ main commit and origin/main sync in Git after committing this document. This latest checkpoint supersedes earlier pending deployment notes.
