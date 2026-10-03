@@ -1,5 +1,9 @@
 # Recovery Checkpoint
 
+## PJ-ZJ-003 recovery checkpoint — 2026-10-03
+
+Use `tools/runner-durable.ps1` and `docs/WINDOWS-RUNNER.md` for scoped Runner startup. The two Windows DPAPI CurrentUser encrypted records are under `%LOCALAPPDATA%\ProjectManager\runner-secrets\`; no plaintext or encryption key is in Git. Per-user logon startup entries exist for DailySystem and ZJ. Manual `-Mode Start -Project daily-system` and `-Mode Start -Project zj` were proven after owned-process stops, without token re-entry. Both were online after restoration. Code/runbook recovery from origin/main is possible after push; Runner credential recovery requires this owner's Windows profile and encrypted local store. Live Telegram acceptance remains pending. See the [PJ-ZJ-003 handoff](../handoffs/PJ-ZJ-003-DURABLE-RUNNERS-TELEGRAM-ACCEPTANCE.md) for job IDs, security checks, and limits; prior process-only notes below are historical.
+
 ## PJ-ZJ-002 recovery checkpoint — 2026-10-03
 
 PJ main includes activation commit 6c6ba2c and Runner/evidence fix d49c219; verify final HEAD/origin after the documentation commit. Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63 runs PJ_ZJ_ENABLED=true. Runner credentials were rotated for windows-runner/daily-system and zj-runner/zj with PROCESS_ONLY local storage. Live scope, DailySystem canaries, ZJ repo status, release evidence and local validation passed during validation. Both Runners were intentionally stopped at 2026-10-03 12:40 UTC; no local token copy survives and coordinated re-rotation is required before restart. ZJ HEAD/upstream f7d8bd43, clean. PJ 234/234 tests pass. Telegram admin live acceptance and durable Runner restart are unresolved. Recover details from ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md; do not use older single-runner rotation instructions.

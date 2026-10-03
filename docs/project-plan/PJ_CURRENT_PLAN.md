@@ -1,5 +1,9 @@
 # ProjectManager Current Plan
 
+## PJ-ZJ-003 final acceptance gate — 2026-10-03
+
+Durable owner-bound Runner credentials, coordinated rotation, separate logon startup entries, live restart proofs, DailySystem health, ZJ repository/release/validation, and project isolation have passed. Both Runners are online for live ProjectManager Telegram acceptance. Next: owner observes `/projects` → ZJ → Repository and Local Validation in the private ProjectManager admin chat and reports job IDs/results; verify Telegram origin in D1, DailySystem visibility, and one-at-a-time outage behavior. Keep ZJ production untouched. See `docs/handoffs/PJ-ZJ-003-DURABLE-RUNNERS-TELEGRAM-ACCEPTANCE.md` for evidence and recovery procedure.
+
 ## Current PJ-ZJ-002 gate — 2026-10-03
 
 Credential rotation, PJ ZJ activation, DailySystem live canaries, bidirectional Runner isolation, ZJ repository/release/validation jobs, and PJ local regression are complete. PJ_ZJ_ENABLED=true is deployed as Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. The two task-owned process-only Runners were intentionally stopped at 2026-10-03 12:40 UTC; their tokens were not retained locally, so restart needs coordinated re-rotation. Remaining acceptance: direct ProjectManager Telegram admin Projects→ZJ observation and a Telegram-triggered ZJ job; then establish approved durable local Runner secret storage/restart or explicitly accept process-only operation. ZJ production remains untouched. See ../handoffs/PJ-ZJ-002-RUNNER-ACTIVATION.md for evidence and precise job IDs.

@@ -1,5 +1,9 @@
 # ProjectManager Master Context
 
+## PJ-ZJ-003 durable Runner context — 2026-10-03
+
+The ProjectManager Worker still has `PJ_ZJ_ENABLED=true` and D1 health available. Separate `windows-runner`/`daily-system` and `zj-runner`/`zj` credentials were rotated together and stored as owner-bound Windows DPAPI CurrentUser records outside Git. Both Runners passed live restart proof from those records; DailySystem health, ZJ repository/release/validation, and bidirectional isolation passed. ZJ validation reports 61 files/1,160 tests/0 failures. Per-user logon startup entries are registered, while actual logoff/logon startup is not yet tested. ProjectManager Telegram admin acceptance is pending; both Runners remain online for that check. The current handoff is `docs/handoffs/PJ-ZJ-003-DURABLE-RUNNERS-TELEGRAM-ACCEPTANCE.md`; older process-only notes below are historical.
+
 ## PJ-ZJ-002 current context — 2026-10-03
 
 ProjectManager now has live DailySystem and ZJ project records and distinct scoped Runner identities. PJ_ZJ_ENABLED=true was deployed in Worker version 45f537fb-f9dc-4d47-bb59-0b2fd7296d63. Remote DailySystem canaries, bidirectional project isolation, ZJ repository status and ZJ local validation passed. ZJ validation reports 61 files/1,160 tests and all eight command domains PASS without changing canonical ZJ. Current release Plans checkpoint is ZJ-RC-006 with staging Telegram acceptance blocked. The local Runner credentials were process-only; both Runners were intentionally stopped at 2026-10-03 12:40 UTC, with no retained local token copy. PJ Telegram admin live acceptance and coordinated Runner restart remain pending. Read the PJ-ZJ-002 handoff and continuity backup first; older disabled/dirty narratives below are historical.
