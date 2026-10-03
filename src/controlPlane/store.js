@@ -93,7 +93,8 @@ class ControlPlaneStore {
     const id = String(input?.runnerId || '').trim(); if (!id) return { ok: false, status: 400, error: 'runnerId is required' };
     const projectId = normalizeProjectKey(input.projectId);
     if (!projectId || !this.projects.has(projectId)) return { ok: false, status: 400, error: 'unknown projectId' };
-    if (this.projects.get(projectId).enabled === false) return { ok: false, status: 403, error: 'project_disabled' };
+    // A disabled ZJ integration may authenticate its scoped runner before job activation.
+    if (this.projects.get(projectId).enabled === false && projectId !== 'zj') return { ok: false, status: 403, error: 'project_disabled' };
     const prior = this.runners.get(id); const nowIso = iso(this.now);
     if (prior && prior.projectId !== projectId) return { ok: false, status: 403, error: 'runner_project_mismatch' };
     const runner = { runnerId: id, projectId, status: 'ONLINE', lastSeenAt: nowIso, version: String(input.version || '').slice(0, 80), hostLabel: String(input.hostLabel || '').slice(0, 80), capabilities: Array.isArray(input.capabilities) ? input.capabilities.slice(0, 30).map((x) => String(x).slice(0, 60)) : [] };

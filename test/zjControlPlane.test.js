@@ -94,10 +94,10 @@ test('cross-project result, stale attempt, and wrong runner are rejected', () =>
   assert.equal(store.resultJob(claimed.id, 'other-runner', { projectId: 'zj', attemptCount: 1 }).status, 409);
 });
 
-test('unknown and disabled projects cannot receive runner heartbeats or jobs', () => {
+test('disabled ZJ can prove runner heartbeat while jobs remain unavailable', () => {
   const store = new ControlPlaneStore({ zjEnabled: false });
   assert.equal(store.heartbeat({ runnerId: 'unknown-runner', projectId: 'unknown' }).error, 'unknown projectId');
-  assert.equal(store.heartbeat({ runnerId: 'zj-runner', projectId: 'zj' }).error, 'project_disabled');
+  assert.equal(store.heartbeat({ runnerId: 'zj-runner', projectId: 'zj' }).ok, true);
   assert.equal(store.createJob({ projectId: 'zj', type: 'ZJ_REPO_STATUS' }).error, 'project_disabled');
   assert.equal(store.claimJob('zj-runner', 'zj'), null);
 });
