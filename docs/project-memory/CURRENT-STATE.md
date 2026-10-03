@@ -1,5 +1,19 @@
 # Current State
 
+## Latest PJ-ZJ-001 result — 2026-10-03
+
+PJ full suite passes 233/233; focused ZJ tests 17/17 and Worker/D1 runtime tests 17/17 pass. Syntax check, Worker dry-run build and diff check pass. PJ D1 requires no migration. PJ Worker deployment version `04704a5f-5394-4488-9577-5f4f5ad84d8b` is live; `/health` returns HTTP 200 and D1 available. ZJ remains disabled in PJ Worker configuration (`PJ_ZJ_ENABLED=false`) pending an accepted ZJ baseline and a distinct ZJ runner credential. ZJ worktree classification is `DIRTY_UNKNOWN_WORK`; real ZJ validation and live Telegram acceptance are incomplete. See `PROJECT-CONTINUITY-BACKUP.md` for recovery. This result supersedes the earlier pending-test/deployment resume note below.
+
+## PJ-ZJ-001 resume — 2026-10-03
+
+The implementation is safely backed up on remote branch `backup/pj-zj-001-pre-validation-20261003` (`00ffe28`) and restored to `main` for finalization. ZJ is `DIRTY_UNKNOWN_WORK`: only `tests/worker.test.ts` is modified, with no evidence establishing who owns or accepts it. `REPO_DIRTY` is the correct PJ validation result. PJ focused checks pass 17/17; the initial full suite passed 232/232; final regression after the credential scope fix is pending. ZJ live validation, a distinct ZJ runner credential, PJ deployment and live Telegram acceptance remain pending. `PJ_ZJ_ENABLED=false`. This checkpoint supersedes the earlier uncommitted-only stop note below.
+
+## PJ-ZJ-001 multi-project control plane — in progress, 2026-10-03
+
+STOPPED: the real local queue found external dirty ZJ work in `tests/worker.test.ts` (24 insertions, 8 deletions). Validation correctly returned `REPO_DIRTY` before execution. The owner's stop condition applies. PJ changes are preserved uncommitted, undeployed; `PJ_ZJ_ENABLED=false`. Final local/live gates remain incomplete. No ZJ product edit or production mutation was performed by this task.
+
+The owner-defined next scope is PJ-ZJ-001. Canonical PJ path is `C:\Users\Amir\Documents\GitHub\ProjectManager`. The local implementation introduces a `daily-system` / `zj` project registry, distinct capabilities and job allowlists, ZJ safe runner jobs and Telegram project navigation. ZJ remains independent of PJ. The current recovery entrypoint is `PROJECT-CONTINUITY-BACKUP.md`; implementation, validation, deployment and acceptance status are tracked in `docs/handoffs/PJ-ZJ-001-MULTI-PROJECT-CONTROL-PLANE.md`. Do not treat the prior "next scope undefined" text below as current.
+
 ## Excel Host Closure CLOSED — 2026-10-01
 
 EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.

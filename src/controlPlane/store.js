@@ -1,11 +1,10 @@
 const { JOB_STATUSES, JOB_TYPES, normalizeProjectKey, classifyJob, validateOperationalEvent, redact } = require('./contracts');
 const { operationalMethods } = require('./operationalState');
+const { PROJECTS, registeredProject, projectAllows } = require('./projectRegistry');
+const { readiness } = require('./zjReadiness');
 function randomId() { return globalThis.crypto?.randomUUID?.() || `id_${Date.now()}_${Math.random().toString(36).slice(2)}`; }
 
-const DEFAULT_PROJECTS = [{
-  id: 'daily-system', key: 'daily-system', name: 'DailySystem', environment: 'dev',
-  runnerProfile: 'daily-system', capabilities: ['windows', 'git', 'tests', 'excel-diagnostics', 'codex'],
-}];
+const DEFAULT_PROJECTS = Object.values(PROJECTS);
 
 function iso(now) { return new Date(now()).toISOString(); }
 
@@ -14,7 +13,7 @@ class ControlPlaneStore {
     this.now = options.now || (() => Date.now());
     this.runnerStaleMs = Number(options.runnerStaleMs || 90_000);
     this.runnerOfflineMs = Number(options.runnerOfflineMs || 300_000);
-    this.projects = new Map((options.projects || DEFAULT_PROJECTS).map((project) => [project.id, { ...project }]));
+    this.projects = new Map((options.projects || DEFAULT_PROJECTS).map((project) => [project.id, registeredProject(project.id, { ...project, ...(project.id === 'zj' && options.zjEnabled != null ? { enabled: options.zjEnabled === true } : {}) }) || { ...project }]));
     this.events = new Map(); this.eventOrder = []; this.jobs = new Map(); this.runners = new Map(); this.alerts = new Map();
     this.initOperationalState();
     this._ingestEventLocal = (event) => ControlPlaneStore.prototype.ingestEvent.call(this, event);
@@ -30,6 +29,7 @@ class ControlPlaneStore {
     if (!validation.ok) return { ok: false, status: 400, error: validation.error };
     const event = validation.value;
     if (!this.projects.has(event.project)) return { ok: false, status: 403, error: 'project is not registered' };
+    if (this.projects.get(event.project).enabled === false) return { ok: false, status: 403, error: 'project_disabled' };
     const prior = this.events.get(event.eventId);
     if (prior) return { ok: true, duplicate: true, event: prior };
     this.events.set(event.eventId, event); this.eventOrder.push(event.eventId);
@@ -47,18 +47,24 @@ class ControlPlaneStore {
     const projectId = normalizeProjectKey(input?.projectId || input?.project);
     const type = String(input?.type || '').toUpperCase();
     if (!projectId || !this.projects.has(projectId)) return { ok: false, status: 400, error: 'unknown projectId' };
+    if (this.projects.get(projectId).enabled === false) return { ok: false, status: 403, error: 'project_disabled' };
     if (!JOB_TYPES.includes(type)) return { ok: false, status: 400, error: 'unsupported job type' };
+    if (!projectAllows(this.projects.get(projectId), type)) return { ok: false, status: 403, error: 'job_not_allowed' };
     const risk = classifyJob(type);
     if (!risk || risk === 'DANGEROUS') return { ok: false, status: 403, error: 'job type is disabled' };
     if (input.payload != null && (typeof input.payload !== 'object' || Array.isArray(input.payload))) return { ok: false, status: 400, error: 'payload must be an object' };
+    if (projectId === 'zj' && Object.keys(input.payload || {}).length) return { ok: false, status: 400, error: 'zj job payload must be empty' };
     const now = iso(this.now); const idempotencyKey = String(input.idempotencyKey || '').slice(0, 160);
     if (idempotencyKey) { const prior = [...this.jobs.values()].find((job) => job.projectId === projectId && job.idempotencyKey === idempotencyKey); if (prior) return { ok: true, duplicate: true, job: { ...prior } }; }
     const job = { id: randomId(), projectId, type, risk, status: 'PENDING', createdAt: now, updatedAt: now, requestedBy: String(requestedBy).slice(0, 120), payload: redact(input.payload || {}), attemptCount: 0, leaseOwner: null, leaseExpiresAt: null, result: null, error: null, idempotencyKey: idempotencyKey || null };
+    if (type === 'ZJ_RELEASE_READINESS') { job.status = 'SUCCEEDED'; job.result = { ...readiness([...this.jobs.values()]), correlationId: job.id, jobId: job.id, jobType: type, attempt: 0 }; }
     this.jobs.set(job.id, job); return { ok: true, duplicate: false, job: { ...job } };
   }
   getJob(id, projectId = null) { const job = this.jobs.get(String(id)); return job && (!projectId || job.projectId === projectId) ? { ...job } : null; }
   listJobs(projectId = null) { return [...this.jobs.values()].filter((job) => !projectId || job.projectId === projectId).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((job) => ({ ...job })); }
   claimJob(runnerId, projectId = null, leaseMs = 120_000) {
+    if (!projectId || !this.projects.get(projectId)?.enabled) return null;
+    if (projectId === 'zj') leaseMs = 900000;
     const nowMs = this.now();
     const candidate = [...this.jobs.values()].filter((job) => (!projectId || job.projectId === projectId) && (job.status === 'PENDING' || (job.status === 'CLAIMED' && Date.parse(job.leaseExpiresAt || 0) <= nowMs))).sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
     if (!candidate) return null;
@@ -67,11 +73,13 @@ class ControlPlaneStore {
   }
   resultJob(id, runnerId, result = {}) {
     const job = this.jobs.get(String(id)); if (!job) return { ok: false, status: 404, error: 'job not found' };
+    if ((job.projectId === 'zj' && result.projectId !== job.projectId) || (result.projectId && result.projectId !== job.projectId)) return { ok: false, status: 403, error: 'project_scope_denied' };
+    if (job.projectId === 'zj' && result.result != null && (typeof result.result !== 'object' || Array.isArray(result.result) || (result.result.projectId && result.result.projectId !== job.projectId))) return { ok: false, status: 403, error: 'project_scope_denied' };
     if (result.attemptCount != null && Number(result.attemptCount) !== job.attemptCount) return { ok:false,status:409,error:'stale attempt' };
-    if (['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(job.status)) return { ok: true, duplicate: true, job: { ...job } };
+    if (['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(job.status)) return job.resultRunnerId === String(runnerId) && result.attemptCount === job.attemptCount ? { ok: true, duplicate: true, job: { ...job } } : { ok: false, status: 409, error: 'terminal result owner cannot be verified' };
     if (job.leaseOwner !== String(runnerId) || (job.leaseExpiresAt && Date.parse(job.leaseExpiresAt) < this.now())) return { ok: false, status: 409, error: 'lease is not owned by runner' };
     const retryable = result.retryable === true && (result.ok === false || result.error);
-    job.status = retryable ? 'PENDING' : (result.ok === false || result.error ? 'FAILED' : 'SUCCEEDED'); job.result = redact(result.result || result); job.error = result.error ? String(result.error).slice(0, 1000) : null; job.updatedAt = iso(this.now); job.leaseOwner = null; job.leaseExpiresAt = null;
+    job.status = retryable ? 'PENDING' : (result.ok === false || result.error ? 'FAILED' : 'SUCCEEDED'); job.result = redact(result.result || result); if (job.projectId === 'zj') job.result = { ...job.result, projectId: job.projectId, correlationId: job.id, jobId: job.id, jobType: job.type, runnerId: String(runnerId).slice(0, 80), attempt: job.attemptCount, diagnosticCode: result.diagnosticCode ? String(result.diagnosticCode).slice(0, 80) : null, executionDurationMs: Math.max(0, Number(result.executionDurationMs) || 0) }; job.error = result.error ? redact(String(result.error)).slice(0, 1000) : null; job.updatedAt = iso(this.now); job.resultRunnerId = String(runnerId); job.leaseOwner = null; job.leaseExpiresAt = null;
     if (job.status === 'SUCCEEDED' && result.result?.operation && ['BACKUP', 'SNAPSHOT'].includes(result.result.operation)) {
       const backup = this._createBackupLocal({ backupId: result.result.backupId, projectId: job.projectId, assetId: result.result.assetId, sourceHash: result.result.sourceHash, backupHash: result.result.backupHash, createdAt: result.result.createdAt, localBackupReference: result.result.localBackupReference, verificationStatus: result.result.verificationStatus, retentionClass: 'CURRENT_TODAY' }, job.idempotencyKey || job.id);
       if (backup.ok) job.result = { ...job.result, backupRecordId: backup.backup.backupId };
@@ -83,8 +91,12 @@ class ControlPlaneStore {
   }
   heartbeat(input) {
     const id = String(input?.runnerId || '').trim(); if (!id) return { ok: false, status: 400, error: 'runnerId is required' };
+    const projectId = normalizeProjectKey(input.projectId);
+    if (!projectId || !this.projects.has(projectId)) return { ok: false, status: 400, error: 'unknown projectId' };
+    if (this.projects.get(projectId).enabled === false) return { ok: false, status: 403, error: 'project_disabled' };
     const prior = this.runners.get(id); const nowIso = iso(this.now);
-    const runner = { runnerId: id, projectId: normalizeProjectKey(input.projectId) || null, status: 'ONLINE', lastSeenAt: nowIso, version: String(input.version || '').slice(0, 80), hostLabel: String(input.hostLabel || '').slice(0, 80), capabilities: Array.isArray(input.capabilities) ? input.capabilities.slice(0, 30).map((x) => String(x).slice(0, 60)) : [] };
+    if (prior && prior.projectId !== projectId) return { ok: false, status: 403, error: 'runner_project_mismatch' };
+    const runner = { runnerId: id, projectId, status: 'ONLINE', lastSeenAt: nowIso, version: String(input.version || '').slice(0, 80), hostLabel: String(input.hostLabel || '').slice(0, 80), capabilities: Array.isArray(input.capabilities) ? input.capabilities.slice(0, 30).map((x) => String(x).slice(0, 60)) : [] };
     this.runners.set(id, runner);
     if (prior && prior.status === 'OFFLINE') this.ingestEvent({ schemaVersion: 1, eventId: `runner-recovered:${id}:${nowIso.slice(0, 13)}`, project: runner.projectId || 'daily-system', environment: 'control-plane', severity: 'INFO', category: 'RUNNER_RECOVERED', timestamp: nowIso, message: `Runner ${id} recovered`, source: 'control-plane' });
     return { ok: true, runner: this.runnerView(runner) };

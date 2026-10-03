@@ -121,7 +121,7 @@ Telegram token and webhook secret names are deployed; corresponding process envi
 Run in the canonical repository after confirming /health. Enter the bot token and the SAME webhook secret already provisioned in Cloudflare; do not share values in chat. The input is masked, values are passed only through the child process environment, and cleared afterward. Process environment is transient plaintext required by the existing tool; no file/CLI argument is used.
 
 ```powershell
-Set-Location 'C:\Users\Amir\Documents\GitHub\cloned\ProjectManager'
+Set-Location 'C:\Users\Amir\Documents\GitHub\ProjectManager'
 $env:PJ_WORKER_URL = 'https://projectmanager-control-plane.amirhoseinsalmani194728095.workers.dev'
 function Set-PjMaskedEnvironment([string]$name) {
   $pjInput = Read-Host "Enter $name (existing value)" -AsSecureString

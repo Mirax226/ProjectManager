@@ -1,16 +1,20 @@
 const { RunnerClient } = require('./client');
 const { executeJob, DEFAULT_PROFILE } = require('./jobExecutor');
+const { ZJ_REPO, ZJ_PLANS } = require('./zjOperations');
 
 async function runOnce(client, options = {}) {
   const claim = await client.claim(); if (!claim.job) return null;
   const job = claim.job;
-  try { const result = await executeJob(job, options); await client.result(job.id, { ...result, attemptCount: job.attemptCount, leaseExpiresAt: job.leaseExpiresAt }); return result; }
-  catch (error) { const result = { ok: false, error: String(error.message || error).slice(0, 1000) }; await client.result(job.id, { ...result, attemptCount: job.attemptCount, leaseExpiresAt: job.leaseExpiresAt }); return result; }
+  const started = Date.now();
+  try { const result = await executeJob(job, options); await client.result(job.id, { ...result, projectId: job.projectId, attemptCount: job.attemptCount, leaseExpiresAt: job.leaseExpiresAt, executionDurationMs: Date.now() - started }); return result; }
+  catch (error) { const result = { ok: false, error: String(error.message || error).slice(0, 1000) }; await client.result(job.id, { ...result, projectId: job.projectId, attemptCount: job.attemptCount, leaseExpiresAt: job.leaseExpiresAt, executionDurationMs: Date.now() - started }); return result; }
 }
 
 async function startRunner(options = {}) {
   const client = options.client || new RunnerClient(options);
-  const profile = { ...DEFAULT_PROFILE, ...(options.profile || {}) };
+  const profile = client.projectId === 'zj'
+    ? { id: 'zj', projectId: 'zj', repoPath: process.env.ZJ_REPO_PATH || ZJ_REPO, plansPath: process.env.ZJ_PLANS_PATH || ZJ_PLANS, stagingHealthUrl: process.env.ZJ_STAGING_HEALTH_URL || '', ...(options.profile || {}) }
+    : { ...DEFAULT_PROFILE, ...(options.profile || {}) };
   const heartbeatMs = Number(options.heartbeatMs || process.env.PG_RUNNER_HEARTBEAT_MS || 30000);
   const pollMs = Number(options.pollMs || process.env.PG_RUNNER_POLL_MS || 5000);
   let stopped = false; let heartbeatTimer; let pollTimer;

@@ -20,6 +20,8 @@ const JOB_TYPES = Object.freeze([
   'CODEX_TASK', 'DAILYSYSTEM_HEALTHCHECK', 'EXCEL_CONNECTIVITY_TEST',
   'EXCEL_SYNC_DIAGNOSTIC', 'EXCEL_RECONCILIATION_CHECK', 'EXCEL_HEALTHCHECK',
   'EXCEL_SNAPSHOT', 'EXCEL_BACKUP', 'EXCEL_RECONCILIATION', 'EXCEL_SYNC',
+  'ZJ_REPO_STATUS', 'ZJ_RELEASE_EVIDENCE', 'ZJ_LOCAL_VALIDATION',
+  'ZJ_STAGING_HEALTHCHECK', 'ZJ_RELEASE_READINESS',
 ]);
 const JOB_STATUSES = Object.freeze(['PENDING', 'CLAIMED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED']);
 const JOB_RISKS = Object.freeze(['READ_ONLY', 'CONTROLLED', 'DANGEROUS']);
@@ -30,6 +32,9 @@ const JOB_RISK = Object.freeze({
   EXCEL_RECONCILIATION_CHECK: 'READ_ONLY', EXCEL_HEALTHCHECK: 'READ_ONLY',
   EXCEL_SNAPSHOT: 'CONTROLLED', EXCEL_BACKUP: 'CONTROLLED', EXCEL_RECONCILIATION: 'READ_ONLY',
   EXCEL_SYNC: 'CONTROLLED', CODEX_TASK: 'CONTROLLED',
+  ZJ_REPO_STATUS: 'READ_ONLY', ZJ_RELEASE_EVIDENCE: 'READ_ONLY',
+  ZJ_LOCAL_VALIDATION: 'CONTROLLED', ZJ_STAGING_HEALTHCHECK: 'READ_ONLY',
+  ZJ_RELEASE_READINESS: 'READ_ONLY',
 });
 
 function string(value, max = 200) {
@@ -45,7 +50,7 @@ function redact(value, depth = 0) {
   if (depth > 5) return '[TRUNCATED]';
   if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
   if (typeof value === 'string') {
-    if (/(token|secret|password|authorization|api[-_]?key|cookie|dsn|private[-_]?key)/i.test(value)) return '[REDACTED]';
+    if (/(token|secret|password|authorization|api[-_]?key|cookie|dsn|private[-_]?key)/i.test(value) || /\b\d{8,12}:[A-Za-z0-9_-]{30,}\b|\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{20,}|\bBearer\s+\S+|postgres(?:ql)?:\/\/\S+/i.test(value)) return '[REDACTED]';
     return value.slice(0, 1000);
   }
   if (Array.isArray(value)) return value.slice(0, 50).map((item) => redact(item, depth + 1));

@@ -15,15 +15,16 @@ function equalSecret(left, right) {
 }
 
 function createAuthenticator({ adminToken = '', runnerTokens = {}, projectTokens = {} } = {}) {
-  const runnerEntries = Object.entries(runnerTokens).map(([id, value]) => ({ id, token: String(value && typeof value === 'object' ? value.token : value), project: value && typeof value === 'object' ? String(value.project || '') : '' }));
+  const runnerEntries = Object.entries(runnerTokens).map(([id, value]) => ({ id, token: String(value && typeof value === 'object' ? value.token || '' : value || ''), project: value && typeof value === 'object' ? String(value.project || '') : '' }));
   const projectEntries = Object.entries(projectTokens).map(([project, token]) => ({ project, token: String(token) }));
   function authenticate(request, required = 'any') {
     const token = bearer(request);
     if (!token) return { ok: false, status: 401, error: 'unauthorized' };
     if ((required === 'admin' || required === 'any') && equalSecret(token, adminToken)) return { ok: true, role: 'admin' };
     if (required !== 'admin' && required !== 'project') {
-      const runner = runnerEntries.find((entry) => equalSecret(token, entry.token));
-      if (runner) return { ok: true, role: 'runner', runnerId: runner.id, project: runner.project || null };
+      const matches = runnerEntries.filter((entry) => equalSecret(token, entry.token));
+      // A credential must identify exactly one runner and an explicit project.
+      if (matches.length === 1 && matches[0].project) return { ok: true, role: 'runner', runnerId: matches[0].id, project: matches[0].project };
     }
     if (required !== 'admin' && required !== 'runner') {
       const project = projectEntries.find((entry) => equalSecret(token, entry.token));

@@ -1,5 +1,17 @@
 # Recovery Checkpoint
 
+## Latest PJ recovery result — 2026-10-03
+
+Remote safety backup is `backup/pj-zj-001-pre-validation-20261003` (`00ffe28`). PJ local suite passed 233/233, focused ZJ tests 17/17, Worker/D1 tests 17/17, check/build/diff pass. PJ Worker version `04704a5f-5394-4488-9577-5f4f5ad84d8b` is deployed and live health/D1 pass. ZJ is still `DIRTY_UNKNOWN_WORK`, with no ZJ product or production mutation. `PJ_ZJ_ENABLED=false`; real ZJ validation, ZJ runner credential and live Telegram acceptance are pending. Verify the final PJ main commit and origin/main sync in Git after committing this document. This latest checkpoint supersedes earlier pending deployment notes.
+
+## Resume from PJ-ZJ-001 — 2026-10-03
+
+Remote WIP backup: `backup/pj-zj-001-pre-validation-20261003` at `00ffe28`; canonical PJ path `C:\Users\Amir\Documents\GitHub\ProjectManager`. ZJ branch `feature/P0-011-weekly-report` is synced at `4c9fa08bec566b9bba4d0f884ffbf8335ffc76de`, but `tests/worker.test.ts` is unstaged and ownership is unproven. Classification: `DIRTY_UNKNOWN_WORK`. Preserve ZJ and keep clean-baseline validation stopped. PJ implementation is restored to `main` for final local regression and commit/push. Distinct ZJ runner credential, deployment and live acceptance remain pending; `PJ_ZJ_ENABLED=false`.
+
+# Current recovery checkpoint — PJ-ZJ-001 (2026-10-03)
+
+PJ-ZJ-001 is the active owner-defined milestone. Canonical checkout: `C:\Users\Amir\Documents\GitHub\ProjectManager`; starting HEAD/origin/main `4aba1b11a62fd2f1bc308eb90a721fe31ef70ed7`. Read `PROJECT-CONTINUITY-BACKUP.md` and `../handoffs/PJ-ZJ-001-MULTI-PROJECT-CONTROL-PLANE.md` before resuming. ZJ product repository must remain unchanged; ZJ production mutation is forbidden. Prior checkpoint material below remains historical.
+
 ## Excel Host Closure CLOSED — 2026-10-01
 
 EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.

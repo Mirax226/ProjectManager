@@ -1,5 +1,17 @@
 # Roadmap
 
+## PJ-ZJ-001 finalization status — 2026-10-03
+
+PJ code passed 233/233 local tests and was deployed as `projectmanager-control-plane` version `04704a5f-5394-4488-9577-5f4f5ad84d8b`, with live health/D1 passing. The safe rollout keeps `PJ_ZJ_ENABLED=false`. Complete the PJ commit/push, then establish ownership or cleanliness of ZJ's `tests/worker.test.ts`, provision a unique ZJ runner credential, enable PJ ZJ visibility, and execute live ZJ/Telegram acceptance. No ZJ production resource was changed.
+
+## Active PJ-ZJ-001 gate — 2026-10-03
+
+Preserve and finalize the PJ implementation from remote backup `backup/pj-zj-001-pre-validation-20261003`. ZJ has an unowned dirty test file, classified `DIRTY_UNKNOWN_WORK`; do not run clean-baseline ZJ validation. Complete PJ-only regression and push the implementation with external gates recorded. Then obtain owner evidence that the ZJ worktree is an accepted baseline or clean, provision a separately scoped ZJ runner credential, perform real queue validation, and complete safe PJ deployment/live acceptance. `PJ_ZJ_ENABLED=false` until deployment prerequisites are met.
+
+# Current owner-defined milestone — PJ-ZJ-001 (2026-10-03)
+
+Upgrade the existing Cloudflare Worker/D1/typed-job/Windows Runner/Telegram control plane to support both DailySystem and ZJ. Initial ZJ jobs are bounded repository inspection, release evidence, local validation, staging health and technical readiness. ZJ production mutation and inbound ZJ→PJ dependency are outside this milestone. Completion requires local and live PJ acceptance, no DailySystem regression, continuity backup, and a clean pushed PJ checkout. See `../handoffs/PJ-ZJ-001-MULTI-PROJECT-CONTROL-PLANE.md`; older "no successor" statements below predate this owner task.
+
 ## Excel Host Closure CLOSED — 2026-10-01
 
 EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.

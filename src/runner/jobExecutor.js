@@ -5,6 +5,8 @@ const { spawn } = require('child_process');
 const { JOB_TYPES, JOB_RISK, redact } = require('../controlPlane/contracts');
 const { executeExcelJob } = require('./excelOperations');
 const { sanitizeDbErrorMessage } = require('../../configDbErrors');
+const { projectAllows, registeredProject } = require('../controlPlane/projectRegistry');
+const zj = require('./zjOperations');
 
 const MAX_OUTPUT = 12000;
 const DEFAULT_PROFILE = {
@@ -48,10 +50,21 @@ function resolveRepoPath(profile, requested) {
 function runCommand(file, args, cwd, options = {}) {
   const timeoutMs = Math.min(15 * 60 * 1000, Math.max(1000, Number(options.timeoutMs || 120000)));
   return new Promise((resolve) => {
-    const child = spawn(file, args, { cwd, shell: false, windowsHide: true, env: options.replaceEnv ? options.env : { ...process.env, ...(options.env || {}) } });
+    let executable = file; let argv = args;
+    if (process.platform === 'win32' && String(file).toLowerCase() === 'npm.cmd') {
+      const configured = process.env.npm_execpath;
+      const npmCli = configured && path.isAbsolute(configured) && path.basename(configured).toLowerCase() === 'npm-cli.js'
+        ? configured : path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      if (!fs.existsSync(npmCli)) { resolve({ ok: false, exitCode: null, stdout: '', stderr: 'npm CLI is unavailable', timedOut: false }); return; }
+      executable = process.execPath; argv = [npmCli, ...args];
+    }
+    let child;
+    try { child = spawn(executable, argv, { cwd, shell: false, windowsHide: true, env: options.replaceEnv ? options.env : { ...process.env, ...(options.env || {}) } }); }
+    catch (error) { resolve({ ok: false, exitCode: null, stdout: '', stderr: truncate(error.message), timedOut: false }); return; }
     let stdout = ''; let stderr = ''; let timedOut = false;
-    child.stdout?.on('data', (chunk) => { stdout = (stdout + chunk).slice(0, MAX_OUTPUT); }); child.stderr?.on('data', (chunk) => { stderr = (stderr + chunk).slice(0, MAX_OUTPUT); });
-    const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs);
+    const bound = (value) => options.outputTail ? value.slice(-MAX_OUTPUT) : value.slice(0, MAX_OUTPUT);
+    child.stdout?.on('data', (chunk) => { stdout = bound(stdout + chunk); }); child.stderr?.on('data', (chunk) => { stderr = bound(stderr + chunk); });
+    const timer = setTimeout(() => { timedOut = true; if (process.platform === 'win32' && child.pid) spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true }).on('error', () => child.kill()); else child.kill(); }, timeoutMs);
     child.on('error', (error) => { clearTimeout(timer); resolve({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: truncate(error.message), timedOut }); });
     child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0 && !timedOut, exitCode: code, stdout: truncate(stdout), stderr: truncate(stderr), timedOut }); });
   });
@@ -61,8 +74,17 @@ async function executeJob(job, options = {}) {
   if (!job || !supportedJob(job.type)) throw new Error('unsupported job type');
   const profile = { ...DEFAULT_PROFILE, ...(options.profile || {}) };
   if (String(profile.projectId || profile.id).toLowerCase() !== String(job.projectId || '').toLowerCase()) return { ok: false, error: 'runner profile is not bound to the job project' };
+  if (!projectAllows(registeredProject(job.projectId), job.type)) return { ok: false, error: 'job is not allowed for this project', diagnosticCode: 'JOB_NOT_ALLOWED' };
   const run = options.runCommand || runCommand;
   const type = String(job.type).toUpperCase();
+  if (job.projectId === 'zj') {
+    if (Object.keys(job.payload || {}).length) return { ok: false, error: 'ZJ jobs do not accept execution parameters', diagnosticCode: 'JOB_NOT_ALLOWED' };
+    if (type === 'ZJ_REPO_STATUS') return zj.repoStatus(run, profile);
+    if (type === 'ZJ_RELEASE_EVIDENCE') return zj.releaseEvidence(profile);
+    if (type === 'ZJ_LOCAL_VALIDATION') return zj.localValidation(run, profile);
+    if (type === 'ZJ_STAGING_HEALTHCHECK') return zj.stagingHealth(profile, options.fetch);
+    return { ok: false, error: 'ZJ job is not enabled on the local runner', diagnosticCode: 'JOB_NOT_ALLOWED' };
+  }
   if (['EXCEL_HEALTHCHECK', 'EXCEL_SNAPSHOT', 'EXCEL_BACKUP', 'EXCEL_RECONCILIATION', 'EXCEL_RECONCILIATION_CHECK', 'EXCEL_SYNC'].includes(type)) return executeExcelJob(job, profile, options);
   const repoPath = resolveRepoPath(profile, job.payload?.repoPath);
   if (type === 'HEALTHCHECK' || type === 'PROJECT_STATUS') return { ok: true, result: { projectId: job.projectId, repoPath, runner: os.hostname(), status: fs.existsSync(repoPath) ? 'available' : 'missing' } };

@@ -33,6 +33,7 @@ before(async () => {
 });
 after(async () => { if (mf) await mf.dispose(); if (buildRoot) fs.rmSync(buildRoot, { recursive: true, force: true }); });
 
+
 test('Cloudflare bundle starts on real workerd/D1 without any legacy DSN or warmup module', async () => {
   const response = await mf.dispatchFetch('https://pj.invalid/health');
   assert.equal(response.status, 200); assert.equal((await response.json()).runtime, 'cloudflare');
@@ -141,4 +142,21 @@ test('Control Plane config requires admin auth and bounds POST bodies', async ()
   assert.equal(config.status,200); assert.equal((await config.json()).config.admin.adminUserIds[0],'123');
   const oversized = await mf.dispatchFetch('https://pj.invalid/api/v1/jobs',{method:'POST',headers:{authorization:'Bearer fixture-admin'},body:'x'.repeat(32769)});
   assert.equal(oversized.status,413);
+});
+
+test('D1 persists ZJ registry, scoped jobs, fenced completion and readiness', async () => {
+  const cp = await store();
+  assert.equal(cp.getProject('zj').allowedJobTypes.includes('ZJ_REPO_STATUS'), true);
+  const created = await cp.createJob({ projectId: 'zj', type: 'ZJ_REPO_STATUS', payload: {}, idempotencyKey: 'zj-d1-fixture' }, 'test');
+  assert.equal(created.ok, true);
+  const claimed = await cp.claimJob('zj-fixture-runner', 'zj');
+  assert.equal(claimed.id, created.job.id);
+  assert.equal((await cp.resultJob(claimed.id, 'zj-fixture-runner', { projectId: 'daily-system', attemptCount: claimed.attemptCount })).status, 403);
+  const accepted = await cp.resultJob(claimed.id, 'zj-fixture-runner', { projectId: 'zj', attemptCount: claimed.attemptCount, ok: true, result: { projectId: 'zj', state: 'CLEAN_SYNCED', head: 'a'.repeat(40) } });
+  assert.equal(accepted.ok, true);
+  const fresh = await store();
+  assert.equal((await fresh.getJob(claimed.id)).result.state, 'CLEAN_SYNCED');
+  const readiness = await fresh.createJob({ projectId: 'zj', type: 'ZJ_RELEASE_READINESS', payload: {} }, 'test');
+  assert.equal(readiness.job.status, 'SUCCEEDED');
+  assert.equal((await (await store()).getJob(readiness.job.id)).result.gates.LOCAL_REPO, 'PASS');
 });

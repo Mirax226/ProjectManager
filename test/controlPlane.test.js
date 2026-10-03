@@ -8,7 +8,7 @@ function setup() {
   let now = Date.parse('2026-09-24T10:00:00.000Z');
   const store = new ControlPlaneStore({ now: () => now, runnerStaleMs: 1000, runnerOfflineMs: 3000, projects: [
     { id: 'daily-system', key: 'daily-system', name: 'DailySystem', environment: 'dev' },
-    { id: 'other-project', key: 'other-project', name: 'Other Project', environment: 'dev' },
+    { id: 'zj', key: 'zj', name: 'ZJ', environment: 'staging' },
   ] });
   const handler = createControlPlaneHandler({ store, authenticator: createAuthenticator({ adminToken: 'admin-secret', runnerTokens: { r1: { token: 'runner-secret', project: 'daily-system' } }, projectTokens: { 'daily-system': 'project-secret' } }) });
   return { store, handler, advance: (ms) => { now += ms; } };
@@ -60,7 +60,7 @@ test('runner identity cannot cross its project boundary', async () => {
   const { handler } = setup();
   const heartbeat = await call(handler, '/api/v1/runners/heartbeat', { method: 'POST', headers: { authorization: 'Bearer runner-secret' }, body: JSON.stringify({ projectId: 'other-project' }) });
   assert.equal(heartbeat.status, 403);
-  const created = await call(handler, '/api/v1/jobs', { method: 'POST', headers: { authorization: 'Bearer admin-secret' }, body: JSON.stringify({ projectId: 'other-project', type: 'GIT_STATUS' }) });
+  const created = await call(handler, '/api/v1/jobs', { method: 'POST', headers: { authorization: 'Bearer admin-secret' }, body: JSON.stringify({ projectId: 'zj', type: 'ZJ_REPO_STATUS' }) });
   assert.equal(created.status, 200);
   const claim = await call(handler, '/api/v1/jobs/claim', { method: 'POST', headers: { authorization: 'Bearer runner-secret' }, body: JSON.stringify({ projectId: 'other-project' }) });
   assert.equal((await body(claim)).job, null);

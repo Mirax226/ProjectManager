@@ -1,5 +1,17 @@
 # ProjectManager Master Context
 
+## Latest PJ-ZJ-001 outcome — 2026-10-03
+
+PJ multi-project code passed 233/233 local tests and focused ZJ/Worker-D1 matrices each passed 17/17. PJ Worker version `04704a5f-5394-4488-9577-5f4f5ad84d8b` is live with D1 health passing. PJ ZJ activation remains disabled because ZJ has unowned dirty test work (`DIRTY_UNKNOWN_WORK`) and a distinct live runner credential is not evidenced. Real ZJ validation and Telegram end to end acceptance remain open. The source recovery branch is `backup/pj-zj-001-pre-validation-20261003` (`00ffe28`). See `PROJECT-CONTINUITY-BACKUP.md` for the authoritative recovery state.
+
+## PJ-ZJ-001 resume — 2026-10-03
+
+The multi-project implementation is preserved remotely in `backup/pj-zj-001-pre-validation-20261003` (`00ffe28`) and restored on PJ `main`. The external ZJ worktree has one unowned unstaged test change, classified `DIRTY_UNKNOWN_WORK`; local validation must return `REPO_DIRTY` until a clean or accepted baseline is established. PJ focused tests pass 17/17, initial full suite 232/232; final regression after credential scope hardening is pending. A distinct ZJ Runner credential, PJ deployment and live acceptance remain open. See `PROJECT-CONTINUITY-BACKUP.md` for the current recovery sequence.
+
+# Current master context — PJ-ZJ-001 (2026-10-03)
+
+ProjectManager's canonical checkout is `C:\Users\Amir\Documents\GitHub\ProjectManager`. Its active owner-defined milestone, PJ-ZJ-001, extends the existing Worker/D1/runner/Telegram control plane to manage `daily-system` and `zj` with project-specific safe capabilities. ZJ remains optional and independent. The current durable recovery source is `PROJECT-CONTINUITY-BACKUP.md`; older activation and "next scope undefined" statements below are historical.
+
 ## Excel Host Closure CLOSED — 2026-10-01
 
 EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.
@@ -99,7 +111,7 @@ Continue with fixture-based, non-production hardening. Keep typed jobs validatio
 
 ## Project Memory Location
 
-- Canonical memory path: `docs/project-memory/` in the canonical Git repository (`C:\Users\Amir\Documents\GitHub\cloned\ProjectManager`).
+- Canonical memory path: `docs/project-memory/` in the canonical Git repository (`C:\Users\Amir\Documents\GitHub\ProjectManager`).
 - Purpose: recovery index for current architecture, verified state, decisions, milestones, and safe operating boundaries.
 - Update protocol: update `CURRENT-STATE.md`, `RECOVERY-CHECKPOINT.md`, or `ROADMAP.md` when verified state changes; add immutable phase evidence under `docs/handoffs/`; keep source contracts and tests authoritative for behavior.
 - Plans/PJ relationship: `C:\Users\Amir\Documents\GitHub\Plans\PJ\` is the owner-facing current-plan and transition log mirror. It summarizes the canonical repository state and does not replace repository memory or tests.
