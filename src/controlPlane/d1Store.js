@@ -1,4 +1,5 @@
 const { ControlPlaneStore, DEFAULT_PROJECTS } = require('./store');
+const { registeredProject } = require('./projectRegistry');
 
 function jsonParse(value, fallback) { try { return value ? JSON.parse(value) : fallback; } catch (_) { return fallback; } }
 function jsonObject(value) { try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null; } catch (_) { return null; } }
@@ -6,14 +7,18 @@ function jsonArray(value) { try { const parsed = JSON.parse(value); return Array
 
 class D1ControlPlaneStore extends ControlPlaneStore {
   constructor(db, options = {}) {
-    super(options); this.db = db;
+    super(options); this.db = db; this.zjEnabled = options.zjEnabled;
     this.ready = this.hydrate();
   }
   async hydrate() {
     if (!this.db) return;
     const projects = await this.db.prepare('SELECT id,name,environment,runner_profile,capabilities_json FROM cp_projects').all();
-    if (projects.results?.length) this.projects = new Map(projects.results.map((row) => [row.id, { id: row.id, key: row.id, name: row.name, environment: row.environment, runnerProfile: row.runner_profile, capabilities: jsonParse(row.capabilities_json, []) }]));
-    else for (const project of DEFAULT_PROJECTS) await this.db.prepare('INSERT OR IGNORE INTO cp_projects (id,name,environment,runner_profile,capabilities_json,updated_at) VALUES (?,?,?,?,?,?)').bind(project.id, project.name, project.environment, project.runnerProfile, JSON.stringify(project.capabilities), new Date().toISOString()).run();
+    this.projects = new Map(DEFAULT_PROJECTS.map((project) => [project.id, registeredProject(project.id, project.id === 'zj' && this.zjEnabled != null ? { enabled: this.zjEnabled === true } : {})]));
+    for (const row of (projects.results || [])) {
+      const registered = registeredProject(row.id);
+      if (registered) this.projects.set(row.id, { ...registered, ...(row.id === 'zj' && this.zjEnabled != null ? { enabled: this.zjEnabled === true } : {}), environment: row.environment || registered.environment });
+    }
+    for (const project of DEFAULT_PROJECTS) if (!(projects.results || []).some((row) => row.id === project.id)) await this.db.prepare('INSERT OR IGNORE INTO cp_projects (id,name,environment,runner_profile,capabilities_json,updated_at) VALUES (?,?,?,?,?,?)').bind(project.id, project.name, project.environment, project.runnerProfile, JSON.stringify(project.capabilities), new Date().toISOString()).run();
     const events = await this.db.prepare('SELECT event_id,schema_version,project,environment,severity,category,component,timestamp,message,context_json,source,correlation_id FROM cp_events ORDER BY timestamp DESC LIMIT 2000').all();
     for (const row of (events.results || []).reverse()) { const event = { schemaVersion: Number(row.schema_version || 1), eventId: row.event_id, project: row.project, environment: row.environment, severity: row.severity, category: row.category, component: row.component || row.source || '', timestamp: row.timestamp, message: row.message, context: jsonParse(row.context_json, {}), source: row.source, correlationId: row.correlation_id || null }; this.events.set(event.eventId, event); this.eventOrder.push(event.eventId); }
     const jobs = await this.db.prepare('SELECT * FROM cp_jobs ORDER BY created_at DESC LIMIT 500').all();
@@ -52,18 +57,23 @@ class D1ControlPlaneStore extends ControlPlaneStore {
       this.jobs.delete(j.id); const row = await this.db.prepare('SELECT * FROM cp_jobs WHERE project_id=? AND idempotency_key=?').bind(j.projectId,j.idempotencyKey).first();
       const prior = this.decodeJob(row); this.jobs.set(prior.id,prior); return { ok:true,duplicate:true,job:prior };
     }
+    if (j.status !== 'PENDING') await this.persistJob(j);
     return result;
   }
   async persistJob(job) { await this.db.prepare('INSERT OR REPLACE INTO cp_jobs (id,project_id,type,risk,status,created_at,updated_at,requested_by,payload_json,attempt_count,lease_owner,lease_expires_at,result_json,error,idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(job.id, job.projectId, job.type, job.risk, job.status, job.createdAt, job.updatedAt, job.requestedBy, JSON.stringify(job.payload || {}), job.attemptCount, job.leaseOwner, job.leaseExpiresAt, job.result == null ? null : JSON.stringify(job.result), job.error, job.idempotencyKey).run(); }
   decodeJob(row) { return row ? { id: row.id, projectId: row.project_id, type: row.type, risk: row.risk, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at, requestedBy: row.requested_by, payload: jsonParse(row.payload_json, {}), attemptCount: row.attempt_count, leaseOwner: row.lease_owner, leaseExpiresAt: row.lease_expires_at, result: jsonParse(row.result_json, null), error: row.error, idempotencyKey: row.idempotency_key } : null; }
   async claimJob(runnerId, projectId, leaseMs = 120000) {
+    if (!this.projects.get(projectId)?.enabled) return null;
     const now = new Date(this.now()).toISOString();
+    if (projectId === 'zj') leaseMs = 900000;
     const expires = new Date(this.now() + Math.min(900000, Math.max(1000, leaseMs))).toISOString();
     const row = await this.db.prepare("UPDATE cp_jobs SET status='CLAIMED',lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE id=(SELECT id FROM cp_jobs WHERE project_id=? AND (status='PENDING' OR (status='CLAIMED' AND lease_expires_at<=?)) ORDER BY created_at,id LIMIT 1) RETURNING *").bind(String(runnerId), expires, now, projectId, now).first();
     const job = this.decodeJob(row); if (job) this.jobs.set(job.id, job); return job;
   }
   async resultJob(id, runnerId, result) { const row = await this.db.prepare('SELECT * FROM cp_jobs WHERE id=?').bind(id).first();
     const current = this.decodeJob(row); if (!current) return { ok:false,status:404,error:'job not found' };
+    if ((current.projectId === 'zj' && result.projectId !== current.projectId) || (result.projectId && result.projectId !== current.projectId)) return { ok:false,status:403,error:'project_scope_denied' };
+    if (current.projectId === 'zj' && result.result != null && (typeof result.result !== 'object' || Array.isArray(result.result) || (result.result.projectId && result.result.projectId !== current.projectId))) return { ok:false,status:403,error:'project_scope_denied' };
     if (result.attemptCount != null && Number(result.attemptCount) !== current.attemptCount) return { ok:false,status:409,error:'stale attempt' };
     if (['SUCCEEDED','FAILED','CANCELLED'].includes(current.status)) return row.result_runner_id === String(runnerId) && result.attemptCount === current.attemptCount ? { ok:true,duplicate:true,job:current } : { ok:false,status:409,error:'terminal result owner cannot be verified' };
     this.jobs.set(id,{ ...current });

@@ -1,5 +1,11 @@
 # Current State
 
+## PJ-ZJ-001 multi-project control plane — in progress, 2026-10-03
+
+STOPPED: the real local queue found external dirty ZJ work in `tests/worker.test.ts` (24 insertions, 8 deletions). Validation correctly returned `REPO_DIRTY` before execution. The owner's stop condition applies. PJ changes are preserved uncommitted, undeployed; `PJ_ZJ_ENABLED=false`. Final local/live gates remain incomplete. No ZJ product edit or production mutation was performed by this task.
+
+The owner-defined next scope is PJ-ZJ-001. Canonical PJ path is `C:\Users\Amir\Documents\GitHub\ProjectManager`. The local implementation introduces a `daily-system` / `zj` project registry, distinct capabilities and job allowlists, ZJ safe runner jobs and Telegram project navigation. ZJ remains independent of PJ. The current recovery entrypoint is `PROJECT-CONTINUITY-BACKUP.md`; implementation, validation, deployment and acceptance status are tracked in `docs/handoffs/PJ-ZJ-001-MULTI-PROJECT-CONTROL-PLANE.md`. Do not treat the prior "next scope undefined" text below as current.
+
 ## Excel Host Closure CLOSED — 2026-10-01
 
 EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.

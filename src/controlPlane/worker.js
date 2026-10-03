@@ -3,7 +3,7 @@ const { createControlPlaneHandler, json } = require('./handler');
 const { D1ControlPlaneStore } = require('./d1Store');
 const { telegramWebhook } = require('./telegramWebhook');
 function parseMap(value) { try { const parsed = JSON.parse(value || '{}'); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch (_) { return {}; } }
-function getStore(env) { if (!env.CONTROL_PLANE_DB) throw new Error('d1_required'); return new D1ControlPlaneStore(env.CONTROL_PLANE_DB); }
+function getStore(env) { if (!env.CONTROL_PLANE_DB) throw new Error('d1_required'); return new D1ControlPlaneStore(env.CONTROL_PLANE_DB, { zjEnabled: env.PJ_ZJ_ENABLED === 'true' }); }
 async function fetch(request, env = {}) {
   const url = new URL(request.url);
   if (request.method === 'GET' && ['/health', '/healthz'].includes(url.pathname)) {

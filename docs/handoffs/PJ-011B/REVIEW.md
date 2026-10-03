@@ -37,7 +37,7 @@ Repository hardening is implemented; **live incident closure remains incomplete*
 | # | Requested item | Evidence/result |
 |---|---|---|
 | 1 | Starting HEAD | 6d4169e82e889f90f5390c9eb29bff307d01e902; main == origin/main. |
-| 2 | Initial working tree | Expected dirty state, five tracked modifications, no untracked files; diff --check passed. Command cwd verified canonical repository; desktop parent context was GitHub, so every development command explicitly used cloned/ProjectManager. |
+| 2 | Initial working tree (historical) | Expected dirty state, five tracked modifications, no untracked files; diff --check passed. At the time, commands used the then-current cloned/ProjectManager checkout. This is historical evidence, not the current canonical path. |
 | 3 | Interrupted files | bot.js, configDb.js, configDbErrors.js, test/configDbSafety.test.js, test/logsHubStore.test.js. |
 | 4 | Retained work | All five files' intended work retained. Parser tests/source precedence and incident-store repeat test were valid but needed broader testing. Typed preflight and bot classification integration were partial; existing prior Excel/PJ-011A/Finalizer checkpoints preserved. |
 | 5 | Corrected/discarded | No unrelated work discarded. Corrected incomplete host validation, missed typed catches, one-time repair reuse, false query inference, legacy tenant/DNS confusion, missing actual routing/recovery dedupe coverage. Broader masking intentionally removes password suffix/query disclosure. |

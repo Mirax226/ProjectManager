@@ -1,5 +1,9 @@
 # ProjectManager Current Plan
 
+# Current owner-defined plan — PJ-ZJ-001 (2026-10-03)
+
+The active milestone is PJ-ZJ-001: make the existing PJ control plane safely manage DailySystem and ZJ. Use `docs/project-memory/PROJECT-CONTINUITY-BACKUP.md` and `docs/handoffs/PJ-ZJ-001-MULTI-PROJECT-CONTROL-PLANE.md` for current implementation and acceptance status. Historical "next scope undefined" text below is superseded by this owner request.
+
 ## Excel Host Closure CLOSED — 2026-10-01
 
 EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.
@@ -73,7 +77,7 @@ Verification: five new closure tests; 16 focused closure/webhook tests passed. F
 PJ-012 COMPLETE: NO until post-deploy /start and /status, visible emoji menu and one safe local Runner E2E pass. No Excel/VBA write, Render/legacy DB investigation or shell/deploy/SQL job. Remaining owner actions documented in runbook; final commit/push hash and clean synchronized state reported in final response.
 
 
-- Canonical repository: C:\Users\Amir\Documents\GitHub\cloned\ProjectManager.
+- Canonical repository: C:\Users\Amir\Documents\GitHub\ProjectManager.
 - PJ-011B finalized at 7a2a6f010d3f4756aaf76816c0a1faa303839e99; normal push succeeded, working tree clean, HEAD == origin/main verified.
 - PJ-012 owner decision: Cloudflare = designated production runtime; D1 = active PJ operational persistence; Windows Runner = local execution plane. Render and old Postgres = DEPRECATED / UNUSED / NON-AUTHORITATIVE; NO MIGRATION REQUIRED. External resources are not deleted.
 - Runtime target: Telegram webhook -> unified projectmanager-control-plane Worker -> shared application/Ops Center -> D1/jobs -> project-bound authenticated Windows Runner. Production Worker imports no Node bot bootstrap/Config DB/Excel/shell execution.

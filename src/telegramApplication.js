@@ -1,5 +1,6 @@
 // Portable application boundary: no Node bot bootstrap or local execution imports.
 const { buildProjectManagerAdminModel, buildRunnerDashboardModel, buildIncidentCenterModel, buildTypedOperationalJob } = require('./telegramOpsCenter');
+const { readiness } = require('./controlPlane/zjReadiness');
 
 function adminIds(env, store) {
   const bootstrap = String(env.TELEGRAM_ADMIN_USER_IDS || '').split(',').map((id) => id.trim()).filter(Boolean);
@@ -17,7 +18,7 @@ async function dispatchTelegramUpdate(update, { store, env }) {
   let keyboard;
   if (['start', 'admin'].includes(command)) {
     text = buildProjectManagerAdminModel({ config: store.operationalConfig, jobs: await store.listJobs(), archives: [...store.archives.values()] }).text;
-    keyboard = { inline_keyboard: [[{ text: '📊 Status', callback_data: 'status' }, { text: '🖥️ Runners', callback_data: 'runners' }], [{ text: '🚨 Incidents', callback_data: 'incidents' }, { text: '📋 Jobs', callback_data: 'jobs' }]] };
+    keyboard = { inline_keyboard: [[{ text: '📊 Status', callback_data: 'status' }, { text: '🖥️ Runners', callback_data: 'runners' }], [{ text: '🚨 Incidents', callback_data: 'incidents' }, { text: '📋 Jobs', callback_data: 'jobs' }], [{ text: '📁 Projects', callback_data: 'projects' }]] };
   } else if (command === 'status') {
     const state = await store.status();
     text = `📊 ProjectManager · Cloudflare/D1\n📁 Projects: ${state.projects.length}\n🖥️ Runners: ${state.runners.length}\n🚨 Incidents: ${state.openAlerts.length}`;
@@ -29,14 +30,32 @@ async function dispatchTelegramUpdate(update, { store, env }) {
     text = '📋 Jobs\n' + ((await store.listJobs()).slice(0, 10).map((job) => `${job.id} · ${job.projectId} · ${job.type} · ${job.status}`).join('\n') || 'No jobs.');
   } else if (command === 'job' && projectId) {
     const job = await store.getJob(projectId);
-    text = job ? `${job.id} · ${job.projectId} · ${job.type} · ${job.status}` : 'Job not found.';
+    text = job ? `${job.id} · ${job.projectId} · ${job.type} · ${job.status}${job.result ? `\n${JSON.stringify(job.result).slice(0, 2500)}` : ''}` : 'Job not found.';
+  } else if (command === 'projects') {
+    const projects = await store.listProjects();
+    text = `📁 Projects\n${projects.map((project) => `${project.displayName || project.name}: ${project.enabled === false ? 'DISABLED' : 'ENABLED'}`).join('\n')}`;
+    keyboard = { inline_keyboard: projects.filter((project) => project.enabled !== false).map((project) => [{ text: project.displayName || project.name, callback_data: `project ${project.id}` }]) };
+  } else if (command === 'project' && projectId) {
+    const project = await store.getProject(projectId);
+    text = project ? `${project.displayName || project.name}\nEnvironment: ${project.environment}\nCapabilities: ${project.capabilities.join(', ')}` : 'Unknown project.';
+    if (project?.id === 'zj') keyboard = { inline_keyboard: [[{ text: 'Status', callback_data: 'zj_status' }, { text: 'Repository', callback_data: 'zj_repo' }], [{ text: 'Release Evidence', callback_data: 'zj_release' }, { text: 'Release Readiness', callback_data: 'zj_readiness' }], [{ text: 'Local Validation', callback_data: 'zj_validate' }, { text: 'Staging Health', callback_data: 'zj_staging' }], [{ text: 'Last Jobs', callback_data: 'zj_jobs' }]] };
+  } else if (command === 'zj_status') {
+    const jobs = await store.listJobs('zj'); const summary = readiness(jobs);
+    const repo = jobs.find((job) => job.type === 'ZJ_REPO_STATUS')?.result;
+    text = `Project: ZJ\nRepo: ${repo?.state || 'UNKNOWN'}\nHEAD: ${repo?.head?.slice(0, 8) || 'UNKNOWN'}\nLocal validation: ${summary.gates.LOCAL_TESTS}\nStaging: ${summary.gates.STAGING_HEALTH}\nTelegram staging: ${summary.gates.STAGING_TELEGRAM}\nProduction isolation: ${summary.gates.PRODUCTION_ISOLATION}\nLast check: ${summary.timestamp || 'UNKNOWN'}`;
+  } else if (command === 'zj_jobs') {
+    text = 'ZJ jobs\n' + ((await store.listJobs('zj')).slice(0, 10).map((job) => `${job.id} · ${job.type} · ${job.status}`).join('\n') || 'No jobs.');
+  } else if (['zj_repo', 'zj_release', 'zj_validate', 'zj_staging', 'zj_readiness'].includes(command)) {
+    const type = { zj_repo: 'ZJ_REPO_STATUS', zj_release: 'ZJ_RELEASE_EVIDENCE', zj_validate: 'ZJ_LOCAL_VALIDATION', zj_staging: 'ZJ_STAGING_HEALTHCHECK', zj_readiness: 'ZJ_RELEASE_READINESS' }[command];
+    const created = await store.createJob({ projectId: 'zj', type, payload: {}, idempotencyKey: `telegram:${update.update_id}` }, 'telegram-admin');
+    text = created.ok ? `${created.job.status === 'SUCCEEDED' ? 'Ready' : 'Queued'} ${type}\nJob: ${created.job.id}\nUse /job ${created.job.id} for the result.` : 'ZJ action is unavailable.';
   } else if (['health', 'project_status', 'excel_healthcheck'].includes(command)) {
     const key = `telegram:${update.update_id}`;
     const inputJob = command === 'excel_healthcheck' ? buildTypedOperationalJob(command, projectId, assetId, key) : { ok: true, job: { projectId, type: command === 'health' ? 'HEALTHCHECK' : 'PROJECT_STATUS', payload: {}, idempotencyKey: key } };
     const created = inputJob.ok ? await store.createJob(inputJob.job, 'telegram-admin') : inputJob;
     text = created.ok ? `Queued ${created.job.type}\nJob: ${created.job.id}\nUse /job ${created.job.id} for the Runner result.` : 'Invalid project or diagnostic action.';
   } else {
-    text = '🏠 /start · ⚙️ /admin\n📊 /status · 🖥️ /runners\n🚨 /incidents · 📋 /jobs · /job ID\n❤️ /health PROJECT\n📁 /project_status PROJECT\n📗 /excel_healthcheck PROJECT ASSET\nOther legacy actions are disabled.';
+    text = '🏠 /start · ⚙️ /admin\n📊 /status · 📁 /projects · /project ID\n🖥️ /runners · 🚨 /incidents · 📋 /jobs · /job ID\n❤️ /health PROJECT · /project_status PROJECT\n📗 /excel_healthcheck PROJECT ASSET\nZJ: /zj_status · /zj_repo · /zj_release · /zj_validate · /zj_staging · /zj_readiness · /zj_jobs\nOther legacy actions are disabled.';
   }
   return { authorized: true, chatId: message.chat.id, text: text.slice(0, 4000), replyMarkup: keyboard, callbackId: callback?.id };
 }

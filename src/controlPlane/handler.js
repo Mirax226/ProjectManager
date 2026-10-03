@@ -26,7 +26,12 @@ function createControlPlaneHandler({ store, authenticator, tokens, logger = cons
     if (identity.role === 'runner' && !identity.project) return json({ ok: false, error: 'runner_project_required' }, 403, headers);
     if (request.method === 'GET' && url.pathname === '/api/v1/status') {
       const status = await store.status();
-      if (identity.role === 'project') status.projects = status.projects.filter((project) => project.id === identity.project);
+      if (identity.role === 'project') {
+        status.projects = status.projects.filter((project) => project.id === identity.project);
+        status.runners = status.runners.filter((runner) => runner.projectId === identity.project);
+        status.latestEvents = status.latestEvents.filter((event) => event.project === identity.project);
+        status.openAlerts = status.openAlerts.filter((alert) => alert.project === identity.project);
+      }
       if (identity.role === 'runner') {
         status.projects = status.projects.filter((project) => project.id === (identity.project || project.id));
         status.runners = status.runners.filter((runner) => runner.runnerId === identity.runnerId);

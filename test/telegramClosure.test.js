@@ -13,8 +13,8 @@ test('start/admin omit command footer while preserving status and emoji callback
     assert.match(output.text, /ProjectManager Admin/); assert.match(output.text, /Archive destination/);
     for (const footer of ['Start: /start', 'Health: /health', 'Project Status: /project_status', 'Excel Health: /excel_healthcheck']) assert.equal(output.text.includes(footer), false);
     const buttons = output.replyMarkup.inline_keyboard.flat();
-    assert.deepEqual(buttons.map((button) => button.callback_data), ['status', 'runners', 'incidents', 'jobs']);
-    assert.deepEqual(buttons.map((button) => button.text), ['📊 Status', '🖥️ Runners', '🚨 Incidents', '📋 Jobs']);
+    assert.deepEqual(buttons.map((button) => button.callback_data), ['status', 'runners', 'incidents', 'jobs', 'projects']);
+    assert.deepEqual(buttons.map((button) => button.text), ['📊 Status', '🖥️ Runners', '🚨 Incidents', '📋 Jobs', '📁 Projects']);
   }
 });
 test('BotFather diagnostic commands remain routed after footer removal', async () => {

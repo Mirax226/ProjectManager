@@ -1,5 +1,9 @@
 # Recovery Checkpoint
 
+# Current recovery checkpoint — PJ-ZJ-001 (2026-10-03)
+
+PJ-ZJ-001 is the active owner-defined milestone. Canonical checkout: `C:\Users\Amir\Documents\GitHub\ProjectManager`; starting HEAD/origin/main `4aba1b11a62fd2f1bc308eb90a721fe31ef70ed7`. Read `PROJECT-CONTINUITY-BACKUP.md` and `../handoffs/PJ-ZJ-001-MULTI-PROJECT-CONTROL-PLANE.md` before resuming. ZJ product repository must remain unchanged; ZJ production mutation is forbidden. Prior checkpoint material below remains historical.
+
 ## Excel Host Closure CLOSED — 2026-10-01
 
 EXCEL_HOST_CLOSURE = CLOSED; PJ-012 remains COMPLETE. Current classification: HISTORICAL_INTERMITTENT_NOT_REPRODUCED. This checkpoint supersedes all older OPEN/blocker/next-experiment statements preserved below; those statements are historical diagnostics, not active work instructions.
