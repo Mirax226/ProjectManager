@@ -13,6 +13,7 @@ const { runOnce } = require('../src/runner');
 let mf, db, buildRoot;
 const delivered = [];
 let failDelivery = false;
+let editFailure = null;
 const secret = 'fixture-webhook-secret';
 function update(id, text = '/status', sender = 123) { return { update_id: id, message: { from: { id: sender }, chat: { id: sender, type: 'private' }, text } }; }
 function webhook(body, supplied = secret, headers = {}) { return mf.dispatchFetch('https://pj.invalid/telegram/webhook', { method: 'POST', headers: { 'content-type': 'application/json', ...(supplied == null ? {} : { 'X-Telegram-Bot-Api-Secret-Token': supplied }), ...headers }, body: typeof body === 'string' ? body : JSON.stringify(body) }); }
@@ -22,7 +23,9 @@ before(async () => {
   execFileSync(process.execPath, [path.resolve(__dirname, '../node_modules/wrangler/bin/wrangler.js'), 'deploy', '--dry-run', '--outdir', buildRoot], { cwd: path.resolve(__dirname, '..'), windowsHide: true, stdio: 'pipe', env: { ...process.env, WRANGLER_SEND_METRICS: 'false' }, timeout: 60000 });
   mf = new Miniflare({ modules: true, modulesRoot: buildRoot, scriptPath: path.join(buildRoot, 'entry.js'), compatibilityDate: '2026-08-01', compatibilityFlags: ['nodejs_compat'], cf: false, d1Databases: { CONTROL_PLANE_DB: 'test-pj012' }, bindings: { TELEGRAM_BOT_TOKEN: 'fixture-token', TELEGRAM_WEBHOOK_SECRET: secret, TELEGRAM_ADMIN_USER_IDS: '123', PG_CONTROL_PLANE_ADMIN_TOKEN: 'fixture-admin', PG_RUNNER_TOKENS_JSON: JSON.stringify({ 'windows-01': { token: 'fixture-runner', project: 'daily-system' } }), LEGACY_CONFIG_DB_ENABLED: 'false' }, outboundService: async (request) => {
     if (failDelivery) return Response.json({ ok:false },{status:503});
-    delivered.push({ method: new URL(request.url).pathname.split('/').pop(), body: await request.json() });
+    const method = new URL(request.url).pathname.split('/').pop();
+    delivered.push({ method, body: await request.json() });
+    if (method === 'editMessageText' && editFailure) return Response.json({ ok: false, error_code: editFailure.code, description: editFailure.description }, { status: editFailure.code });
     return Response.json({ ok: true, result: true });
   } });
   db = await mf.getD1Database('CONTROL_PLANE_DB');
@@ -66,10 +69,44 @@ test('Unauthorized user and group context cannot read admin data or create jobs'
 });
 test('Callbacks route through shared Ops Center models and explicit read-only action allowlist', async () => {
   const callback = { update_id: 6, callback_query: { id: 'callback-fixture', from: { id: 123 }, message: { chat: { id: 123, type: 'private' } }, data: 'admin' } };
+  const before = delivered.length;
   assert.equal((await webhook(callback)).status, 200);
-  assert.equal(delivered.at(-1).method, 'answerCallbackQuery');
+  assert.deepEqual(delivered.slice(before).map((call) => call.method), ['answerCallbackQuery', 'sendMessage']); // No editable message ID in this fixture.
   const application = await dispatchTelegramUpdate(update(7, '/shell rm -rf'), { store: await store(), env: { TELEGRAM_ADMIN_USER_IDS: '123' } });
   assert.match(application.text, /disabled/); assert.equal((await db.prepare('SELECT COUNT(*) AS count FROM cp_jobs').first()).count, 0);
+});
+test('ProjectManager callback navigation edits one menu and acknowledges without duplicate messages', async () => {
+  const initial = delivered.length;
+  assert.equal((await webhook(update(101, '/projects'))).status, 200);
+  assert.deepEqual(delivered.slice(initial).map((call) => call.method), ['sendMessage']);
+  const callback = (id, data) => ({ update_id: id, callback_query: { id: `callback-${id}`, from: { id: 123 }, message: { message_id: 77, chat: { id: 123, type: 'private' } }, data } });
+  for (const [id, data, label] of [[102, 'project zj', '🎓 ZJ'], [103, 'projects', '📁 Projects'], [104, 'project daily-system', '📘 DailySystem'], [105, 'projects', '📁 Projects'], [106, 'start', 'ProjectManager Admin']]) {
+    const before = delivered.length;
+    assert.equal((await webhook(callback(id, data))).status, 200);
+    assert.deepEqual(delivered.slice(before).map((call) => call.method), ['answerCallbackQuery', 'editMessageText']);
+    assert.equal(delivered.at(-1).body.message_id, 77);
+    assert.match(delivered.at(-1).body.text, new RegExp(label));
+  }
+  const unauthorized = delivered.length;
+  assert.equal((await webhook({ update_id: 107, callback_query: { id: 'unauthorized', from: { id: 456 }, message: { message_id: 77, chat: { id: 456, type: 'private' } }, data: 'project zj' } })).status, 200);
+  assert.deepEqual(delivered.slice(unauthorized).map((call) => call.method), ['answerCallbackQuery']);
+});
+test('Telegram edit edge cases distinguish unchanged, impossible and unexpected failures', async () => {
+  const callback = (id) => ({ update_id: id, callback_query: { id: `callback-${id}`, from: { id: 123 }, message: { message_id: 78, chat: { id: 123, type: 'private' } }, data: 'projects' } });
+  try {
+    editFailure = { code: 400, description: 'Bad Request: message is not modified' };
+    let before = delivered.length;
+    assert.equal((await webhook(callback(108))).status, 200);
+    assert.deepEqual(delivered.slice(before).map((call) => call.method), ['answerCallbackQuery', 'editMessageText']);
+    editFailure = { code: 400, description: 'Bad Request: message to edit not found' };
+    before = delivered.length;
+    assert.equal((await webhook(callback(109))).status, 200);
+    assert.deepEqual(delivered.slice(before).map((call) => call.method), ['answerCallbackQuery', 'editMessageText', 'sendMessage']);
+    editFailure = { code: 403, description: 'Forbidden: bot was blocked by the user' };
+    before = delivered.length;
+    assert.equal((await webhook(callback(110))).status, 503);
+    assert.deepEqual(delivered.slice(before).map((call) => call.method), ['answerCallbackQuery', 'editMessageText']);
+  } finally { editFailure = null; }
 });
 test('Telegram -> Worker/D1 -> authenticated local Runner -> typed result/status', async () => {
   await webhook(update(8, '/health daily-system'));

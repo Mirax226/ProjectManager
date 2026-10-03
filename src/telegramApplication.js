@@ -66,7 +66,7 @@ async function dispatchTelegramUpdate(update, { store, env }) {
   } else {
     text = '🏠 /start · ⚙️ /admin\n📊 /status · 📁 /projects · /project ID\n🖥️ /runners · 🚨 /incidents · 📋 /jobs · /job ID\n❤️ /health PROJECT · /project_status PROJECT\n📗 /excel_healthcheck PROJECT ASSET\nZJ: /zj_status · /zj_repo · /zj_release · /zj_validate · /zj_staging · /zj_readiness · /zj_jobs\nOther legacy actions are disabled.';
   }
-  return { authorized: true, chatId: message.chat.id, text: text.slice(0, 4000), replyMarkup: keyboard, callbackId: callback?.id };
+  return { authorized: true, chatId: message.chat.id, messageId: callback?.message?.message_id, text: text.slice(0, 4000), replyMarkup: keyboard, callbackId: callback?.id };
 }
 
 module.exports = { dispatchTelegramUpdate, adminIds };

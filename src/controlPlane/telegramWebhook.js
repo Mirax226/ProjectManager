@@ -13,9 +13,40 @@ async function telegramCall(token, method, payload, fetchImpl = fetch) {
   try {
     const response = await fetchImpl(`https://api.telegram.org/bot${token}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
     const data = await response.json();
-    if (!response.ok || data.ok !== true) throw new Error('telegram_delivery_failed');
+    if (!response.ok || data.ok !== true) {
+      const error = new Error('telegram_delivery_failed');
+      error.telegramCode = data.error_code || response.status;
+      error.telegramDescription = String(data.description || '');
+      throw error;
+    }
     return data.result;
-  } catch (_) { throw new Error('telegram_delivery_failed'); }
+  } catch (error) {
+    if (error.message === 'telegram_delivery_failed') throw error;
+    throw new Error('telegram_delivery_failed', { cause: error });
+  }
+}
+
+function editOutcome(error) {
+  const description = String(error.telegramDescription || '').toLowerCase();
+  if (error.telegramCode !== 400) return 'error';
+  if (description.includes('message is not modified')) return 'unchanged';
+  if (['message to edit not found', "message can't be edited", 'message cannot be edited', 'message is inaccessible', 'message to edit is unavailable'].some((part) => description.includes(part))) return 'fallback';
+  return 'error';
+}
+
+async function deliverTelegramOutput(token, output, fetchImpl) {
+  const payload = { chat_id: output.chatId, text: output.text, ...(output.replyMarkup ? { reply_markup: output.replyMarkup } : {}) };
+  if (output.callbackId && Number.isSafeInteger(output.messageId)) {
+    try {
+      await telegramCall(token, 'editMessageText', { ...payload, message_id: output.messageId }, fetchImpl);
+      return;
+    } catch (error) {
+      const outcome = editOutcome(error);
+      if (outcome === 'unchanged') return;
+      if (outcome !== 'fallback') throw error;
+    }
+  }
+  await telegramCall(token, 'sendMessage', payload, fetchImpl);
 }
 
 async function telegramWebhook(request, env, store, fetchImpl) {
@@ -32,16 +63,15 @@ async function telegramWebhook(request, env, store, fetchImpl) {
     return json({ ok: row?.status === 'DONE', duplicate: true }, row?.status === 'DONE' ? 200 : 503);
   }
   try {
+    if (update.callback_query?.id) await telegramCall(env.TELEGRAM_BOT_TOKEN, 'answerCallbackQuery', { callback_query_id: update.callback_query.id }, fetchImpl);
     const output = await dispatchTelegramUpdate(update, { store, env });
-    if (output.authorized) {
-      await telegramCall(env.TELEGRAM_BOT_TOKEN, 'sendMessage', { chat_id: output.chatId, text: output.text, ...(output.replyMarkup ? { reply_markup: output.replyMarkup } : {}) }, fetchImpl);
-      if (output.callbackId) await telegramCall(env.TELEGRAM_BOT_TOKEN, 'answerCallbackQuery', { callback_query_id: output.callbackId }, fetchImpl);
-    }
+    if (output.authorized) await deliverTelegramOutput(env.TELEGRAM_BOT_TOKEN, output, fetchImpl);
     await store.db.prepare('UPDATE cp_telegram_updates SET status=\'DONE\',lease_until=0 WHERE update_id=? AND owner=?').bind(update.update_id, owner).run();
     return json({ ok: true });
-  } catch (_) {
+  } catch (error) {
+    console.error('[telegram] update delivery failed', { code: error.telegramCode || 'transport', updateId: update.update_id });
     await store.db.prepare('UPDATE cp_telegram_updates SET status=\'PENDING\',lease_until=0 WHERE update_id=? AND owner=?').bind(update.update_id, owner).run();
     return json({ ok: false, error: 'update_processing_failed' }, 503);
   }
 }
-module.exports = { telegramWebhook, boundedJson, validUpdate, telegramCall };
+module.exports = { telegramWebhook, boundedJson, validUpdate, telegramCall, deliverTelegramOutput, editOutcome };
